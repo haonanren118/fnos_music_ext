@@ -5407,6 +5407,50 @@ def _kw_rid_from_guid(guid: str) -> str:
     return ""
 
 
+_KG_HASH_RE = re.compile(r"^[0-9A-Za-z]{32}$")
+
+
+def _kg_cover_by_hash(guid: str) -> str:
+    """酷狗 hash 直构封面：online:lx:kg:<hash> → imge.kugou.com/stdmusic/480/<hash>.jpg。
+
+    该 URL 模式为酷狗公开静态资源，免鉴权免 Referer（2026-10 实测 200 image/jpeg），
+    覆盖 lx 酷狗源全部曲目；酷我源（kw）无此模式，走 artistpicserver/网易补全。
+    """
+    parts = (guid or "").split(":")
+    if len(parts) >= 4 and parts[1] == "lx" and parts[2] == "kg":
+        h = parts[3]
+    elif len(parts) == 3 and parts[1] in ("kg", "kugou"):
+        h = parts[2]
+    else:
+        return ""
+    if not _KG_HASH_RE.match(str(h or "")):
+        return ""
+    return f"https://imge.kugou.com/stdmusic/480/{h}.jpg"
+
+
+# 封面解析失败负缓存：识别不出的源（如 kw artistpicserver 403、网易搜索无命中）
+# 短期内不会变好，TTL 内直接落占位图，避免每次列表渲染都重跑整条失败链
+# （18 首 × kw 403 + 网易搜索，既慢又扰上游）。成功结果仍走 _COVER_CDN_CACHE。
+_COVER_NEG_TTL_S = 600.0
+_COVER_NEG_CACHE: "dict[str, float]" = {}
+
+
+def _cover_negative_get(key: str) -> bool:
+    ts = _COVER_NEG_CACHE.get(key)
+    if ts is None:
+        return False
+    if time.time() - ts < _COVER_NEG_TTL_S:
+        return True
+    _COVER_NEG_CACHE.pop(key, None)
+    return False
+
+
+def _cover_negative_put(key: str) -> None:
+    if len(_COVER_NEG_CACHE) > 4000:
+        _COVER_NEG_CACHE.clear()
+    _COVER_NEG_CACHE[key] = time.time()
+
+
 def _cover_cdn_client() -> httpx.AsyncClient:
     # 直构 CDN 探测用独立短超时客户端；transport 仅供测试注入 MockTransport
     kwargs: dict = {"timeout": 5.0, "follow_redirects": True}
@@ -5512,6 +5556,135 @@ async def _enrich_cover_via_netease(request: Request, guid: str, data: dict) -> 
     return target
 
 
+async def _netease_direct_cover(title: str, artist: str) -> str:
+    """网易 cloudsearch/pc 直连同名曲补全（免 musicbox 依赖）。
+
+    该端点无需 weapi 加密、无需登录 Cookie，仅带 Referer/UA 即可命中（2026-10 实测
+    稳定 200，返回 result.songs[].al.picUrl）。当 musicbox（网易源）未启用时，它是
+    酷我(lx kw)等无公开图床直构模式曲源的兜底封面来源；酷狗(lx kg)优先走
+    _kg_cover_by_hash，无需走本兜底。
+
+    匹配策略：先去掉标题里的括号修饰（如「（深情版）」）与前缀表演者（如「吉他 」），
+    再做精确/包含匹配，score 高者优先，歌手命中再加分。网易搜索本身已按关键词模糊召回，
+    若严格匹配无果但搜索有返回，退而取首个结果（其专辑图通常即所求），最大化封面覆盖率，
+    避免「标题带版本后缀就对不上」而落占位图。
+    """
+    title = str(title or "").strip()
+    if not title:
+        return ""
+    artist = str(artist or "").strip()
+
+    # 抽取「核心曲名」：去括号修饰与前缀表演者，避免 祝福祖国（深情版）/吉他 祝福祖国 对不上
+    def _core(t: str) -> str:
+        t = re.sub(r"[\(（\[【].*?[\)）\]】]", " ", t)  # 去括号内容
+        t = re.sub(r"^(吉他|钢琴|小提琴|大提琴|伴奏|dj|remix|翻唱|纯音乐|instrumental|现场|live)\s*", " ", t, flags=re.I)
+        return re.sub(r"\s+", " ", t).strip()
+
+    key = f"wyc:{title.casefold()}|{artist.casefold()}"
+    cached = _cover_cache_get(key)
+    if cached:
+        return cached
+    keyword = " ".join(x for x in (artist, title) if x)
+    target = ""
+    try:
+        async with _cover_cdn_client() as client:
+            r = await client.post(
+                "https://music.163.com/api/cloudsearch/pc",
+                data={"s": keyword, "type": 1, "limit": 8, "offset": 0},
+                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://music.163.com/"},
+            )
+        if r.status_code != 200:
+            return ""
+        payload = r.json()
+        songs = payload.get("result", {}).get("songs") if isinstance(payload, dict) else None
+        if not isinstance(songs, list) or not songs:
+            return ""
+        tl = _core(title).casefold()
+        al_l = _core(artist).casefold()
+        best_score = 0
+        best_pic = ""
+        for song in songs:
+            if not isinstance(song, dict):
+                continue
+            s_name = str(song.get("name") or "")
+            nl = _core(s_name).casefold()
+            if nl == tl:
+                score = 3
+            elif tl and (tl in nl or nl in tl):
+                score = 1
+            else:
+                continue
+            ars = song.get("ar") or []
+            if isinstance(ars, list) and ars and isinstance(ars[0], dict):
+                s_artist = " / ".join(str(a.get("name")) for a in ars if isinstance(a, dict))
+            else:
+                s_artist = str(song.get("artist") or "")
+            s_artist = _core(s_artist).casefold()
+            if al_l and (al_l in s_artist or s_artist in al_l):
+                score += 1
+            al = song.get("al") or {}
+            pic = str(al.get("picUrl") or "")
+            if pic and score > best_score:
+                best_score = score
+                best_pic = pic.replace("http://", "https://")
+        # 严格匹配无果：网易已按关键词模糊召回，首个结果通常相关，兜底取之提升覆盖率
+        if not best_pic:
+            al0 = (songs[0].get("al") or {}) if isinstance(songs[0], dict) else {}
+            p0 = str(al0.get("picUrl") or "")
+            if p0:
+                best_pic = p0.replace("http://", "https://")
+        target = best_pic
+    except Exception as e:
+        logger.debug("netease direct cover failed for %s: %s", keyword, e)
+        return ""
+    if target:
+        _cover_cache_put(key, target)
+    return target
+
+
+_VO_META_CACHE: "dict[str, tuple[str, str]]" = {}
+
+
+def _vo_meta_from_cache(guid: str) -> "tuple[str, str]":
+    """从推荐缓存 VO 反查曲目的 (title, artist)。
+
+    _online_info 对 lx 酷我源（online:lx:kw:）拿不到标题，导致网易同名曲补全兜底无关键词
+    可搜、整条链落占位图。而推荐缓存（热门/每日）里的 VO 曲目始终带 title/artist，借此回填，
+    让 KW 等无公开图床直构模式的源也能走网易补全拿到真实封面。结果内存缓存，避免重复扫盘。
+    """
+    cached = _VO_META_CACHE.get(guid)
+    if cached is not None:
+        return cached
+    res: "tuple[str, str]" = ("", "")
+    try:
+        import glob as _glob
+
+        base = dailyrec.recommend_cache_dir()
+        files = sorted(_glob.glob(os.path.join(base, "*", "*.json")), key=os.path.getmtime)
+        for f in files[-200:]:
+            try:
+                with open(f, encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except Exception:
+                continue
+            tracks = (data.get("tracks") or []) if isinstance(data, dict) else []
+            for t in tracks:
+                if not isinstance(t, dict):
+                    continue
+                if (t.get("guid") or "") == guid:
+                    res = (
+                        str(t.get("title") or t.get("song_name") or ""),
+                        str(t.get("artist") or ""),
+                    )
+                    break
+            if res[0]:
+                break
+    except Exception as e:
+        logger.debug("vo meta lookup failed for %s: %s", guid, e)
+    _VO_META_CACHE[guid] = res
+    return res
+
+
 def _embedded_cover_bytes(guid: str) -> "tuple[bytes, str] | None":
     """本地边听边存缓存文件的内嵌专辑图（mutagen 读 ID3/FLAC/MP4 封面）。"""
     path = find_cache_file(guid)
@@ -5546,7 +5719,14 @@ def _embedded_cover_bytes(guid: str) -> "tuple[bytes, str] | None":
 
 
 def _placeholder_cover_response(guid: str) -> Response:
-    """占位图池确定性选取（guid 哈希），客户端缓存 1 天。"""
+    """占位图池确定性选取（guid 哈希）。
+
+    关键：占位图绝不可被客户端长缓存（旧实现 max-age=86400 会让「封面解析失败回落的
+    占位图」在 App/WebView 里冻住一整天——即便服务端后来修好，客户端仍显示波纹）。
+    改为 no-cache：每次都回源确认，配合服务端负缓存（_COVER_NEG_CACHE）只在 TTL 内
+    跳过昂贵的失败链，既不受上游拖累，也不会把占位图冻在客户端。真实封面（_proxy_cover
+    / 内嵌图）仍带 max-age=86400 长缓存，不受影响。
+    """
     digest = hashlib.sha256(str(guid or "").encode()).hexdigest()
     name = f"placeholder-{int(digest[:8], 16) % _PLACEHOLDER_COUNT}.png"
     content = _PLACEHOLDER_CACHE.get(name)
@@ -5561,7 +5741,7 @@ def _placeholder_cover_response(guid: str) -> Response:
     return Response(
         content=content,
         media_type="image/png",
-        headers={"Cache-Control": "public, max-age=86400"},
+        headers={"Cache-Control": "no-cache"},
     )
 
 
@@ -5628,24 +5808,45 @@ async def static_cover(request: Request, subpath: str = ""):
             return await _proxy_cover_response(cover, request, guid)
         return _placeholder_cover_response(guid)
 
+    # 负缓存：整条解析链曾失败（kw artistpicserver 403 / 网易无命中）的 guid，TTL 内
+    # 直接落占位图，避免每次列表渲染都重跑昂贵失败链（慢且扰上游）。成功解析的 guid
+    # 不会进负缓存；服务重启会清空负缓存，重新尝试解析（部署新版本即自动刷新）。
+    if _cover_negative_get(guid):
+        return _placeholder_cover_response(guid)
+
     data = await _online_info(request, guid)
     cover = str((data or {}).get("cover_url") or "")
     # ① 已知直链封面同源回源；酷我文本封面（artistpicserver 返回的是文本页）除外
     if cover and _KW_TEXT_COVER_HOST not in cover:
         return await _proxy_cover_response(cover, request, guid)
 
-    # ② 按源+ID 直构 CDN：kw rid → artistpicserver 真图；qq albummid → gtimg
-    direct = ""
-    kw_rid = _kw_rid_from_guid(guid)
-    if kw_rid:
-        direct = await _kw_cover_by_rid(kw_rid)
+    # ② 按源+ID 直构 CDN：
+    #    kg hash → 酷狗公开静态图（免鉴权，覆盖 lx 酷狗全部曲目，实测稳定 200）
+    #    kw rid  → 酷我 artistpicserver 真图（实测 403 反爬，失败回落，后续进负缓存）
+    #    qq albummid → 腾讯 gtimg
+    direct = _kg_cover_by_hash(guid)
+    if not direct:
+        kw_rid = _kw_rid_from_guid(guid)
+        if kw_rid:
+            direct = await _kw_cover_by_rid(kw_rid)
     if not direct:
         direct = _qq_cover_by_albummid((data or {}).get("albummid"))
     if direct:
         return await _proxy_cover_response(direct, request, guid)
 
-    # ③ 网易 cloudsearch 同名曲补全
-    enriched = await _enrich_cover_via_netease(request, guid, data or {})
+    # ③ 网易 cloudsearch/pc 直连同名曲补全（免 musicbox 依赖；musicbox 未启用时唯一兜底）
+    title = str((data or {}).get("title") or "")
+    artist = str((data or {}).get("artist") or "")
+    # _online_info 对 lx 酷我源拿不到标题 → 从推荐缓存 VO 回填，保证 KW 等源也能搜同名曲
+    if not title or not artist:
+        vt, va = _vo_meta_from_cache(guid)
+        if not title:
+            title = vt
+        if not artist:
+            artist = va
+    enriched = await _netease_direct_cover(title, artist)
+    if not enriched:
+        enriched = await _enrich_cover_via_netease(request, guid, data or {})
     if enriched:
         return await _proxy_cover_response(enriched, request, guid)
 
@@ -5655,7 +5856,8 @@ async def static_cover(request: Request, subpath: str = ""):
         art, mime = embedded
         return Response(content=art, media_type=mime, headers={"Cache-Control": "public, max-age=86400"})
 
-    # ⑤ 本地占位图池：在线曲目封面永不 404
+    # ⑤ 本地占位图池：在线曲目封面永不 404。整条链失败 → 记负缓存，TTL 内不再重跑
+    _cover_negative_put(guid)
     return _placeholder_cover_response(guid)
 
 
