@@ -36,3 +36,6 @@ dist/
 packaging/fpk/.build/
 
 .cursor/
+
+# 离线 fpk 专用：内置镜像包（由 docker save 生成，禁止提交大文件）
+images/

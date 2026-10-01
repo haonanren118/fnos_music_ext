@@ -211,3 +211,23 @@ sudo python3 tests/integration/fpk_lifecycle.py --auto-restore
 - 使用者应遵守所在国家/地区法律法规与第三方平台用户协议；因滥用导致的任何责任由使用者自行承担。
 
 上游致谢：[CharlesPikachu/musicdl](https://github.com/CharlesPikachu/musicdl)、[darknessomi/musicbox](https://github.com/darknessomi/musicbox)、洛雪音乐（LX Music）社区及其自定义源规范。
+
+
+## 离线部署（v2.6.4 新增）
+
+把 Docker 镜像与代理依赖内置进 fpk，安装即跑、不联网拉取/构建，解决「部署卡在 55%」的问题。
+
+- ensure_base_image.sh：安装时优先从内置镜像包 images/fnmusic-sources.tar 执行 docker load（含「镜像已在本地则秒级跳过」快路径）；包缺失才回退在线探测。
+- install.sh / extend.sh：compose up -d --no-build，禁止镜像缺失时静默触发联网构建。
+- ensure_proxy_deps.sh：proxy/wheels/ 存在时离线安装代理依赖。
+
+### 打包离线 fpk
+
+```bash
+# 1. 生成内置镜像包（需在已构建过 fnmusic-sources 的机器上执行一次）
+docker save fnmusic-sources:latest -o images/fnmusic-sources.tar
+# 2. 打包（fnpack 在 fnOS 内执行）
+cd packaging/fpk && bash build.sh
+```
+
+> images/ 已被 .gitignore 排除，请勿把 1.2GB 镜像包提交进 Git。

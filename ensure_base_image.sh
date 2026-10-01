@@ -92,6 +92,38 @@ persist_base_image() {
     chmod 600 "${ENV_PATH}"
 }
 
+# ==============================================================================
+# 离线模式（v2.6.4-offline）：优先从内置镜像包加载，彻底跳过联网拉取基础镜像
+# （原「部署时间太长」根因：国内镜像源逐个探测 + 每源 240s 超时拉 python:3.13-slim）
+# 镜像包由打包阶段 docker save 进 app/repo/images/fnmusic-sources.tar，安装即本地 load。
+# 排障日志统一写 /tmp/fnmusic_offline.log（安装失败后可 SSH 读取）。
+# ==============================================================================
+OFFLINE_LOG="/tmp/fnmusic_offline.log"
+olog() { echo "[$(date '+%F %T')] $*" >> "${OFFLINE_LOG}" 2>/dev/null || true; }
+
+# 快路径：镜像已在本地（历史构建或上次加载）→ 秒级返回，零网络零 IO
+if ${DOCKER_CMD} image inspect fnmusic-sources:latest >/dev/null 2>&1; then
+    olog "image fnmusic-sources:latest already present, skip load"
+    log_info "镜像 fnmusic-sources:latest 本地已存在，直接复用。"
+    persist_base_image "fnmusic-sources:latest"
+    exit 0
+fi
+
+OFFLINE_TAR="${BASE_DIR}/images/fnmusic-sources.tar"
+if [ -f "${OFFLINE_TAR}" ]; then
+    olog "offline load start: ${OFFLINE_TAR} ($(stat -c%s "${OFFLINE_TAR}" 2>/dev/null || echo '?') bytes)"
+    log_info "离线模式：从内置镜像包加载 fnmusic-sources:latest（无需联网）..."
+    if ${DOCKER_CMD} load -i "${OFFLINE_TAR}" >>"${OFFLINE_LOG}" 2>&1; then
+        olog "offline load OK"
+        log_info "镜像已加载：fnmusic-sources:latest（部署不再联网拉取）"
+        persist_base_image "fnmusic-sources:latest"
+        exit 0
+    fi
+    olog "offline load FAILED (see log above)"
+    log_warn "内置镜像包加载失败，回退到在线探测拉取..."
+fi
+# ---- 以下为原在线探测逻辑（仅当内置镜像包缺失时兜底）----
+
 MANUAL="${BASE_IMAGE:-}"
 CACHED="$(cached_base_image)"
 MIRRORS="${FNMUSIC_DOCKER_MIRRORS:-${DEFAULT_MIRRORS}}"

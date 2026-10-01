@@ -39,6 +39,18 @@ if [ ! -x "${PIP_BIN}" ]; then
 fi
 
 # 候选源去重：用户自定义 PIP_INDEX 永远第一位
+# 离线模式：优先用内置 wheels 安装代理依赖（无需联网）
+WHEELS_DIR="${BASE_DIR}/proxy/wheels"
+if [ -d "${WHEELS_DIR}" ] && ls "${WHEELS_DIR}"/*.whl >/dev/null 2>&1; then
+    log_info "离线模式：从内置 wheels 安装代理依赖（无需联网）..."
+    if "${PIP_BIN}" install -q -U pip --no-index --find-links "${WHEELS_DIR}" \
+       && "${PIP_BIN}" install -q -r "${REQ_FILE}" --no-index --find-links "${WHEELS_DIR}"; then
+        log_info "代理依赖安装完成（离线 wheels）。"
+        exit 0
+    fi
+    log_warn "内置 wheels 安装失败，回退到在线 pip 源..."
+fi
+
 candidates="${PIP_INDEX}"
 for idx in ${FALLBACK_INDEXES}; do
     [ "${idx}" = "${PIP_INDEX}" ] || candidates="${candidates} ${idx}"

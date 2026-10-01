@@ -1114,8 +1114,10 @@ install_sources_container() {
     fi
     # issue #24：构建日志逐层可见（非 tty 下默认进度条会被压成静默，看似"卡在 55%"）
     export BUILDKIT_PROGRESS="${BUILDKIT_PROGRESS:-plain}"
-    if ! run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build; then
-        log_err "Docker 镜像构建或启动失败（compose up --build）。"
+    # 离线模式：镜像已由 ensure_base_image.sh 从内置包加载，--no-build 禁止任何
+    # 隐式重建（compose 在镜像缺失时会静默触发构建，弱网下表现为"卡在 55%"）。
+    if ! run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --no-build; then
+        log_err "Docker 容器启动失败（compose up -d --no-build，镜像缺失且禁止联网构建）。"
         log_err "若日志里反复出现 apt/pip 拉取超时：多为国内网络直连境外源受限，"
         log_err "可为 Docker 配置代理后重试，或检查 /var/log/apps/fnmusic-ext-install.log 定位具体步骤。"
         return 1

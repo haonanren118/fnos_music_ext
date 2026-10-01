@@ -506,7 +506,15 @@ ensure_image_current() {
     fi
     # issue #24：构建日志逐层可见（非 tty 下默认进度条会被压成静默）
     export BUILDKIT_PROGRESS="${BUILDKIT_PROGRESS:-plain}"
-    if ! run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build; then
+    # 离线模式：镜像已在（历史构建或 fpk 内置包加载）时绝不重建——
+    # --build 会无条件重跑 Dockerfile 的 apt/pip 步骤，构建容器无外网时直接失败，
+    # 表现为 fpk 安装/启动"卡在 55%"后报错。
+    if run_docker image inspect fnmusic-sources:latest >/dev/null 2>&1; then
+        if ! run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --no-build; then
+            log_err "启动 ${CONTAINER_NAME} 失败（离线模式：镜像已存在，不重建）。"
+            exit 1
+        fi
+    elif ! run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build; then
         log_err "构建/启动 ${CONTAINER_NAME} 失败。"
         exit 1
     fi
