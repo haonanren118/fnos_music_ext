@@ -168,6 +168,11 @@ CONF = {
     # 音乐页在热门推荐与官方歌单之间展示账号自建歌单（只读，不回写网易）
     "netease_my_playlists": os.environ.get("FNMUSIC_NETEASE_MY_PLAYLISTS", "false").lower() in ("true", "1", "yes"),
     "cover_enrich": os.environ.get("FNMUSIC_COVER_ENRICH", "true").lower() in ("true", "1", "yes"),
+    # 同源回源封面（2.6.5）：默认开。在线/歌单封面原本 302 跳第三方图床直链，
+    # 远程 HTTPS 下 App 直连会被混合内容/防盗链/CORS 拦截→全回落波纹占位图
+    # （与早前音频直链远程全挂同一根因）。开启后改为服务端同源回源（带浏览器
+    # UA/Referer 抓取图床再流式返回），彻底绕开拦截。关闭则沿用旧 302 行为。
+    "cover_proxy": os.environ.get("FNMUSIC_COVER_PROXY", "true").lower() in ("true", "1", "yes"),
     "env_watch": os.environ.get("FNMUSIC_ENV_WATCH", "true").lower() in ("true", "1", "yes"),
     # 官方端点取证：未拦截的 /music/api 请求首见 INFO、之后每 50 次采样一条；
     # =detail 时逐条记录。官方 App 更新引入新端点时（如 2.5.0 前的 download/*），
@@ -483,6 +488,7 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_RECOMMEND_DAILY": ("recommend_daily", "bool"),
     "FNMUSIC_NETEASE_MY_PLAYLISTS": ("netease_my_playlists", "bool"),
     "FNMUSIC_COVER_ENRICH": ("cover_enrich", "bool"),
+    "FNMUSIC_COVER_PROXY": ("cover_proxy", "bool"),
     "FNMUSIC_TRACE_FORWARD": ("trace_forward", "bool"),
     "FNMUSIC_TRANSCODE_ENABLED": ("transcode_enabled", "bool"),
     "FNMUSIC_TRANSCODE_BITRATE": ("transcode_bitrate", "str"),
@@ -1186,6 +1192,53 @@ def download_cover_bytes(url: str) -> "tuple[bytes, str] | None":
     except Exception as e:
         logger.debug("cover fetch failed for %s: %s", url, type(e).__name__)
         return None
+
+
+async def _proxy_cover_response(url: str, request: Request, fallback_guid: str) -> Response:
+    """同源回源封面：服务端拉取第三方图床封面字节，以同源 Response 流式返回。
+
+    原实现把在线/歌单封面 302 跳转到网易/QQ/酷我等图床直链。在远程 HTTPS 访问
+    下，飞牛音乐 App 直连这些外部图床会被混合内容、CORS 或防盗链（Referer 校验）
+    拦截，导致封面全部回落默认波纹占位图——与早前音频直链在远程 HTTPS 下全挂是
+    同一类根因。
+
+    改为同源回源：proxy 在 NAS 侧用浏览器 UA（必要时带 Referer）抓取图床字节，再
+    原样返回给 App。App 收到的是与自身 API 同源的图，既不触发混合内容/CORS，也绕
+    开图床防盗链；任何失败都回落占位图，绝不让封面 404。
+    """
+    if not CONF.get("cover_proxy", True):
+        # 开关关闭：沿用旧 302 行为（留给需要直连图床的局域网场景）
+        if url and url.startswith(("http://", "https://")) and _KW_TEXT_COVER_HOST not in url:
+            return RedirectResponse(url, status_code=302)
+        return _placeholder_cover_response(fallback_guid)
+    url = str(url or "").strip()
+    if not url.startswith(("http://", "https://")) or _KW_TEXT_COVER_HOST in url:
+        return _placeholder_cover_response(fallback_guid)
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; fnmusic-ext/cover)"}
+        # 网易/QQ 图床按 Referer 鉴权，带上官方域名显著提升命中率（酷我文本页已排除）
+        if "music.126.net" in url or "126.net" in url:
+            headers["Referer"] = "https://music.163.com/"
+        elif "gtimg.cn" in url:
+            headers["Referer"] = "https://y.qq.com/"
+        async with _cover_cdn_client() as client:
+            r = await client.get(url, headers=headers)
+        if r.status_code != 200:
+            return _placeholder_cover_response(fallback_guid)
+        data = r.content or b""
+        if not data or len(data) > _COVER_FETCH_MAX_BYTES:
+            return _placeholder_cover_response(fallback_guid)
+        mime = _sniff_image_mime(data)
+        if not mime:
+            return _placeholder_cover_response(fallback_guid)
+        return Response(
+            content=data,
+            media_type=mime,
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+    except Exception as e:
+        logger.debug("cover proxy failed for %s: %s", url, type(e).__name__)
+        return _placeholder_cover_response(fallback_guid)
 
 
 def _has_embedded_cover(path: str) -> bool:
@@ -5562,7 +5615,7 @@ async def static_cover(request: Request, subpath: str = ""):
     if nm_pl_id:
         cover = nmpl.cover_url_for(nm_pl_id)
         if cover:
-            return RedirectResponse(cover, status_code=302)
+            return await _proxy_cover_response(cover, request, guid)
         return Response(status_code=404)
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
@@ -5572,14 +5625,14 @@ async def static_cover(request: Request, subpath: str = ""):
     if album_entry is not None:
         cover = str((album_entry.get("item") or {}).get("cover_url") or "")
         if cover and _KW_TEXT_COVER_HOST not in cover:
-            return RedirectResponse(cover, status_code=302)
+            return await _proxy_cover_response(cover, request, guid)
         return _placeholder_cover_response(guid)
 
     data = await _online_info(request, guid)
     cover = str((data or {}).get("cover_url") or "")
-    # ① 已知直链封面直接 302；酷我文本封面（artistpicserver 返回的是文本页）除外
+    # ① 已知直链封面同源回源；酷我文本封面（artistpicserver 返回的是文本页）除外
     if cover and _KW_TEXT_COVER_HOST not in cover:
-        return RedirectResponse(cover, status_code=302)
+        return await _proxy_cover_response(cover, request, guid)
 
     # ② 按源+ID 直构 CDN：kw rid → artistpicserver 真图；qq albummid → gtimg
     direct = ""
@@ -5589,12 +5642,12 @@ async def static_cover(request: Request, subpath: str = ""):
     if not direct:
         direct = _qq_cover_by_albummid((data or {}).get("albummid"))
     if direct:
-        return RedirectResponse(direct, status_code=302)
+        return await _proxy_cover_response(direct, request, guid)
 
     # ③ 网易 cloudsearch 同名曲补全
     enriched = await _enrich_cover_via_netease(request, guid, data or {})
     if enriched:
-        return RedirectResponse(enriched, status_code=302)
+        return await _proxy_cover_response(enriched, request, guid)
 
     # ④ 本地边听边存文件的内嵌专辑图
     embedded = _embedded_cover_bytes(guid)

@@ -113,7 +113,19 @@ OFFLINE_TAR="${BASE_DIR}/images/fnmusic-sources.tar"
 if [ -f "${OFFLINE_TAR}" ]; then
     olog "offline load start: ${OFFLINE_TAR} ($(stat -c%s "${OFFLINE_TAR}" 2>/dev/null || echo '?') bytes)"
     log_info "离线模式：从内置镜像包加载 fnmusic-sources:latest（无需联网）..."
-    if ${DOCKER_CMD} load -i "${OFFLINE_TAR}" >>"${OFFLINE_LOG}" 2>&1; then
+    # 心跳（issue #24 同源）：docker load 1.2GB 大镜像长时间无输出，fpk 安装器里
+    # 表现为"卡在 55%"；后台 load + 每 30s 打一行已耗时，让用户知道仍在推进。
+    ${DOCKER_CMD} load -i "${OFFLINE_TAR}" >>"${OFFLINE_LOG}" 2>&1 &
+    load_pid=$!
+    lwaited=0
+    while kill -0 "${load_pid}" 2>/dev/null; do
+        sleep 5
+        lwaited=$((lwaited + 5))
+        if (( lwaited % 30 == 0 )) && kill -0 "${load_pid}" 2>/dev/null; then
+            log_info "仍在加载内置镜像包（已等 ${lwaited}s）..."
+        fi
+    done
+    if wait "${load_pid}" 2>/dev/null; then
         olog "offline load OK"
         log_info "镜像已加载：fnmusic-sources:latest（部署不再联网拉取）"
         persist_base_image "fnmusic-sources:latest"
