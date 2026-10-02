@@ -6904,21 +6904,24 @@ def _playlist_public_fields(record: dict, tracks: list | None = None) -> dict:
     # 封面取曲在下发时重算（兼容当天旧缓存），并伪装成官方 track_+32hex 形态：
     # 官方 App 按 id 格式过滤，online: 原样下发的 coverId 不会被渲染成图标。
     # 本地曲目的 coverId 是真实官方封面 guid：原样下发（封面端点透传官方）。
-    cover = ""
+    # cover_real：真实封面 guid（在线 online:xxx 或本地 32hex），用于 coverUrl 让电脑端/web 直接
+    # 走服务端封面端点解析，免去 fake guid 反查注册表的依赖，更稳；coverId 仍伪装成官方 track_ 形态供手机端渲染。
+    cover_real = ""
     picked = dailyrec.pick_playlist_cover_track(tracks)
     if picked:
-        cover = str(picked.get("coverId") or picked.get("guid") or "")
-    if not cover:
-        cover = str(record.get("coverId") or record.get("guid") or "")
-    if cover.startswith("online:"):
-        cover = "track_" + fake_official_guid(cover)
+        cover_real = str(picked.get("coverId") or picked.get("guid") or "")
+    if not cover_real:
+        cover_real = str(record.get("coverId") or record.get("guid") or "")
+    cover_id = cover_real
+    if cover_id.startswith("online:"):
+        cover_id = "track_" + fake_official_guid(cover_id)
     return {
         "guid": record.get("guid"),
         "name": record.get("name") or "每日推荐",
-        "coverId": cover,
-        # 同步下发 coverUrl（同源封面端点）：电脑端/web 读 coverUrl 取图，且此字段此前为空、
-        # 客户端从未缓存过，故是全新 URL，可绕开修复前 coverId→占位图的旧缓存（max-age=86400）。
-        "coverUrl": _cover_endpoint_url(cover) if cover else "",
+        "coverId": cover_id,
+        # 同步下发 coverUrl（同源封面端点，用真实封面 guid，免注册表依赖）：电脑端/web 读 coverUrl 取图，
+        # 此字段此前为空、客户端从未缓存过，故是全新 URL，可绕开修复前 coverId→占位图的旧缓存（max-age=86400）。
+        "coverUrl": _cover_endpoint_url(cover_real) if cover_real else "",
         "createdAt": int(record.get("createdAt") or time.time()),
         "updatedAt": int(record.get("updatedAt") or time.time()),
         "trackCount": int(record.get("trackCount") or 0),
@@ -7228,6 +7231,17 @@ async def playlist_track_list(request: Request):
         return auth_resp
     bundle = await _load_daily_bundle(request, user_guid, kind)
     tracks = dailyrec.stamp_playlist_tracks(list(bundle.get("tracks") or []))
+    # 电脑端/web 读 coverUrl 取图：推荐缓存 VO 的 coverUrl 多为空，这里按封面 guid 兜底为
+    # 服务端封面端点（在线 online:xxx 走在线解析链，本地 32hex 走本地解析），与手机端 coverId 一致。
+    for _t in tracks:
+        if isinstance(_t, dict) and not (_t.get("coverUrl") or _t.get("coverURL")):
+            _cid = str(_t.get("coverId") or _t.get("guid") or "")
+            if _cid:
+                _ep = _cover_endpoint_url(_cid)
+                if not _t.get("coverUrl"):
+                    _t["coverUrl"] = _ep
+                if not _t.get("coverURL"):
+                    _t["coverURL"] = _ep
     try:
         page = max(int(request.query_params.get("page") or 1), 1)
     except (TypeError, ValueError):
