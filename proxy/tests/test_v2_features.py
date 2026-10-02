@@ -391,9 +391,10 @@ def _setup_clients(**handlers):
 
 
 def test_cover_kw_text_url_resolved_via_rid(monkeypatch):
-    """lx 酷我条目返回 artistpicserver 文本封面 → 解析 rid 拿真图再 302。"""
+    """lx 酷我条目返回 artistpicserver 文本封面 → 解析 rid 拿真图直链 → 服务端回源图片字节（200）。"""
     monkeypatch.setitem(CONF, "lx_enabled", True)
     text_cover = "https://artistpicserver.kuwo.cn/pic?corp=kuwo&type=rid_pic&pictype=500&size=500&rid=123"
+    fake_jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF-kw-real"
 
     def lx_handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/v1/track/info"
@@ -405,23 +406,29 @@ def test_cover_kw_text_url_resolved_via_rid(monkeypatch):
 
     def cdn_handler(request: httpx.Request) -> httpx.Response:
         cdn_calls["n"] += 1
-        assert "rid=123" in str(request.url)
-        return httpx.Response(200, text="http://img.kuwo.cn/abc/real.jpg extra")
+        url = str(request.url)
+        if "artistpicserver.kuwo.cn" in url:
+            assert "rid=123" in url
+            return httpx.Response(200, text="http://img.kuwo.cn/abc/real.jpg extra")
+        assert url == "http://img.kuwo.cn/abc/real.jpg"
+        return httpx.Response(200, content=fake_jpeg, headers={"content-type": "image/jpeg"})
 
     _setup_clients(lx=lx_handler)
     monkeypatch.setattr("proxy.app._COVER_CDN_TRANSPORT", httpx.MockTransport(cdn_handler))
     with TestClient(app) as client:
         resp = client.get("/music/api/v1/static/cover?coverId=online:lx:kw:123", follow_redirects=False)
-        assert resp.status_code == 302
-        assert resp.headers["location"] == "http://img.kuwo.cn/abc/real.jpg"
-        # 第二次命中内存缓存，不再打 CDN
+        assert resp.status_code == 200
+        assert resp.content == fake_jpeg
+        assert resp.headers.get("content-type").startswith("image/")
+        # 第二次命中图片字节缓存，rid 解析亦有缓存：不再打 CDN
         client.get("/music/api/v1/static/cover?coverId=online:lx:kw:123", follow_redirects=False)
-    assert cdn_calls["n"] == 1
+    assert cdn_calls["n"] == 2  # 1 次 rid 解析 + 1 次图片回源
 
 
-def test_cover_qq_albummid_gtimg_redirect(monkeypatch):
+def test_cover_qq_albummid_gtimg_proxied(monkeypatch):
     monkeypatch.setitem(CONF, "musicdl_enabled", True)
     monkeypatch.setitem(CONF, "online_sources", "QqMusicClient,KuwoMusicClient,MiguMusicClient")
+    fake_jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF-qq-gtimg"
 
     def musicdl_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={
@@ -430,11 +437,17 @@ def test_cover_qq_albummid_gtimg_redirect(monkeypatch):
             "cover_url": "", "albummid": "003x9b8s1v8ZxT",
         })
 
+    def cdn_handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url).startswith("https://y.gtimg.cn/music/photo_new/T002R800x800M000003x9b8s1v8ZxT")
+        return httpx.Response(200, content=fake_jpeg, headers={"content-type": "image/jpeg"})
+
     _setup_clients(musicdl=musicdl_handler)
+    monkeypatch.setattr("proxy.app._COVER_CDN_TRANSPORT", httpx.MockTransport(cdn_handler))
     with TestClient(app) as client:
         resp = client.get("/music/api/v1/static/cover?coverId=online:qq:003x", follow_redirects=False)
-        assert resp.status_code == 302
-        assert resp.headers["location"].startswith("https://y.gtimg.cn/music/photo_new/T002R800x800M000003x9b8s1v8ZxT")
+        assert resp.status_code == 200
+        assert resp.content == fake_jpeg
+        assert resp.headers.get("content-type").startswith("image/")
 
 
 def test_cover_enrich_via_netease_search(monkeypatch):
@@ -463,10 +476,20 @@ def test_cover_enrich_via_netease_search(monkeypatch):
         return httpx.Response(404)
 
     _setup_clients(musicdl=musicdl_handler, musicbox=musicbox_handler)
+    fake_jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF-netease-album"
+
+    def cdn_handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://p1.music.126.net/cover.jpg"
+        # 网易图床按 Referer 鉴权，回源必须带官方域名 Referer
+        assert request.headers.get("referer") == "https://music.163.com/"
+        return httpx.Response(200, content=fake_jpeg, headers={"content-type": "image/jpeg"})
+
+    monkeypatch.setattr("proxy.app._COVER_CDN_TRANSPORT", httpx.MockTransport(cdn_handler))
     with TestClient(app) as client:
         resp = client.get("/music/api/v1/static/cover?coverId=online:kugou:xyz", follow_redirects=False)
-        assert resp.status_code == 302
-        assert resp.headers["location"] == "https://p1.music.126.net/cover.jpg"
+        assert resp.status_code == 200
+        assert resp.content == fake_jpeg
+        assert resp.headers.get("content-type").startswith("image/")
 
 
 def test_cover_enrich_disabled_falls_to_placeholder(monkeypatch):
@@ -488,11 +511,14 @@ def test_cover_enrich_disabled_falls_to_placeholder(monkeypatch):
         return httpx.Response(404)
 
     _setup_clients(musicdl=musicdl_handler, musicbox=musicbox_handler)
+    # 网易直连兜底与所有外部 CDN 一律失败 → 确定性落占位图（否则测试依赖真实外网）
+    monkeypatch.setattr("proxy.app._COVER_CDN_TRANSPORT", httpx.MockTransport(lambda r: httpx.Response(503)))
     with TestClient(app) as client:
         resp = client.get("/music/api/v1/static/cover?coverId=online:kugou:xyz", follow_redirects=False)
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("image/png")
-    assert resp.headers.get("cache-control") == "public, max-age=86400"
+    # 占位图绝不可被客户端长缓存（旧 max-age=86400 会把占位图冻住一整天）
+    assert resp.headers.get("cache-control") == "no-cache"
     assert box_calls["n"] == 0  # 补全关闭不打 musicbox
 
 
@@ -505,6 +531,8 @@ def test_cover_placeholder_never_404_and_deterministic(monkeypatch):
         })
 
     _setup_clients(musicdl=musicdl_handler)
+    # 阻断网易直连兜底等真实外网：全部 503 → 确定性落占位图
+    monkeypatch.setattr("proxy.app._COVER_CDN_TRANSPORT", httpx.MockTransport(lambda r: httpx.Response(503)))
     guid = "online:migu:9"
     with TestClient(app) as client:
         r1 = client.get(f"/music/api/v1/static/cover?coverId={guid}", follow_redirects=False)
@@ -515,6 +543,8 @@ def test_cover_placeholder_never_404_and_deterministic(monkeypatch):
     assert r1.content == r2.content  # 同 guid 确定性选取
     assert r1.content != _TINY_GRAY_PNG  # 用的是仓库占位图池而非 1x1 兜底
     assert r1.content[:8] == b"\x89PNG\r\n\x1a\n"
+    # 占位图 no-cache：每次回源确认，服务端负缓存兜性能，绝不把占位图冻在客户端
+    assert r1.headers.get("cache-control") == "no-cache"
 
 
 def test_cover_placeholder_files_exist_and_cover_pool():
@@ -634,6 +664,16 @@ def test_static_cover_playlist_skips_coverless_tracks(tmp_path, monkeypatch):
                                           "cover_url": "http://img.music.migu.cn/2.jpg"})
 
     rec_dir = _cover_env(tmp_path, monkeypatch, musicdl_handler=musicdl_handler)
+    # 网易兜底返回空（不打真实外网）；migu 图床回源给确定性字节
+    fake_jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF-migu2"
+
+    def cdn_handler(request: httpx.Request) -> httpx.Response:
+        if "music.163.com" in str(request.url):
+            return httpx.Response(200, json={"result": {"songs": []}})
+        assert str(request.url) == "http://img.music.migu.cn/2.jpg"
+        return httpx.Response(200, content=fake_jpeg, headers={"content-type": "image/jpeg"})
+
+    monkeypatch.setattr("proxy.app._COVER_CDN_TRANSPORT", httpx.MockTransport(cdn_handler))
     tracks = [
         {"guid": "online:migu:1", "coverId": "online:migu:1", "cover_url": ""},
         {"guid": "online:migu:2", "coverId": "online:migu:2", "cover_url": "http://img.music.migu.cn/2.jpg"},
@@ -641,8 +681,9 @@ def test_static_cover_playlist_skips_coverless_tracks(tmp_path, monkeypatch):
     pl_guid = _write_recommend_bundle(rec_dir, "user-cover", tracks)
     with TestClient(app) as client:
         resp = client.get(f"/music/api/v1/static/cover?coverId={pl_guid}&size=120", follow_redirects=False)
-    assert resp.status_code == 302
-    assert resp.headers.get("location") == "http://img.music.migu.cn/2.jpg"
+    assert resp.status_code == 200
+    assert resp.content == fake_jpeg
+    assert resp.headers.get("content-type").startswith("image/")
 
 
 def test_static_cover_playlist_without_covers_returns_404(tmp_path, monkeypatch):
@@ -676,6 +717,16 @@ def test_static_cover_disguised_playlist_cover_survives_restart(tmp_path, monkey
                                           "cover_url": "http://img.music.migu.cn/2.jpg"})
 
     rec_dir = _cover_env(tmp_path, monkeypatch, musicdl_handler=musicdl_handler)
+    # 网易兜底返回空（不打真实外网）；migu 图床回源给确定性字节
+    fake_jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF-migu2"
+
+    def cdn_handler(request: httpx.Request) -> httpx.Response:
+        if "music.163.com" in str(request.url):
+            return httpx.Response(200, json={"result": {"songs": []}})
+        assert str(request.url) == "http://img.music.migu.cn/2.jpg"
+        return httpx.Response(200, content=fake_jpeg, headers={"content-type": "image/jpeg"})
+
+    monkeypatch.setattr("proxy.app._COVER_CDN_TRANSPORT", httpx.MockTransport(cdn_handler))
     tracks = [
         {"guid": "online:migu:1", "coverId": "online:migu:1", "cover_url": ""},
         {"guid": "online:migu:2", "coverId": "online:migu:2", "cover_url": "http://img.music.migu.cn/2.jpg"},
@@ -693,8 +744,9 @@ def test_static_cover_disguised_playlist_cover_survives_restart(tmp_path, monkey
     try:
         with TestClient(app) as client:
             resp = client.get(f"/music/api/v1/static/cover?coverId={fake_cover}&size=120", follow_redirects=False)
-        assert resp.status_code == 302
-        assert resp.headers.get("location") == "http://img.music.migu.cn/2.jpg"
+        assert resp.status_code == 200
+        assert resp.content == fake_jpeg
+        assert resp.headers.get("content-type").startswith("image/")
     finally:
         _FAKE_GUID_REVERSE.clear()
         _FAKE_GUID_REVERSE.update(backup)

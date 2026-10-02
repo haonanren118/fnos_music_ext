@@ -839,8 +839,9 @@ async def test_hot_playlist_uses_netease_charts(tmp_path, monkeypatch):
     assert payload["playlist"]["name"] == "热门推荐"
     assert len(payload["tracks"]) == dailyrec.PLAYLIST_SIZE
     assert all(str(t["guid"]).startswith("online:netease:") for t in payload["tracks"])
-    # 封面 = 第一个有 cover_url 的歌（第一首在列）
-    assert payload["playlist"]["coverId"] == payload["tracks"][0]["guid"]
+    # 封面 = 第一个有 cover_url 的歌（第一首在列）；coverId 为其独立盐伪装 id，可反解
+    assert payload["playlist"]["coverId"] == payload["tracks"][0]["coverId"]
+    assert resolve_real_guid(payload["playlist"]["coverId"]) == payload["tracks"][0]["guid"]
     assert str(payload["tracks"][0].get("cover_url") or "").startswith("http://img/70000")
 
 
@@ -922,8 +923,10 @@ async def test_hot_uses_lx_charts_when_musicbox_unavailable(tmp_path, monkeypatc
     assert payload["tiers"] == ["lx-charts"]
     assert len(payload["tracks"]) == dailyrec.PLAYLIST_SIZE
     assert all(str(t["guid"]).startswith("online:lx:kg:") for t in payload["tracks"])
-    # lx 榜单曲目 cover_url 全为空：无可用封面，coverId 落到歌单自身 guid
-    assert payload["playlist"]["coverId"] == payload["guid"]
+    # lx 榜单曲目 cover_url 全为空：v2.6.12 起在线曲目恒有 coverId（独立盐伪装），
+    # 封面端点可按源直构/网易兜底出图，歌单 coverId 取第一首的 coverId（可反解）
+    assert payload["playlist"]["coverId"] == payload["tracks"][0]["coverId"]
+    assert resolve_real_guid(payload["playlist"]["coverId"]) == payload["tracks"][0]["guid"]
 
 
 # ------------------------------------------------ 推荐歌单封面取曲
@@ -987,7 +990,9 @@ async def test_daily_cover_skips_coverless_tracks(tmp_path, monkeypatch):
         )
     assert payload["tracks"][0]["title"] == "无封面歌"
     assert not payload["tracks"][0].get("cover_url")
-    assert payload["playlist"]["coverId"] == payload["tracks"][1]["guid"]
+    # v2.6.16：歌单 coverId 取第一个有封面歌的 coverId（独立盐纯 32-hex），可反解回其真实 guid
+    assert payload["playlist"]["coverId"] == payload["tracks"][1]["coverId"]
+    assert resolve_real_guid(payload["playlist"]["coverId"]) == payload["tracks"][1]["guid"]
     assert payload["tracks"][1].get("cover_url")
 
 
@@ -1022,10 +1027,11 @@ def test_playlist_list_injects_both_playlists_with_disguised_cover(tmp_path, mon
         hot = next(it for it in recs if dailyrec.online_playlist_kind(str(it["guid"])) == "hot")
         assert "每日推荐" in daily["name"]
         assert hot["name"] == "热门推荐"
-        # coverId 伪装为官方形态（track_ + 32hex），且可反解回第一个有封面的歌
+        # coverId 伪装为纯 32-hex（v2.6.16 独立盐，列表行可渲染），且可反解回第一个有封面的歌
+        import re as _re
         for rec in (daily, hot):
             cover = str(rec["coverId"])
-            assert cover.startswith("track_") and len(cover) == 6 + 32
+            assert _re.fullmatch(r"[0-9a-f]{32}", cover)
             resolved = resolve_real_guid(cover)
             assert str(resolved).startswith("online:netease:")
 
@@ -1539,8 +1545,10 @@ def test_playlist_serves_local_random_tracks_and_cover_passthrough(tmp_path, mon
 
         cover = client.get("/music/api/v1/static/cover", params={"coverId": daily["coverId"]})
         assert cover.status_code == 200
-        assert cover_calls["n"] == 1
-        assert cover_calls["id"] == daily["coverId"]  # 官方封面 id 原样透传
+        assert cover.content[:8] == b"\x89PNG\r\n\x1a\n"  # 本地解析兜底占位图
+        # v2.6.8 起：官方封面 guid 不再透传官方 /static/cover（对本地 guid 固定 400），
+        # 改为服务端本地解析（内嵌图/网易兜底/占位图），上游封面端点零调用
+        assert cover_calls["n"] == 0
 
 
 def test_invalidate_today_cache_all_users(tmp_path):

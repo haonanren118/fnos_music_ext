@@ -15,6 +15,7 @@ from proxy.app import (
     CONF,
     _FAKE_ALBUM_REGISTRY,
     _SEARCH_CACHE,
+    _track_cover_id,
     app,
     album_entry_from_real_guid,
     build_online_track,
@@ -58,7 +59,7 @@ def test_build_online_track_registers_album_for_all_sources(item):
     album = vo.get("album")
     assert isinstance(album, dict) and album.get("name") == "叶惠美"
     assert album.get("guid") == f"{vo['guid']}:album"
-    assert album.get("coverId") == vo["guid"]
+    assert album.get("coverId") == _track_cover_id(vo["guid"])
     assert vo.get("albumName") == "叶惠美"
     # 伪装登记可反解：fake 形态与 track_ 前缀形态都能命中
     fake = fake_official_guid(album["guid"])

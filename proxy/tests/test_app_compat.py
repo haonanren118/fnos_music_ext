@@ -359,7 +359,9 @@ def test_search_response_disguised_no_online_prefix():
         online_items = [it for it in items if resolve_real_guid(str(it.get("guid"))).startswith("online:")]
         assert online_items, "merged online item missing"
         it = online_items[0]
-        assert it["coverId"].startswith("track_")
+        # v2.6.16：曲目 coverId 为独立盐伪装的纯 32-hex（列表行可渲染），可反解回 online: guid
+        import re as _re
+        assert _re.fullmatch(r"[0-9a-f]{32}", it["coverId"])
         assert resolve_real_guid(it["coverId"]).startswith("online:")
         assert resolve_real_guid(str(it["guid"])) == "online:migu:600908"
 

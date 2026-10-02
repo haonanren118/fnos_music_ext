@@ -707,29 +707,37 @@ run_docker() {
   printf '%s\\n' "$*" >> "${DOCKER_LOG}"
   case "$1" in
     container) return 0 ;;
+    image) if [ "${IMAGE_PRESENT:-1}" = "1" ]; then return 0; else return 1; fi ;;
     inspect) if [ "$3" = '{{.Image}}' ]; then printf 'sha256:img'; else printf '%s' "${STARTED_AT}"; fi; return 0 ;;
     compose|restart) return 0 ;;
   esac
 }
 reclaim_container() { return 0; }
 """
-    def run_case(started_at):
+    def run_case(started_at, image_present="1"):
         script = (stub_tpl + funcs + '\n' + block
                   ).replace('__BASE__', str(tmp_path)).replace('__STARTED__', started_at
                   ).replace('__LOG__', str(log))
         log.write_text('', encoding='utf-8')
-        result = subprocess.run(['bash', '-c', script], capture_output=True, text=True)
+        result = subprocess.run(['bash', '-c', script], capture_output=True, text=True,
+                                env={**os.environ, 'IMAGE_PRESENT': image_present})
         assert result.returncode == 0, result.stderr
         return log.read_text(encoding='utf-8')
 
-    # 容器比 .env 新（未改配置的例行运行）：重建校验执行，但不重启
+    # 容器比 .env 新（未改配置的例行运行）：重建校验执行，但不重启。
+    # 离线模式（06db4c1）：镜像已存在（fpk 内置/历史构建）时绝不 --build——
+    # 构建容器无外网时 apt/pip 步骤必挂，表现为安装"卡在 55%"；镜像在则 up -d --no-build。
     out = run_case('2100-01-01T00:00:00Z')
-    assert 'up -d --build' in out
+    assert 'up -d --no-build' in out
+    assert 'up -d --build' not in out
     assert 'restart' not in out
     # .env 比容器启动新（安装/切源后）：重建之外还要重启容器
     out = run_case('2000-01-01T00:00:00Z')
-    assert 'up -d --build' in out
+    assert 'up -d --no-build' in out
     assert 'restart fnmusic-sources' in out
+    # 镜像不存在（源码部署/git pull 后首次）：回退 up -d --build 同步新代码
+    out = run_case('2100-01-01T00:00:00Z', image_present='0')
+    assert 'up -d --build' in out
 
 
 def test_install_aligns_container_process_set_before_healthz(tmp_path):

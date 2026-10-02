@@ -9,6 +9,7 @@ from proxy.app import (
     app,
     CONF,
     _SEARCH_CACHE,
+    _track_cover_id,
     find_cache_file,
     library_basename,
     remember_media_path,
@@ -320,7 +321,9 @@ def test_search_track_preserves_lossless_and_common_formats():
         assert flac["format"] == "flac"
         assert flac["audioSpec"]["format"] == "flac"
         assert flac["audioSpec"]["path"].endswith(".flac")
-        assert flac["coverId"] == "track_" + fake_official_guid("online:netease:flac1")
+        # v2.6.16：曲目 coverId 为独立盐伪装的纯 32-hex（列表行可渲染），可反解回原 guid
+        assert flac["coverId"] == _track_cover_id("online:netease:flac1")
+        assert flac["coverId"] != fake_official_guid("online:netease:flac1")  # 封面盐与曲目 guid 盐解耦
         assert by_guid[fake_official_guid("online:migu:m4a1")]["format"] == "m4a"
         assert by_guid[fake_official_guid("online:kuwo:wav1")]["format"] == "wav"
         assert by_guid[fake_official_guid("online:kuwo:wav1")]["audioSpec"]["bitDepth"] == 16
@@ -1964,9 +1967,11 @@ def test_user_guid_sanitization():
     assert sanitize_user_guid(None) == "shared"
 
 
-def test_static_cover_online_coverid_redirect():
-    """测试 1: mock musicdl /info 返回 cover_url，GET /static/cover?coverId=online:migu:123&size=120 → 302 且 Location == cover_url。"""
+def test_static_cover_online_coverid_proxied(monkeypatch):
+    """coverId 为在线 guid 且 /info 给出封面直链 → 服务端同源回源图床字节（200），
+    不再 302 跳外部图床（远程 HTTPS 下混合内容/防盗链会拦掉直链）。"""
     cover_target = "http://img.music.migu.cn/cover123.jpg"
+    fake_jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF-fake-migu-cover"
 
     def upstream_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(400, text="Should not reach upstream")
@@ -1985,6 +1990,11 @@ def test_static_cover_online_coverid_redirect():
             },
         )
 
+    def cdn_handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == cover_target
+        return httpx.Response(200, content=fake_jpeg, headers={"content-type": "image/jpeg"})
+
+    monkeypatch.setattr("proxy.app._COVER_CDN_TRANSPORT", httpx.MockTransport(cdn_handler))
     app.state.upstream_client = httpx.AsyncClient(
         transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
     )
@@ -1997,32 +2007,34 @@ def test_static_cover_online_coverid_redirect():
             "/music/api/v1/static/cover?coverId=online:migu:123&size=120",
             follow_redirects=False,
         )
-        assert resp.status_code == 302
-        assert resp.headers.get("location") == cover_target
+        assert resp.status_code == 200
+        assert resp.content == fake_jpeg
+        assert resp.headers.get("content-type").startswith("image/")
+        assert resp.headers.get("cache-control") == "public, max-age=86400"
 
 
-def test_static_cover_local_coverid_passthrough():
-    """测试 2: coverId 为非 online: 本地 guid → 透传上游（mock 上游 200 二进制），响应原样。"""
-    fake_image_bytes = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR..."
+def test_static_cover_local_coverid_local_resolution(monkeypatch):
+    """coverId 为非 online: 本地 guid → 不再透传上游（飞牛对本地 guid 固定 400），
+    改走本地解析：无内嵌图/元数据/网易兜底时落占位图（200 PNG + no-cache，绝不 404）。"""
+
+    upstream_paths = []
 
     def upstream_handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/music/api/v1/static/cover"
-        assert request.url.params.get("coverId") == "local:track:999"
-        assert request.url.params.get("size") == "120"
-        return httpx.Response(
-            200,
-            content=fake_image_bytes,
-            headers={"content-type": "image/png"},
-        )
+        upstream_paths.append(request.url.path)
+        if request.url.path == "/music/api/v1/track/metadata":
+            return httpx.Response(200, json={"code": 0, "data": None})
+        return httpx.Response(400, text="upstream /static/cover must not be called")
 
-    def musicdl_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(500, text="Should not reach musicdl")
+    def cdn_handler(request: httpx.Request) -> httpx.Response:
+        # 网易兜底等外部请求一律失败，保证确定性落占位图
+        return httpx.Response(503)
 
+    monkeypatch.setattr("proxy.app._COVER_CDN_TRANSPORT", httpx.MockTransport(cdn_handler))
     app.state.upstream_client = httpx.AsyncClient(
         transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
     )
     app.state.musicdl_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(musicdl_handler), base_url="http://127.0.0.1:8768"
+        transport=httpx.MockTransport(lambda r: httpx.Response(500)), base_url="http://127.0.0.1:8768"
     )
 
     with TestClient(app) as client:
@@ -2031,8 +2043,12 @@ def test_static_cover_local_coverid_passthrough():
             follow_redirects=False,
         )
         assert resp.status_code == 200
-        assert resp.content == fake_image_bytes
+        assert resp.content[:8] == b"\x89PNG\r\n\x1a\n"  # 占位图池 PNG
         assert resp.headers.get("content-type") == "image/png"
+        # 占位图绝不可被客户端长缓存（旧 max-age=86400 会把占位图冻住一整天）
+        assert resp.headers.get("cache-control") == "no-cache"
+        # 本地 guid 绝不透传官方 /static/cover（固定 400，透传必失败）
+        assert "/music/api/v1/static/cover" not in upstream_paths
 
 
 def test_favorite_track_list_official_items_populate_is_favorite_and_empty_handling():
