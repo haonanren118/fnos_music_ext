@@ -211,6 +211,10 @@ python3 -m pytest        # 全量测试（无需 Docker/飞牛环境）
 sudo python3 tests/integration/fpk_lifecycle.py --auto-restore
 ```
 
+## 进群交流
+
+使用中遇到问题、想提建议，或单纯想聊聊飞牛音乐，欢迎加入 QQ 交流群 **708144970**（在 QQ 内搜索群号即可加入），与作者和其他用户直接沟通。
+
 ## 免责与版权声明
 
 - 本项目基于 **MIT 许可证** 开源（见 [LICENSE](LICENSE)），严格限定于**个人技术研究与非商业用途**；
