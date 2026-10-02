@@ -5509,6 +5509,61 @@ def _qq_cover_by_albummid(albummid: "str | None") -> str:
     return f"https://y.gtimg.cn/music/photo_new/T002R800x800M000{mid}.jpg?max_age=2592000"
 
 
+def _tx_songmid_from_guid(guid: str) -> str:
+    """从 lx 腾讯源 guid（online:lx:tx:<songmid>）取 songmid；非 tx 源返回空。"""
+    parts = str(guid or "").split(":")
+    if len(parts) >= 4 and parts[0] == "online" and parts[1] == "lx" and parts[2] == "tx":
+        return parts[3]
+    return ""
+
+
+async def _tx_track_meta(songmid: str) -> dict:
+    """腾讯（lx:tx）曲目元信息：songmid → {albummid, title, artist}。
+
+    lx 服务 /api/v1/track/info 对 tx 源返回全空（title/artist/cover_url 皆空），
+    且 tx 曲目常不在推荐缓存里 → 无法从缓存 VO 回填歌名，网易同名曲兜底无关键词可搜，
+    整条链落占位图（电脑端热门推荐歌单大图即由此无封面）。
+    这里改用 QQ 音乐公开接口按 songmid 取 albummid（直构 gtimg 封面）+ 真实歌名/歌手
+    （供网易兜底）。结果内存缓存，失败也缓存（短 TTL）避免每次渲染都拖一次外网。
+    """
+    songmid = str(songmid or "").strip()
+    if not songmid:
+        return {}
+    hit = _cover_cache_get(f"tx:{songmid}")
+    if hit == "__MISS__":
+        return {}
+    if hit:
+        try:
+            return json.loads(hit)
+        except Exception:
+            pass
+    meta: dict = {}
+    try:
+        async with _cover_cdn_client() as client:
+            r = await client.get(
+                "https://c.y.qq.com/v8/fcg-bin/fcg_play_single_song.fcg",
+                params={"songmid": songmid, "format": "json", "platform": "yqq"},
+                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://y.qq.com/"},
+            )
+        if r.status_code == 200:
+            item = ((r.json() or {}).get("data") or [{}])[0]
+            if isinstance(item, dict):
+                al = item.get("album") or {}
+                albummid = str(al.get("mid") or "")
+                if len(re.sub(r"[^0-9A-Za-z]", "", albummid)) >= 8:
+                    meta["albummid"] = albummid
+                title = str(item.get("title") or item.get("name") or "")
+                singers = [str(s.get("name")) for s in (item.get("singer") or []) if isinstance(s, dict) and s.get("name")]
+                if title:
+                    meta["title"] = title
+                if singers:
+                    meta["artist"] = " / ".join(singers)
+    except Exception as e:
+        logger.debug("tx track meta fetch failed for songmid=%s: %s", songmid, e)
+    _cover_cache_put(f"tx:{songmid}", json.dumps(meta) if meta else "__MISS__")
+    return meta
+
+
 async def _enrich_cover_via_netease(request: Request, guid: str, data: dict) -> str:
     """musicdl/lx 空封面 → 网易 cloudsearch 同名曲补全（FNMUSIC_COVER_ENRICH=1）。"""
     if not CONF.get("cover_enrich", True):
@@ -5973,12 +6028,19 @@ async def static_cover(request: Request, subpath: str = ""):
     # ② 按源+ID 直构 CDN：
     #    kg hash → 酷狗公开静态图（免鉴权，覆盖 lx 酷狗全部曲目，实测稳定 200）
     #    kw rid  → 酷我 artistpicserver 真图（实测 403 反爬，失败回落，后续进负缓存）
+    #    tx songmid → QQ 公开接口换 albummid → 腾讯 gtimg（lx info 全空时的唯一可靠来源）
     #    qq albummid → 腾讯 gtimg
+    _tx_meta: dict = {}
     direct = _kg_cover_by_hash(guid)
     if not direct:
         kw_rid = _kw_rid_from_guid(guid)
         if kw_rid:
             direct = await _kw_cover_by_rid(kw_rid)
+    if not direct:
+        tx_mid = _tx_songmid_from_guid(guid)
+        if tx_mid:
+            _tx_meta = await _tx_track_meta(tx_mid)
+            direct = _qq_cover_by_albummid(_tx_meta.get("albummid"))
     if not direct:
         direct = _qq_cover_by_albummid((data or {}).get("albummid"))
     if direct:
@@ -5988,6 +6050,11 @@ async def static_cover(request: Request, subpath: str = ""):
     # ③ 网易 cloudsearch/pc 直连同名曲补全（免 musicbox 依赖；musicbox 未启用时唯一兜底）
     title = str((data or {}).get("title") or "")
     artist = str((data or {}).get("artist") or "")
+    # lx info 对 tx 源同样返回空歌名，而 tx 曲目常不在推荐缓存里 → 用 QQ 接口取回的真名回填
+    if not title and _tx_meta.get("title"):
+        title = str(_tx_meta["title"])
+    if not artist and _tx_meta.get("artist"):
+        artist = str(_tx_meta["artist"])
     # _online_info 对 lx 酷我源拿不到标题 → 从推荐缓存 VO 回填，保证 KW 等源也能搜同名曲
     if not title or not artist:
         vt, va = _vo_meta_from_cache(guid)
