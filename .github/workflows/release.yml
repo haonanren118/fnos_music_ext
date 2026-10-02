@@ -43,6 +43,19 @@ jobs:
           ./packaging/fpk/build.sh
           ls -la dist/
 
+      - name: Prepare online fpk asset
+        # CI 环境没有 1.2GB 的内置镜像（images/ 已被 .gitignore 排除），只能构建「在线版」。
+        # 为避免每次发版把维护者手动上传的「离线版」fnmusic-ext-<ver>.fpk 覆盖掉，
+        # 这里把 CI 产物固定改名为 fnmusic-ext-<ver>-online.fpk 再发布；
+        # 规范名 fnmusic-ext-<ver>.fpk（约 412MB、内置镜像、免联网）由维护者手动上传，CI 永不触碰。
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          built="$(ls dist/fnmusic-ext-*.fpk)"
+          online_fpk="dist/fnmusic-ext-${ver}-online.fpk"
+          cp -f "$built" "$online_fpk"
+          sha256sum "$online_fpk" > "${online_fpk}.sha256"
+          ls -la "$online_fpk" "${online_fpk}.sha256"
+
       - name: Extract changelog for this version
         run: |
           version="${GITHUB_REF_NAME#v}"
@@ -56,33 +69,46 @@ jobs:
             exit 1
           fi
           head -5 /tmp/release-notes.md
+          # 追加安装包说明：CI 只附「在线版」，规范名的「离线版」由维护者手动上传
+          {
+            cat /tmp/release-notes.md
+            echo
+            echo "---"
+            echo
+            echo "### 安装包（fpk）"
+            echo
+            echo "> ⚠️ CI 自动附加的是**在线版** \`fnmusic-ext-${version}-online.fpk\`（约 5MB，安装时需联网拉取基础镜像）。"
+            echo "> **离线版** \`fnmusic-ext-${version}.fpk\`（约 412MB，内置镜像、免联网安装）由维护者手动上传；若暂缺，请稍后刷新本页面。"
+          } > /tmp/release-notes-final.md
 
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          fpk_file="$(ls dist/fnmusic-ext-*.fpk)"
-          title="fnmusic-ext ${GITHUB_REF_NAME#v}"
+          ver="${GITHUB_REF_NAME#v}"
+          online_fpk="dist/fnmusic-ext-${ver}-online.fpk"
+          title="fnmusic-ext ${ver}"
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release edit "${GITHUB_REF_NAME}" --draft=false --title "$title" --notes-file /tmp/release-notes.md
-            gh release upload "${GITHUB_REF_NAME}" "$fpk_file" "$fpk_file.sha256" --clobber
+            gh release edit "${GITHUB_REF_NAME}" --draft=false --title "$title" --notes-file /tmp/release-notes-final.md
+            gh release upload "${GITHUB_REF_NAME}" "$online_fpk" "${online_fpk}.sha256" --clobber
           else
             gh release create "${GITHUB_REF_NAME}" \
               --title "$title" \
-              --notes-file /tmp/release-notes.md \
-              "$fpk_file" "$fpk_file.sha256"
+              --notes-file /tmp/release-notes-final.md \
+              "$online_fpk" "${online_fpk}.sha256"
           fi
 
       # Gitee 镜像只同步分支/标签/提交，发行版需经 API 发布；发布的是同一份
-      # fpk（字节一致，sha256 两边相同）。未配置 GITEE_TOKEN 密钥时本步跳过。
+      # 「在线版」产物（与 GitHub 字节一致、sha256 相同）。未配置 GITEE_TOKEN 密钥时本步跳过。
       - name: Publish release to Gitee
         if: env.GITEE_TOKEN != ''
         env:
-          GITEE_REPO: javycoder/fnos_music_ext
+          GITEE_REPO: yygitee118/fnos_music_ext
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
-          fpk_file="$(ls dist/fnmusic-ext-*.fpk)"
+          ver="${tag#v}"
+          online_fpk="dist/fnmusic-ext-${ver}-online.fpk"
           api="https://gitee.com/api/v5/repos/${GITEE_REPO}"
 
           # 镜像同步有延迟，轮询等 tag 出现在 Gitee（公开仓库 ls-remote 无需认证）
@@ -111,13 +137,12 @@ jobs:
             cat /tmp/gitee-release.json >&2 || true
             exit 1
           fi
-          ver="${tag#v}"
           if [ -n "${release_id}" ]; then
-            # 重发时清理同名旧附件（不动 gitee 自动生成的源码包）；by-tag 响应的
-            # assets 不带附件 id，需走附件列表接口
+            # 重发时仅清理 CI 自己的「在线版」旧附件（不动离线版与 gitee 自动源码包）；
+            # by-tag 响应的 assets 不带附件 id，需走附件列表接口
             curl -sSf -o /tmp/gitee-att-list.json \
               "${api}/releases/${release_id}/attach_files?access_token=${GITEE_TOKEN}"
-            for attach_id in $(jq -r --arg fpk "fnmusic-ext-${ver}.fpk" --arg sum "fnmusic-ext-${ver}.fpk.sha256" \
+            for attach_id in $(jq -r --arg fpk "fnmusic-ext-${ver}-online.fpk" --arg sum "fnmusic-ext-${ver}-online.fpk.sha256" \
                 '.[]? | select(.name == $fpk or .name == $sum) | .id' /tmp/gitee-att-list.json); do
               curl -sS -o /dev/null -X DELETE \
                 "${api}/releases/${release_id}/attach_files/${attach_id}?access_token=${GITEE_TOKEN}" || true
@@ -129,7 +154,7 @@ jobs:
               -d "tag_name=${tag}" \
               -d "target_commitish=${tag}" \
               -d "name=fnmusic-ext ${ver}" \
-              --data-urlencode "body@/tmp/release-notes.md")"
+              --data-urlencode "body@/tmp/release-notes-final.md")"
             if [ "${create_http}" != 201 ] && [ "${create_http}" != 200 ]; then
               echo "ERROR: 创建 Gitee 发行版失败 HTTP ${create_http}" >&2
               cat /tmp/gitee-create.json >&2 || true
@@ -138,10 +163,10 @@ jobs:
             release_id="$(jq -r '.id' /tmp/gitee-create.json)"
           fi
 
-          # 上传 fpk + sha256，收集下载链接（实测返回单对象 browser_download_url，
+          # 上传「在线版」fpk + sha256，收集下载链接（实测返回单对象 browser_download_url，
           # 保留数组/对象兼容解析以防变动）
           attach_links=""
-          for f in "${fpk_file}" "${fpk_file}.sha256"; do
+          for f in "${online_fpk}" "${online_fpk}.sha256"; do
             att_http="$(curl -sS -o /tmp/gitee-att-one.json -w '%{http_code}' \
               "${api}/releases/${release_id}/attach_files" \
               -F "access_token=${GITEE_TOKEN}" \
@@ -159,9 +184,9 @@ jobs:
             attach_links="${attach_links}- [$(basename "${f}")](${url})"$'\n'
           done
 
-          # 更新说明 = changelog + 附件下载链接；PATCH 必须重传 tag_name 与 name
+          # 更新说明 = changelog + 安装包说明 + 附件下载链接；PATCH 必须重传 tag_name 与 name
           {
-            cat /tmp/release-notes.md
+            cat /tmp/release-notes-final.md
             echo
             echo "### 附件"
             printf '%s' "${attach_links}"
@@ -177,4 +202,3 @@ jobs:
             exit 1
           fi
           echo "[gitee] 发行版发布完成: https://gitee.com/${GITEE_REPO}/releases"
-
