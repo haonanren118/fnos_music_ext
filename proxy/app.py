@@ -908,6 +908,12 @@ def source_from_online_guid(guid: str) -> str:
     return parts[1] if len(parts) >= 3 else ""
 
 
+def _cover_endpoint_url(guid: str) -> str:
+    """服务端封面端点（同源相对 URL）：客户端（含电脑端/web）用 coverUrl 取图时，
+    统一走 /static/cover 的服务端解析（酷狗直构 / 网易直连兜底），不再依赖空的第三方 CDN coverUrl。"""
+    return f"/music/api/v1/static/cover?coverId={quote(str(guid), safe='')}"
+
+
 def build_online_track(item: dict) -> dict:
     """对齐飞牛前端 ZQ 解构 / _h() 期望：artists、album 对象、genres 数组、audioSpec、duration 毫秒。"""
     guid = online_guid_from_item(item)
@@ -929,6 +935,9 @@ def build_online_track(item: dict) -> dict:
     except (TypeError, ValueError):
         file_size = 0
     cover = str(item.get("cover_url") or "")
+    # 第三方 CDN 封面缺失时，把 coverUrl/coverURL 兜底为服务端封面端点（同源相对 URL），
+    # 让读 coverUrl 的客户端（电脑端/web）也能走服务端解析拿到真图，而不是永远空白。
+    cover_ep = _cover_endpoint_url(guid) if not cover else ""
     # 路径带真实后缀，飞牛 ll() 用 path 解析 extension；封面走 guid 以便 /static/cover 拦截
     spec_path = f"online/{src}/{guid}.{play_format}"
 
@@ -977,8 +986,8 @@ def build_online_track(item: dict) -> dict:
         "file_size": file_size,
         "coverId": guid,
         "cover_url": cover,
-        "coverUrl": cover,
-        "coverURL": cover,
+        "coverUrl": cover or cover_ep,
+        "coverURL": cover or cover_ep,
         "source": src,
         "is_online": True,
         "isFavorite": False,
@@ -6762,6 +6771,9 @@ def _playlist_public_fields(record: dict, tracks: list | None = None) -> dict:
         "guid": record.get("guid"),
         "name": record.get("name") or "每日推荐",
         "coverId": cover,
+        # 同步下发 coverUrl（同源封面端点）：电脑端/web 读 coverUrl 取图，且此字段此前为空、
+        # 客户端从未缓存过，故是全新 URL，可绕开修复前 coverId→占位图的旧缓存（max-age=86400）。
+        "coverUrl": _cover_endpoint_url(cover) if cover else "",
         "createdAt": int(record.get("createdAt") or time.time()),
         "updatedAt": int(record.get("updatedAt") or time.time()),
         "trackCount": int(record.get("trackCount") or 0),
