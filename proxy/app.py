@@ -914,6 +914,20 @@ def _cover_endpoint_url(guid: str) -> str:
     return f"/music/api/v1/static/cover?coverId={quote(str(guid), safe='')}"
 
 
+def _track_cover_id(guid: str) -> str:
+    """曲目 coverId：在线 guid → 纯 32-hex 伪装 id（并登记 fake→real 反查）。
+
+    客户端列表行只渲染**纯 32-hex**形态的 coverId（本地曲目即此形态，故能出封面）；
+    track_+32hex 形态是歌单封面的惯例，列表行不识别、不会发起封面请求——在线曲目
+    因此长期只显示默认色块。这里预先伪装成纯 32-hex，disguise_client_json 便不会
+    再给它加 track_ 前缀（它只处理 online: 开头的值）。
+    """
+    g = str(guid or "")
+    if not g:
+        return ""
+    return fake_official_guid(g) if g.startswith("online:") else g
+
+
 def _public_cover_url(guid: str) -> str:
     """下发用的封面 URL：coverId 一律官方 track_+32hex 形态。
 
@@ -950,7 +964,9 @@ def build_online_track(item: dict) -> dict:
     cover = str(item.get("cover_url") or "")
     # 第三方 CDN 封面缺失时，把 coverUrl/coverURL 兜底为服务端封面端点（同源相对 URL），
     # 让读 coverUrl 的客户端（电脑端/web）也能走服务端解析拿到真图，而不是永远空白。
-    cover_ep = _cover_endpoint_url(guid) if not cover else ""
+    # cover_id 用纯 32-hex 伪装形态：客户端列表行只渲染这种形态的 coverId。
+    cover_id = _track_cover_id(guid)
+    cover_ep = _cover_endpoint_url(cover_id) if not cover else ""
     # 路径带真实后缀，飞牛 ll() 用 path 解析 extension；封面走 guid 以便 /static/cover 拦截
     spec_path = f"online/{src}/{guid}.{play_format}"
 
@@ -959,7 +975,7 @@ def build_online_track(item: dict) -> dict:
         "name": album,
         "guid": f"{guid}:album",
         "artists": artists_list,
-        "coverId": guid,
+        "coverId": cover_id,
     }
     # 专辑伪装 guid 同步登记（issue #22）：客户端点击专辑时按 fake 反解分源适配详情
     register_fake_album(guid, album, item)
@@ -997,7 +1013,7 @@ def build_online_track(item: dict) -> dict:
         "ext": ext,
         "size": file_size,
         "file_size": file_size,
-        "coverId": guid,
+        "coverId": cover_id,
         "cover_url": cover,
         "coverUrl": cover or cover_ep,
         "coverURL": cover or cover_ep,
@@ -7394,14 +7410,22 @@ async def playlist_track_list(request: Request):
     # 电脑端/web 读 coverUrl 取图：推荐缓存 VO 的 coverUrl 多为空，这里按封面 guid 兜底为
     # 服务端封面端点（在线 online:xxx 走在线解析链，本地 32hex 走本地解析），与手机端 coverId 一致。
     for _t in tracks:
-        if isinstance(_t, dict) and not (_t.get("coverUrl") or _t.get("coverURL")):
-            _cid = str(_t.get("coverId") or _t.get("guid") or "")
-            if _cid:
-                _ep = _public_cover_url(_cid)
-                if not _t.get("coverUrl"):
-                    _t["coverUrl"] = _ep
-                if not _t.get("coverURL"):
-                    _t["coverURL"] = _ep
+        if not isinstance(_t, dict):
+            continue
+        _cid = str(_t.get("coverId") or _t.get("guid") or "")
+        if not _cid:
+            continue
+        # 列表行封面：coverId 必须是纯 32-hex（客户端只认此形态），否则不会请求封面
+        _fake = _track_cover_id(_cid)
+        _t["coverId"] = _fake
+        _alb = _t.get("album")
+        if isinstance(_alb, dict):
+            _alb["coverId"] = _fake
+        _ep = _cover_endpoint_url(_fake)
+        if not _t.get("coverUrl"):
+            _t["coverUrl"] = _ep
+        if not _t.get("coverURL"):
+            _t["coverURL"] = _ep
     try:
         _cover_log(
             "PL_TRACKS_OUT",
