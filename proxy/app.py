@@ -915,17 +915,19 @@ def _cover_endpoint_url(guid: str) -> str:
 
 
 def _track_cover_id(guid: str) -> str:
-    """曲目 coverId：在线 guid → 纯 32-hex 伪装 id（并登记 fake→real 反查）。
+    """曲目 coverId：在线 guid → 独立盐伪装的纯 32-hex（并登记 fake→real 反查）。
 
     客户端列表行只渲染**纯 32-hex**形态的 coverId（本地曲目即此形态，故能出封面）；
     track_+32hex 形态是歌单封面的惯例，列表行不识别、不会发起封面请求——在线曲目
     因此长期只显示默认色块。这里预先伪装成纯 32-hex，disguise_client_json 便不会
     再给它加 track_ 前缀（它只处理 online: 开头的值）。
+    v2.6.16 起改用封面独立盐：与曲目 guid 伪装 id 解耦，换盐即换封面 URL，
+    客户端缓存的旧黑胶占位图自然失效；曲目 guid 伪装保持旧盐，收藏/历史不受影响。
     """
     g = str(guid or "")
     if not g:
         return ""
-    return fake_official_guid(g) if g.startswith("online:") else g
+    return _cover_fake_guid(g) if g.startswith("online:") else g
 
 
 def _public_cover_url(guid: str) -> str:
@@ -937,7 +939,7 @@ def _public_cover_url(guid: str) -> str:
     g = str(guid or "")
     if not g:
         return ""
-    cid = "track_" + fake_official_guid(g) if g.startswith("online:") else g
+    cid = "track_" + _cover_fake_guid(g) if g.startswith("online:") else g
     return _cover_endpoint_url(cid)
 
 
@@ -1260,6 +1262,13 @@ async def _proxy_cover_response(url: str, request: Request, fallback_guid: str) 
             headers["Referer"] = "https://music.163.com/"
         elif "gtimg.cn" in url:
             headers["Referer"] = "https://y.qq.com/"
+        _cached = _cover_bytes_get(url)
+        if _cached is not None:
+            return Response(
+                content=_cached,
+                media_type=_sniff_image_mime(_cached) or "image/jpeg",
+                headers={"Cache-Control": "public, max-age=86400"},
+            )
         async with _cover_cdn_client() as client:
             r = await client.get(url, headers=headers)
         if r.status_code != 200:
@@ -1274,6 +1283,7 @@ async def _proxy_cover_response(url: str, request: Request, fallback_guid: str) 
             _cover_log("COVER_FB", f"guid={fallback_guid} reason=mime src={url[:60]}")
             return _placeholder_cover_response(fallback_guid)
         _cover_log("COVER_OK", f"guid={fallback_guid} bytes={len(data)} mime={mime} src={url[:60]}")
+        _cover_bytes_put(url, data)
         return Response(
             content=data,
             media_type=mime,
@@ -2317,8 +2327,24 @@ def merge_online_tracks(
 
 
 _FAKE_GUID_REVERSE: dict[str, str] = {}
+# 封面 id 独立盐（v2.6.16）：早期版本封面与曲目共用同一伪装 id，故障窗口下发的
+# 黑胶默认图/占位图被客户端按 URL 强缓存（max-age=86400），换真图后 URL 不变、
+# 客户端永远不回源。封面 id 改用独立盐生成全新 32-hex，URL 全部刷新即绕开旧缓存；
+# 曲目 guid 伪装保持旧盐不变，收藏/播放历史/歌单回读不受影响。
+_FAKE_COVER_REVERSE: dict[str, str] = {}
+_COVER_FAKE_SALT = "fnmusic-ext::cover::v2::"
 _REGISTRY_WARMED = False
 _ONLINE_ID_RE = re.compile(r"online:[A-Za-z0-9_:\-]+")
+
+
+def _cover_fake_guid(real_guid: str) -> str:
+    """封面专用伪装 id（独立盐，32-hex）：换盐即换 URL，破客户端对旧占位图的强缓存。"""
+    real = str(real_guid or "")
+    if not real:
+        return ""
+    fake = hashlib.md5(f"{_COVER_FAKE_SALT}{real}".encode()).hexdigest()
+    _FAKE_COVER_REVERSE.setdefault(fake, real)
+    return fake
 
 
 def fake_official_guid(real_guid: str) -> str:
@@ -2327,9 +2353,12 @@ def fake_official_guid(real_guid: str) -> str:
     官方 App 会按 id 格式过滤条目（非 32-hex 的 online: 前缀 id 整条被丢弃，
     症状为收藏/播放历史列表空白或条目消失），且要求收藏/播放回读的 guid 与
     客户端自身持有的一致，因此所有下发的在线 id 必须统一伪装成官方形态。
+    同时把封面盐的伪装 id 一并登记进反查表：ensure_registry_warm 重建时走本函数，
+    曲目假 id 与封面假 id 即可一并恢复（客户端持有的封面 id 也要能反解回真实 guid）。
     """
     fake = hashlib.md5(f"fnmusic-ext::{real_guid}".encode()).hexdigest()
     _FAKE_GUID_REVERSE.setdefault(fake, real_guid)
+    _cover_fake_guid(real_guid)
     return fake
 
 
@@ -2643,18 +2672,27 @@ def ensure_registry_warm() -> None:
 def resolve_real_guid(candidate: str) -> str:
     if not candidate:
         return candidate
+    # 封面盐伪装 id（v2.6.16 起下发的 coverId）先行反解
+    if candidate in _FAKE_COVER_REVERSE:
+        return _FAKE_COVER_REVERSE[candidate]
     if candidate in _FAKE_GUID_REVERSE:
         return _FAKE_GUID_REVERSE[candidate]
     if candidate.startswith("track_") and len(candidate) > 6:
         stripped = candidate[6:]
+        if stripped in _FAKE_COVER_REVERSE:
+            return _FAKE_COVER_REVERSE[stripped]
         if stripped in _FAKE_GUID_REVERSE:
             return _FAKE_GUID_REVERSE[stripped]
         if re.fullmatch(r"[0-9a-f]{32}", stripped):
             ensure_registry_warm()
+            if stripped in _FAKE_COVER_REVERSE:
+                return _FAKE_COVER_REVERSE[stripped]
             if stripped in _FAKE_GUID_REVERSE:
                 return _FAKE_GUID_REVERSE[stripped]
     if re.fullmatch(r"[0-9a-f]{32}", candidate or ""):
         ensure_registry_warm()
+        if candidate in _FAKE_COVER_REVERSE:
+            return _FAKE_COVER_REVERSE[candidate]
         if candidate in _FAKE_GUID_REVERSE:
             return _FAKE_GUID_REVERSE[candidate]
     return candidate
@@ -2673,7 +2711,7 @@ def disguise_client_json(obj):
         for k, v in obj.items():
             if isinstance(v, str) and v.startswith("online:"):
                 if k in ("coverId", "cover_id"):
-                    out[k] = "track_" + fake_official_guid(v)
+                    out[k] = "track_" + _cover_fake_guid(v)
                 else:
                     out[k] = fake_official_guid(v)
             else:
@@ -5552,6 +5590,32 @@ _DEFAULT_COVER_MD5S = {
 }
 
 
+# 封面字节缓存：网易/酷狗图床的图每次都要重新下载（实测 0.8-1.6s/首），18 首列表
+# 并发解析会让页面长时间停在波纹占位。缓存已下载的字节后，重复渲染毫秒级出图。
+_COVER_BYTES_CACHE: "dict[str, bytes]" = {}
+_COVER_BYTES_ORDER: "list[str]" = []
+_COVER_BYTES_LIMIT = 48 * 1024 * 1024
+_COVER_BYTES_MAX_ITEM = 4 * 1024 * 1024
+
+
+def _cover_bytes_get(url: str) -> "bytes | None":
+    return _COVER_BYTES_CACHE.get(url)
+
+
+def _cover_bytes_put(url: str, data: bytes) -> None:
+    if not data or len(data) > _COVER_BYTES_MAX_ITEM:
+        return
+    if url in _COVER_BYTES_CACHE:
+        return
+    _COVER_BYTES_CACHE[url] = data
+    _COVER_BYTES_ORDER.append(url)
+    total = sum(len(_COVER_BYTES_CACHE[k]) for k in _COVER_BYTES_ORDER)
+    while _COVER_BYTES_ORDER and total > _COVER_BYTES_LIMIT:
+        old = _COVER_BYTES_ORDER.pop(0)
+        b = _COVER_BYTES_CACHE.pop(old, b"")
+        total -= len(b)
+
+
 async def _fetch_cover_bytes_checked(url: str) -> "bytes | None":
     """拉取封面字节并做可用性校验；不可用（失败/默认占位风格图）返回 None。
 
@@ -5560,6 +5624,9 @@ async def _fetch_cover_bytes_checked(url: str) -> "bytes | None":
     url = str(url or "").strip()
     if not url.startswith(("http://", "https://")) or _KW_TEXT_COVER_HOST in url:
         return None
+    _cached = _cover_bytes_get(url)
+    if _cached is not None:
+        return _cached
     try:
         headers = {"User-Agent": "Mozilla/5.0 (compatible; fnmusic-ext/cover)"}
         if "music.126.net" in url or "126.net" in url:
@@ -5577,6 +5644,7 @@ async def _fetch_cover_bytes_checked(url: str) -> "bytes | None":
             return None
         if hashlib.md5(data).hexdigest() in _DEFAULT_COVER_MD5S:
             return None
+        _cover_bytes_put(url, data)
         return data
     except Exception:
         return None
@@ -5643,6 +5711,42 @@ async def _tx_track_meta(songmid: str) -> dict:
         logger.debug("tx track meta fetch failed for songmid=%s: %s", songmid, e)
     _cover_cache_put(f"tx:{songmid}", json.dumps(meta) if meta else "__MISS__")
     return meta
+
+
+async def _prefetch_playlist_covers(tracks: list) -> None:
+    """后台预热推荐曲目的封面解析结果（只填 _cover_cache，不取图片字节）。
+
+    列表渲染时每首曲目都要现查：酷狗直构（1 次外网）+ 网易 cloudsearch（1 次外网）。
+    18 首并发解析需要数秒，期间页面停在波纹占位图——容易被误判为"没有封面"。
+    下发列表后后台预热，用户真正请求封面时多数已命中内存缓存，可毫秒级出真图。
+    """
+    try:
+        sem = asyncio.Semaphore(4)
+
+        async def _one(t):
+            if not isinstance(t, dict):
+                return
+            title = str(t.get("title") or t.get("name") or "")
+            artist = str(t.get("artist") or "")
+            guid = str(t.get("coverId") or t.get("guid") or "")
+            if not title and not guid:
+                return
+            async with sem:
+                if title and not _cover_cache_get(f"wyc:{title.casefold()}|{artist.casefold()}"):
+                    try:
+                        await asyncio.wait_for(_netease_direct_cover(title, artist), timeout=8.0)
+                    except Exception:
+                        pass
+                # 腾讯源：songmid→albummid 元信息也预热（gtimg 直构依赖它）
+                if guid.startswith("online:lx:tx:") and not _cover_cache_get("tx:" + guid.split(":")[3]):
+                    try:
+                        await asyncio.wait_for(_tx_track_meta(guid.split(":")[3]), timeout=8.0)
+                    except Exception:
+                        pass
+
+        await asyncio.gather(*[_one(t) for t in tracks[:24]], return_exceptions=True)
+    except Exception as e:
+        logger.debug("playlist cover prefetch failed: %s", type(e).__name__)
 
 
 async def _enrich_cover_via_netease(request: Request, guid: str, data: dict) -> str:
@@ -7423,6 +7527,10 @@ async def playlist_track_list(request: Request):
             _t["coverUrl"] = _ep
         if not _t.get("coverURL"):
             _t["coverURL"] = _ep
+    try:
+        asyncio.create_task(_prefetch_playlist_covers(tracks))
+    except Exception:
+        pass
     try:
         _cover_log(
             "PL_TRACKS_OUT",
