@@ -144,6 +144,14 @@ set +a
 # 不用 read：文件末尾没有换行时 read 返回 1，set -e 会在打出任何日志前静默退出。
 FNMUSIC_VERSION="$(head -n 1 "${BASE_DIR}/VERSION" 2>/dev/null | tr -d '[:space:]' || true)"
 FNMUSIC_VERSION="${FNMUSIC_VERSION:-0.0.0}"
+# 自愈：热补丁/手工升级只同步了代码而没动 .env 时，容器 env 里的版本号会永远是旧值
+# （WebUI 侧栏即读它）。仅在该行确实过期时改写，避免每次运行都动 .env 触发无谓重启；
+# 改写后 env_newer_than_container 为真，下方健康路径会自动重启容器让新版本号生效。
+if [ -f "${BASE_DIR}/.env" ] && grep -qE "^FNMUSIC_VERSION=" "${BASE_DIR}/.env" 2>/dev/null \
+    && ! grep -qE "^FNMUSIC_VERSION=['\"]?${FNMUSIC_VERSION}['\"]?[[:space:]]*$" "${BASE_DIR}/.env" 2>/dev/null; then
+    sed -i "s/^FNMUSIC_VERSION=.*/FNMUSIC_VERSION='${FNMUSIC_VERSION}'/" "${BASE_DIR}/.env"
+    log_info "已将 .env 的 FNMUSIC_VERSION 刷新为 v${FNMUSIC_VERSION}（同步自 VERSION 文件）"
+fi
 MUSICDL_URL="${FNMUSIC_MUSICDL_URL:-${MUSICDL_URL}}"
 MUSICBOX_URL="${FNMUSIC_MUSICBOX_URL:-${MUSICBOX_URL}}"
 LX_URL="${FNMUSIC_LX_URL:-${LX_URL}}"
