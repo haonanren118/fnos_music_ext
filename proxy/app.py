@@ -914,6 +914,19 @@ def _cover_endpoint_url(guid: str) -> str:
     return f"/music/api/v1/static/cover?coverId={quote(str(guid), safe='')}"
 
 
+def _public_cover_url(guid: str) -> str:
+    """下发用的封面 URL：coverId 一律官方 track_+32hex 形态。
+
+    客户端（App/电脑端 web）按官方 id 格式过滤封面——online: 原样的 id 不会被渲染成图标，
+    也就根本不会发起请求。故 coverUrl 必须与 coverId 同形态，且 fake guid 在此登记反查。
+    """
+    g = str(guid or "")
+    if not g:
+        return ""
+    cid = "track_" + fake_official_guid(g) if g.startswith("online:") else g
+    return _cover_endpoint_url(cid)
+
+
 def build_online_track(item: dict) -> dict:
     """对齐飞牛前端 ZQ 解构 / _h() 期望：artists、album 对象、genres 数组、audioSpec、duration 毫秒。"""
     guid = online_guid_from_item(item)
@@ -1222,6 +1235,7 @@ async def _proxy_cover_response(url: str, request: Request, fallback_guid: str) 
         return _placeholder_cover_response(fallback_guid)
     url = str(url or "").strip()
     if not url.startswith(("http://", "https://")) or _KW_TEXT_COVER_HOST in url:
+        _cover_log("COVER_FB", f"guid={fallback_guid} reason=bad_url src={url[:60]}")
         return _placeholder_cover_response(fallback_guid)
     try:
         headers = {"User-Agent": "Mozilla/5.0 (compatible; fnmusic-ext/cover)"}
@@ -1233,19 +1247,24 @@ async def _proxy_cover_response(url: str, request: Request, fallback_guid: str) 
         async with _cover_cdn_client() as client:
             r = await client.get(url, headers=headers)
         if r.status_code != 200:
+            _cover_log("COVER_FB", f"guid={fallback_guid} reason=http_{r.status_code} src={url[:60]}")
             return _placeholder_cover_response(fallback_guid)
         data = r.content or b""
         if not data or len(data) > _COVER_FETCH_MAX_BYTES:
+            _cover_log("COVER_FB", f"guid={fallback_guid} reason=body_{len(data)} src={url[:60]}")
             return _placeholder_cover_response(fallback_guid)
         mime = _sniff_image_mime(data)
         if not mime:
+            _cover_log("COVER_FB", f"guid={fallback_guid} reason=mime src={url[:60]}")
             return _placeholder_cover_response(fallback_guid)
+        _cover_log("COVER_OK", f"guid={fallback_guid} bytes={len(data)} mime={mime} src={url[:60]}")
         return Response(
             content=data,
             media_type=mime,
             headers={"Cache-Control": "public, max-age=86400"},
         )
     except Exception as e:
+        _cover_log("COVER_FB", f"guid={fallback_guid} reason=exc_{type(e).__name__} src={url[:60]}")
         logger.debug("cover proxy failed for %s: %s", url, type(e).__name__)
         return _placeholder_cover_response(fallback_guid)
 
@@ -5509,6 +5528,52 @@ def _qq_cover_by_albummid(albummid: "str | None") -> str:
     return f"https://y.gtimg.cn/music/photo_new/T002R800x800M000{mid}.jpg?max_age=2592000"
 
 
+# 图床"默认封面"黑名单：这些图技术上合法（HTTP 200 真图片），但内容是无信息量的
+# 默认占位风格图（如酷狗 stdmusic 的黑胶唱片图），直接出图会以假乱真顶掉真实专辑封面。
+# 命中黑名单 → 视为该直构源不可用，继续走下一级兜底（网易同名曲反查）。
+_DEFAULT_COVER_MD5S = {
+    "7d79006af51cdd1fe1aca16482a2ef3e",  # 酷狗 stdmusic 黑胶默认封面（480x480, 17853B）
+}
+
+
+async def _fetch_cover_bytes_checked(url: str) -> "bytes | None":
+    """拉取封面字节并做可用性校验；不可用（失败/默认占位风格图）返回 None。
+
+    与 _proxy_cover_response 的差异：不直接产出响应，允许调用方继续下一级兜底。
+    """
+    url = str(url or "").strip()
+    if not url.startswith(("http://", "https://")) or _KW_TEXT_COVER_HOST in url:
+        return None
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; fnmusic-ext/cover)"}
+        if "music.126.net" in url or "126.net" in url:
+            headers["Referer"] = "https://music.163.com/"
+        elif "gtimg.cn" in url:
+            headers["Referer"] = "https://y.qq.com/"
+        async with _cover_cdn_client() as client:
+            r = await client.get(url, headers=headers)
+        if r.status_code != 200:
+            return None
+        data = r.content or b""
+        if not data or len(data) > _COVER_FETCH_MAX_BYTES:
+            return None
+        if not _sniff_image_mime(data):
+            return None
+        if hashlib.md5(data).hexdigest() in _DEFAULT_COVER_MD5S:
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def _cover_bytes_response(data: bytes) -> Response:
+    return Response(
+        content=data,
+        media_type=_sniff_image_mime(data) or "image/jpeg",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 def _tx_songmid_from_guid(guid: str) -> str:
     """从 lx 腾讯源 guid（online:lx:tx:<songmid>）取 songmid；非 tx 源返回空。"""
     parts = str(guid or "").split(":")
@@ -5980,6 +6045,16 @@ async def static_cover(request: Request, subpath: str = ""):
         cached = dailyrec.load_daily_cache(user_guid, dailyrec.today_key(), playlist_kind)
         tracks = (cached or {}).get("tracks") or []
         picked = dailyrec.pick_playlist_cover_track(tracks)
+        # 歌单大图：优先按封面曲目的「歌名+歌手」网易反查真实专辑图。
+        # 在线图床（酷狗 stdmusic 等）不少歌曲的"封面"就是黑胶默认图，直构出来
+        # 以假乱真（看起来像没封面）；网易同名曲搜到的基本是真实专辑封面。
+        _pt_title = str((picked or {}).get("title") or "")
+        _pt_artist = str((picked or {}).get("artist") or "")
+        if _pt_title:
+            _wy = await _netease_direct_cover(_pt_title, _pt_artist)
+            if _wy:
+                _cover_log("PL_NETEASE", f"kind={playlist_kind} title={_pt_title[:30]}")
+                return await _proxy_cover_response(_wy, request, guid)
         picked_guid = str((picked or {}).get("guid") or "")
         if not is_online_guid(picked_guid):
             if picked_guid:
@@ -6044,8 +6119,12 @@ async def static_cover(request: Request, subpath: str = ""):
     if not direct:
         direct = _qq_cover_by_albummid((data or {}).get("albummid"))
     if direct:
-        _cover_log("PROXY_DIRECT", f"guid={guid} src={direct[:55]}")
-        return await _proxy_cover_response(direct, request, guid)
+        _b = await _fetch_cover_bytes_checked(direct)
+        if _b:
+            _cover_log("PROXY_DIRECT", f"guid={guid} src={direct[:55]}")
+            return _cover_bytes_response(_b)
+        # 直构图不可用（拉取失败或命中默认封面黑名单）→ 继续网易同名曲兜底
+        _cover_log("DIRECT_SKIP", f"guid={guid} src={direct[:55]}")
 
     # ③ 网易 cloudsearch/pc 直连同名曲补全（免 musicbox 依赖；musicbox 未启用时唯一兜底）
     title = str((data or {}).get("title") or "")
@@ -6986,9 +7065,9 @@ def _playlist_public_fields(record: dict, tracks: list | None = None) -> dict:
         "guid": record.get("guid"),
         "name": record.get("name") or "每日推荐",
         "coverId": cover_id,
-        # 同步下发 coverUrl（同源封面端点，用真实封面 guid，免注册表依赖）：电脑端/web 读 coverUrl 取图，
-        # 此字段此前为空、客户端从未缓存过，故是全新 URL，可绕开修复前 coverId→占位图的旧缓存（max-age=86400）。
-        "coverUrl": _cover_endpoint_url(cover_real) if cover_real else "",
+        # 同步下发 coverUrl（同源封面端点，与 coverId 同形态）：电脑端/web 读 coverUrl 取图。
+        # 必须用官方 track_ 形态——online: 原样 id 会被客户端格式过滤掉、根本不发起请求。
+        "coverUrl": _public_cover_url(cover_real) if cover_real else "",
         "createdAt": int(record.get("createdAt") or time.time()),
         "updatedAt": int(record.get("updatedAt") or time.time()),
         "trackCount": int(record.get("trackCount") or 0),
@@ -7061,6 +7140,20 @@ async def playlist_list(request: Request):
     data["list"] = recs + nm_cards + official
     total = data.get("total")
     data["total"] = (total if isinstance(total, int) else len(official)) + len(recs) + len(nm_cards)
+    try:
+        _cover_log(
+            "PL_LIST_OUT",
+            "ua=%s recs=%s"
+            % (
+                request.headers.get("user-agent", "")[:70],
+                json.dumps(
+                    [{k: r.get(k) for k in ("guid", "name", "coverId", "coverUrl")} for r in recs],
+                    ensure_ascii=False,
+                )[:900],
+            ),
+        )
+    except Exception:
+        pass
     return JSONResponse(content=envelope, headers=headers)
 
 
@@ -7304,11 +7397,29 @@ async def playlist_track_list(request: Request):
         if isinstance(_t, dict) and not (_t.get("coverUrl") or _t.get("coverURL")):
             _cid = str(_t.get("coverId") or _t.get("guid") or "")
             if _cid:
-                _ep = _cover_endpoint_url(_cid)
+                _ep = _public_cover_url(_cid)
                 if not _t.get("coverUrl"):
                     _t["coverUrl"] = _ep
                 if not _t.get("coverURL"):
                     _t["coverURL"] = _ep
+    try:
+        _cover_log(
+            "PL_TRACKS_OUT",
+            "kind=%s n=%d sample=%s"
+            % (
+                kind,
+                len(tracks),
+                json.dumps(
+                    [
+                        {k: t.get(k) for k in ("guid", "title", "coverId", "coverUrl", "coverURL")}
+                        for t in tracks[:3]
+                    ],
+                    ensure_ascii=False,
+                )[:900],
+            ),
+        )
+    except Exception:
+        pass
     try:
         page = max(int(request.query_params.get("page") or 1), 1)
     except (TypeError, ValueError):
