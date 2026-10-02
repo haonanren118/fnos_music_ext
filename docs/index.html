@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>fnmusic-ext · 飞牛 fnOS 音乐扩展 | 网易云 / 洛雪 / 音乐DL 三音源聚合</title>
+  <meta name="description" content="fnmusic-ext 是飞牛 NAS（fnOS）音乐应用的零侵入增强扩展：聚合网易云音乐、洛雪音乐、音乐DL 三大音源，自带管理 WebUI，Docker 自托管，让飞牛音乐直接在线搜播、补全歌词与高清封面。适合飞牛 NAS 用户自建音乐服务器。" />
+  <meta name="keywords" content="飞牛音乐扩展,fnOS,飞牛NAS,NAS音乐,网易云音乐,洛雪音乐,musicDL,飞牛音乐在线播放,自建音乐服务器,Docker音乐,音乐增强扩展,fnmusic-ext" />
+  <meta name="author" content="haonanren118" />
+  <meta name="robots" content="index,follow" />
+  <link rel="canonical" href="https://haonanren118.github.io/fnos_music_ext/" />
+  <meta property="og:type" content="website" />
+  <meta property="og:locale" content="zh_CN" />
+  <meta property="og:title" content="fnmusic-ext · 飞牛 fnOS 音乐扩展" />
+  <meta property="og:description" content="飞牛 NAS 音乐增强扩展：零侵入接管官方飞牛音乐，聚合网易云 / 洛雪 / 音乐DL 三音源，Docker 自托管，自带 WebUI。" />
+  <meta property="og:url" content="https://haonanren118.github.io/fnos_music_ext/" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "fnmusic-ext",
+    "operatingSystem": "fnOS (飞牛私有云)",
+    "applicationCategory": "MultimediaApplication",
+    "description": "飞牛 NAS 音乐应用的零侵入增强扩展，聚合网易云音乐、洛雪音乐、音乐DL 三音源，自带管理 WebUI，Docker 自托管。",
+    "url": "https://haonanren118.github.io/fnos_music_ext/",
+    "codeRepository": "https://github.com/haonanren118/fnos_music_ext",
+    "downloadUrl": "https://github.com/haonanren118/fnos_music_ext/releases",
+    "sameAs": [
+      "https://github.com/haonanren118/fnos_music_ext",
+      "https://gitee.com/yygitee118/fnos_music_ext"
+    ],
+    "license": "https://opensource.org/licenses/MIT",
+    "author": { "@type": "Person", "name": "haonanren118" }
+  }
+  </script>
+  <style>
+    :root {
+      --bg: #0d0f16;
+      --bg2: #13161f;
+      --card: rgba(255, 255, 255, 0.05);
+      --border: rgba(255, 255, 255, 0.1);
+      --text: #e7e9ee;
+      --muted: #9aa0ad;
+      --accent: #7c5cff;
+      --accent2: #2dd4bf;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: var(--text);
+      background: radial-gradient(1200px 600px at 80% -10%, rgba(124,92,255,0.18), transparent 60%),
+                  radial-gradient(900px 500px at -10% 10%, rgba(45,212,191,0.12), transparent 55%),
+                  var(--bg);
+      line-height: 1.7;
+      -webkit-font-smoothing: antialiased;
+    }
+    a { color: var(--accent2); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .wrap { max-width: 940px; margin: 0 auto; padding: 0 20px; }
+    header.hero {
+      padding: 72px 0 48px;
+      text-align: center;
+    }
+    .badge {
+      display: inline-block; padding: 4px 12px; border: 1px solid var(--border);
+      border-radius: 999px; font-size: 13px; color: var(--muted); margin-bottom: 18px;
+      background: var(--card); backdrop-filter: blur(8px);
+    }
+    h1 { font-size: 40px; margin: 0 0 12px; letter-spacing: -0.5px; }
+    h1 .grad {
+      background: linear-gradient(90deg, var(--accent), var(--accent2));
+      -webkit-background-clip: text; background-clip: text; color: transparent;
+    }
+    .tagline { font-size: 18px; color: var(--muted); max-width: 680px; margin: 0 auto 26px; }
+    .cta { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+    .btn {
+      display: inline-flex; align-items: center; gap: 8px; padding: 12px 22px;
+      border-radius: 12px; font-weight: 600; font-size: 15px; transition: transform .15s ease, box-shadow .15s ease;
+    }
+    .btn.primary { background: linear-gradient(90deg, var(--accent), #6a4cf0); color: #fff; box-shadow: 0 8px 30px rgba(124,92,255,0.35); }
+    .btn.ghost { background: var(--card); border: 1px solid var(--border); color: var(--text); backdrop-filter: blur(8px); }
+    .btn:hover { transform: translateY(-2px); text-decoration: none; }
+    section { padding: 36px 0; }
+    h2 { font-size: 26px; margin: 0 0 22px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+    .card {
+      background: var(--card); border: 1px solid var(--border); border-radius: 16px;
+      padding: 20px; backdrop-filter: blur(10px);
+    }
+    .card h3 { margin: 0 0 8px; font-size: 17px; color: var(--text); }
+    .card p { margin: 0; color: var(--muted); font-size: 14px; }
+    .install { background: var(--bg2); border: 1px solid var(--border); border-radius: 16px; padding: 22px; }
+    pre {
+      background: #0a0c12; border: 1px solid var(--border); border-radius: 12px;
+      padding: 16px; overflow-x: auto; color: #d7dbe4; font-size: 13.5px; line-height: 1.6;
+    }
+    code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
+    .note { color: var(--muted); font-size: 14px; margin-top: 12px; }
+    footer { padding: 40px 0 60px; text-align: center; color: var(--muted); font-size: 13px; }
+    footer a { margin: 0 10px; }
+    @media (max-width: 600px) {
+      h1 { font-size: 30px; }
+      .tagline { font-size: 16px; }
+      header.hero { padding: 52px 0 32px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="hero">
+      <span class="badge">飞牛 fnOS · 音乐增强扩展 · 开源 MIT</span>
+      <h1>fnmusic-ext <span class="grad">飞牛音乐扩展</span></h1>
+      <p class="tagline">零侵入接管飞牛官方音乐，聚合网易云音乐 / 洛雪音乐 / 音乐DL 三大音源，自带管理 WebUI，Docker 自托管——让飞牛音乐直接在线搜播、自动补全歌词与高清封面。</p>
+      <div class="cta">
+        <a class="btn primary" href="https://github.com/haonanren118/fnos_music_ext/releases">下载 fpk 安装包</a>
+        <a class="btn ghost" href="https://github.com/haonanren118/fnos_music_ext">GitHub 仓库</a>
+        <a class="btn ghost" href="https://gitee.com/yygitee118/fnos_music_ext">Gitee 仓库</a>
+      </div>
+    </header>
+
+    <section>
+      <h2>它能做什么</h2>
+      <div class="grid">
+        <div class="card">
+          <h3>三音源聚合搜播</h3>
+          <p>在飞牛音乐搜索框输入歌名，聚合网易云 / 音乐DL（酷我·咪咕等）/ 洛雪三音源，即点即播，自动补歌词与封面。</p>
+        </div>
+        <div class="card">
+          <h3>零侵入接管</h3>
+          <p>接管官方后端通信入口，不改官方程序、nginx 与数据库；一条命令即可还原官方直连。</p>
+        </div>
+        <div class="card">
+          <h3>管理 WebUI</h3>
+          <p>浏览器内完成音源切换、网易扫码登录、洛雪源配置、音质偏好与边听边存，全部热生效。</p>
+        </div>
+        <div class="card">
+          <h3>边听边存</h3>
+          <p>在线听歌后台自动缓存，再次播放本地秒开；可把歌曲与内嵌封面、歌词落库到飞牛共享曲库。</p>
+        </div>
+        <div class="card">
+          <h3>封面深度优化</h3>
+          <p>各端各页面真实封面兜底、图片字节缓存、歌单封面后台预热与缓存破除，告别"波纹默认图"。</p>
+        </div>
+        <div class="card">
+          <h3>Docker 自托管</h3>
+          <p>音源合并为单容器，常驻内存约 100–200MB；离线 fpk 安装即跑，无需联网拉取构建。</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>快速安装</h2>
+      <div class="install">
+        <p class="note">方式一（推荐）：在 fnOS「应用中心 → 手动安装」选择从 GitHub Releases 下载的 <code>fnmusic-ext-&lt;版本&gt;.fpk</code>。</p>
+        <p class="note">方式二：命令行克隆安装（适合需要改代码的用户）</p>
+        <pre><code># 需要已安装 fnOS 官方「飞牛音乐」与 Docker
+sudo apt-get update &amp;&amp; sudo apt-get install -y python3 python3-venv git
+git clone https://github.com/haonanren118/fnos_music_ext.git fnmusic_ext
+cd fnmusic_ext
+chmod +x install.sh extend.sh restore.sh
+./install.sh</code></pre>
+        <p class="note">详见 <a href="https://github.com/haonanren118/fnos_music_ext/blob/main/docs/INSTALL.md">安装文档</a>。项目基于 MIT 许可证开源，限个人技术研究与非商业用途。</p>
+      </div>
+    </section>
+
+    <footer>
+      <div>
+        <a href="https://github.com/haonanren118/fnos_music_ext">GitHub</a>
+        <a href="https://gitee.com/yygitee118/fnos_music_ext">Gitee</a>
+        <a href="https://github.com/haonanren118/fnos_music_ext/releases">Releases</a>
+        <a href="https://github.com/haonanren118/fnos_music_ext/blob/main/CHANGELOG.md">更新日志</a>
+      </div>
+      <p style="margin-top:16px">© fnmusic-ext 分支维护版 · 鸣谢上游 javycoder 开源架构 · MIT License</p>
+    </footer>
+  </div>
+</body>
+</html>

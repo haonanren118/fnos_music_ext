@@ -1,14 +1,16 @@
-# fnmusic-ext 飞牛音乐扩展代理
+# fnmusic-ext · 飞牛 fnOS 音乐扩展（网易云音乐 / 洛雪音乐 / 音乐DL 三音源聚合，Docker 自托管）
 
-Gitee：https://gitee.com/javycoder/fnos_music_ext
+Gitee：https://gitee.com/yygitee118/fnos_music_ext
 
-GitHub：https://github.com/javycoder/fnos_music_ext
+GitHub：https://github.com/haonanren118/fnos_music_ext
 
-[![CI](https://github.com/javycoder/fnos_music_ext/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/javycoder/fnos_music_ext/actions/workflows/ci.yml)
+[![CI](https://github.com/haonanren118/fnos_music_ext/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/haonanren118/fnos_music_ext/actions/workflows/ci.yml)
 
 `fnmusic-ext` 是专为 fnOS（飞牛私有云）自带音乐应用（`trim.music`）打造的**无侵入增强扩展**。它通过接管官方后端的 Unix Socket 通信入口，在完全不修改官方程序、nginx 配置与数据库的前提下，让原生飞牛音乐获得在线音乐能力；可随时一条命令还原官方直连。
 
 ![飞牛桌面里的 fnMusic 扩展管理](preview_image/preview.png)
+
+> **搜索关键词**：飞牛 NAS 音乐 · fnOS 音乐扩展 · 网易云音乐 飞牛 · 洛雪音乐 飞牛 · musicDL 飞牛 · NAS 音乐增强 · 飞牛音乐 在线播放 · 自建音乐服务器 · Docker 音乐
 
 ## 鸣谢（Acknowledgements）
 
@@ -70,7 +72,7 @@ GitHub：https://github.com/javycoder/fnos_music_ext
 
 ### 安装（推荐：应用中心 fpk 包）
 
-从 [GitHub Releases](https://github.com/javycoder/fnos_music_ext/releases) 下载最新 `fnmusic-ext-<版本>.fpk`，在 fnOS「应用中心 → 手动安装」选择该文件，按向导选择**初始音源**即可自动完成安装并启用。
+从 [GitHub Releases](https://github.com/haonanren118/fnos_music_ext/releases) 下载最新 `fnmusic-ext-<版本>.fpk`，在 fnOS「应用中心 → 手动安装」选择该文件，按向导选择**初始音源**即可自动完成安装并启用。
 
 - 桌面会出现「fnMusic 扩展管理」图标，点击即在飞牛桌面窗口内打开管理页（音源切换/扫码登录/平台选择/洛雪源配置）；
 - 选洛雪音源时向导不索要任何源信息：装好后打开管理页，在「音乐源 → 洛雪自定义源」里粘贴脚本 URL、上传电脑 `.js` 文件或从 NAS 选择，测试可用后保存即激活；
@@ -86,7 +88,7 @@ GitHub：https://github.com/javycoder/fnos_music_ext
 
 ```bash
 sudo apt-get update && sudo apt-get install -y python3 python3-venv git
-git clone https://github.com/javycoder/fnos_music_ext.git fnmusic_ext
+git clone https://github.com/haonanren118/fnos_music_ext.git fnmusic_ext
 cd fnmusic_ext
 chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 ./install.sh
