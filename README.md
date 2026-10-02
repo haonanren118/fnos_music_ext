@@ -72,7 +72,10 @@ GitHub：https://github.com/haonanren118/fnos_music_ext
 
 ### 安装（推荐：应用中心 fpk 包）
 
-从 [GitHub Releases](https://github.com/haonanren118/fnos_music_ext/releases) 下载最新 `fnmusic-ext-<版本>.fpk`，在 fnOS「应用中心 → 手动安装」选择该文件，按向导选择**初始音源**即可自动完成安装并启用。
+从 [GitHub Releases](https://github.com/haonanren118/fnos_music_ext/releases) 下载最新 `fnmusic-ext-<版本>.fpk`（**离线版，约 412 MB**：内置 Docker 镜像，安装时本地 `docker load`，**无需联网拉取或构建**），在 fnOS「应用中心 → 手动安装」选择该文件，按向导选择**初始音源**即可自动完成安装并启用。
+
+> ⚠️ **包体积约 412 MB 是正常的**——它把 Docker 镜像一并打进去了，换来「安装即跑、不卡构建」。
+> 若你拿到的是**约 5 MB 的小包**，那是**在线版**（不含镜像），安装时才去联网拉取基础镜像；在无法访问 Docker 仓库的飞牛 NAS 上会**安装失败或功能不全**。请到上方 Release 页面下载 **412 MB 的离线版**（sha256 见 Release 说明）。
 
 - 桌面会出现「fnMusic 扩展管理」图标，点击即在飞牛桌面窗口内打开管理页（音源切换/扫码登录/平台选择/洛雪源配置）；
 - 选洛雪音源时向导不索要任何源信息：装好后打开管理页，在「音乐源 → 洛雪自定义源」里粘贴脚本 URL、上传电脑 `.js` 文件或从 NAS 选择，测试可用后保存即激活；
@@ -205,6 +208,13 @@ python3 -m pytest        # 全量测试（无需 Docker/飞牛环境）
 - 版本号唯一来源为根目录 `VERSION`，打包时注入 manifest；
 - CI 在每次 push/PR 都会构建一次 fpk 防止结构回归；推送 `v<版本>` tag 会自动构建并把 `.fpk` 与校验和发布到 GitHub Release（tag 需与 `VERSION` 一致）；
 - 打包结构由 `packaging/tests/test_fpk_pack.py` 离线校验（含 fnpack 实测校验规则）；
+
+> ⚠️ **发布用的必须是「离线版」fpk**。CI 在 `v<版本>` tag 上自动构建并上传的 fpk 是**在线版**（CI 环境无 1.2 GB 内置镜像，且 `images/` 已被 `.gitignore` 排除），体积仅约 5 MB，会导致用户安装时联网拉镜像、并在无法访问 Docker 仓库的 NAS 上失败。**发布后请用本机 `./packaging/fpk/build.sh` 产出的离线版（约 412 MB，含 `images/fnmusic-sources.tar`）覆盖 Release 资产：**
+>
+> ```bash
+> sha256sum dist/fnmusic-ext-<版本>.fpk > dist/fnmusic-ext-<版本>.fpk.sha256
+> gh release upload v<版本> dist/fnmusic-ext-<版本>.fpk dist/fnmusic-ext-<版本>.fpk.sha256 --clobber
+> ```
 - 实机安装/卸载自动测试（需在飞牛设备上以 root 运行）：
 
 ```bash
