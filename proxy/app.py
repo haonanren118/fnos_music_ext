@@ -7063,27 +7063,24 @@ async def playlist_delete(request: Request):
 
 
 def _playlist_public_fields(record: dict, tracks: list | None = None) -> dict:
-    # 封面取曲在下发时重算（兼容当天旧缓存），并伪装成官方 track_+32hex 形态：
-    # 官方 App 按 id 格式过滤，online: 原样下发的 coverId 不会被渲染成图标。
-    # 本地曲目的 coverId 是真实官方封面 guid：原样下发（封面端点透传官方）。
-    # cover_real：真实封面 guid（在线 online:xxx 或本地 32hex），用于 coverUrl 让电脑端/web 直接
-    # 走服务端封面端点解析，免去 fake guid 反查注册表的依赖，更稳；coverId 仍伪装成官方 track_ 形态供手机端渲染。
+    # 封面取曲在下发时重算（兼容当天旧缓存）。coverId 统一用**纯 32-hex** 伪装形态：
+    # - 每日推荐（本地曲目）历来就是纯 32-hex，手机/电脑端歌单卡片渲染正常（实证）；
+    # - 在线曲目原下发 track_+32hex，但该形态 URL 长期不变，早前的黑胶默认图/占位图
+    #   被浏览器强缓存（真图 max-age=86400），换真图后客户端仍用旧图且不重新请求；
+    #   改纯 32-hex 后 URL 变化，旧缓存自然失效。fake→real 反查已登记，服务端可还原。
     cover_real = ""
     picked = dailyrec.pick_playlist_cover_track(tracks)
     if picked:
         cover_real = str(picked.get("coverId") or picked.get("guid") or "")
     if not cover_real:
         cover_real = str(record.get("coverId") or record.get("guid") or "")
-    cover_id = cover_real
-    if cover_id.startswith("online:"):
-        cover_id = "track_" + fake_official_guid(cover_id)
+    cover_id = _track_cover_id(cover_real)
     return {
         "guid": record.get("guid"),
         "name": record.get("name") or "每日推荐",
         "coverId": cover_id,
-        # 同步下发 coverUrl（同源封面端点，与 coverId 同形态）：电脑端/web 读 coverUrl 取图。
-        # 必须用官方 track_ 形态——online: 原样 id 会被客户端格式过滤掉、根本不发起请求。
-        "coverUrl": _public_cover_url(cover_real) if cover_real else "",
+        # 同步下发 coverUrl（同源封面端点，与 coverId 同形态纯 32-hex）
+        "coverUrl": _cover_endpoint_url(cover_id) if cover_id else "",
         "createdAt": int(record.get("createdAt") or time.time()),
         "updatedAt": int(record.get("updatedAt") or time.time()),
         "trackCount": int(record.get("trackCount") or 0),
