@@ -5754,9 +5754,164 @@ def _placeholder_cover_response(guid: str) -> Response:
     )
 
 
+def _cover_log(tag: str, msg: str) -> None:
+    """封面端点诊断日志（临时）：写到 /tmp/fnmusic_cover_req.log，定位客户端真实取图行为。"""
+    try:
+        ts = time.strftime("%m-%d %H:%M:%S")
+        with open("/tmp/fnmusic_cover_req.log", "a", encoding="utf-8") as _f:
+            _f.write(f"{ts} [{tag}] {msg}\n")
+    except Exception:
+        pass
+
+
+def _read_embedded_cover(path: str) -> "tuple[bytes, str] | None":
+    """从任意音频文件读取内嵌专辑图（路径已知，不依赖 guid 反查）。
+
+    飞牛扫描器只认内嵌图，本地曲库封面即存于音频文件本身；mutagen 读
+    ID3(APIC)/FLAC(Picture)/MP4(covr)/OGG(METADATA_BLOCK_PICTURE)。
+    """
+    try:
+        from mutagen import File as MutagenFile
+
+        mf = MutagenFile(path)
+        tags = getattr(mf, "tags", None)
+        if tags is None:
+            return None
+        pics: list = []
+        if hasattr(tags, "pictures"):
+            pics = list(tags.pictures or [])
+        elif hasattr(tags, "getall"):
+            pics = list(tags.getall("APIC") or [])
+        elif hasattr(tags, "get"):
+            covr = tags.get("covr")
+            pics = list(covr) if covr else []
+        for pic in pics:
+            data = getattr(pic, "data", None)
+            if not data:
+                continue
+            mime = str(getattr(pic, "mime", "") or "")
+            if "/" not in mime:
+                mime = "image/jpeg"
+            return bytes(data), mime
+    except Exception as e:
+        logger.debug("read embedded cover failed for %s: %s", path, e)
+    return None
+
+
+_VO_PATH_CACHE: "dict[str, str]" = {}
+
+
+def _vo_audio_path(guid: str) -> str:
+    """从推荐缓存 VO 反查本地曲目的音频文件路径（audioSpec.path），免鉴权、快。"""
+    cached = _VO_PATH_CACHE.get(guid)
+    if cached is not None:
+        return cached
+    path = ""
+    try:
+        for cdir in dailyrec.recommend_cache_dirs():
+            for fn in os.listdir(cdir):
+                if not (fn.startswith("daily-") or fn.startswith("hot-")):
+                    continue
+                fpath = os.path.join(cdir, fn)
+                if not os.path.isfile(fpath):
+                    continue
+                try:
+                    with open(fpath, "r", encoding="utf-8") as fh:
+                        data = json.load(fh)
+                except Exception:
+                    continue
+                tracks = (data.get("tracks") or []) if isinstance(data, dict) else []
+                for t in tracks:
+                    if not isinstance(t, dict):
+                        continue
+                    if (t.get("guid") or "") == guid:
+                        ap = t.get("audioSpec") or {}
+                        p = str(ap.get("path") or "") if isinstance(ap, dict) else ""
+                        if p:
+                            path = p
+                        break
+                if path:
+                    break
+            if path:
+                break
+    except Exception as e:
+        logger.debug("vo audio path lookup failed for %s: %s", guid, e)
+    _VO_PATH_CACHE[guid] = path
+    return path
+
+
+async def _local_cover_response(request: Request, guid: str) -> Response:
+    """本地曲库封面解析。
+
+    飞牛 /music/api/v1/static/cover 对本地曲库 guid 固定返回 400（上游根本不服务本地
+    封面），原实现 forward_to_upstream 必 400。改为：
+      1) 内嵌图优先：从音频文件（audioSpec.path）读 ID3/FLAC/MP4 封面，精确且零外部依赖；
+      2) 在线反查兜底：按「歌名+歌手」调网易 cloudsearch 取专辑图（复用 _netease_direct_cover）；
+      3) 都没有才落占位图。
+    标题/路径优先查推荐缓存（免鉴权、快）；缓存缺失时带鉴权探 track/metadata。
+    """
+    if _cover_negative_get(guid):
+        return _placeholder_cover_response(guid)
+    # 1) 标题/路径
+    title, artist = _vo_meta_from_cache(guid)
+    path = _vo_audio_path(guid)
+    if not path and request is not None:
+        try:
+            mc = get_upstream_client(request.app)
+            mh = copy_incoming_headers(request)
+            mr = mc.build_request(
+                "GET", f"/music/api/v1/track/metadata?guid={quote(guid, safe='')}", headers=mh
+            )
+            mresp = await mc.send(mr)
+            if mresp.status_code == 200:
+                try:
+                    mb = mresp.json()
+                except Exception:
+                    mb = None
+                if isinstance(mb, dict):
+                    data = mb.get("data") if isinstance(mb.get("data"), dict) else mb
+                    if isinstance(data, dict):
+                        if not title:
+                            title = str(data.get("title") or data.get("name") or "")
+                        if not artist:
+                            art = data.get("artist") or data.get("artists")
+                            if isinstance(art, list) and art and isinstance(art[0], dict):
+                                artist = str(art[0].get("name") or "")
+                            else:
+                                artist = str(art or "")
+                        ap = data.get("audioSpec") or data.get("audio") or {}
+                        if isinstance(ap, dict):
+                            p = str(ap.get("path") or "")
+                            if p:
+                                path = p
+        except Exception as e:
+            logger.debug("local cover metadata probe failed for %s: %s", guid, e)
+    _cover_log("LOCAL_RESOLVE", f"guid={guid} title={title!r} artist={artist!r} path={path!r}")
+    # 2) 内嵌图
+    if path and os.path.exists(path):
+        emb = _read_embedded_cover(path)
+        if emb:
+            data_b, mime = emb
+            return Response(
+                content=data_b, media_type=mime,
+                headers={"Cache-Control": "public, max-age=86400"},
+            )
+    # 3) 在线反查
+    if title:
+        cover = await _netease_direct_cover(title, artist)
+        if cover:
+            return await _proxy_cover_response(cover, request, guid)
+    # 4) 占位（负缓存，避免频繁重试）
+    _cover_negative_put(guid)
+    return _placeholder_cover_response(guid)
+
+
 @app.api_route("/music/api/v1/static/cover", methods=["GET", "HEAD"])
 @app.api_route("/music/api/v1/static/cover/{subpath:path}", methods=["GET", "HEAD"])
 async def static_cover(request: Request, subpath: str = ""):
+    _ua = request.headers.get("user-agent", "")[:150]
+    _q = {k: (str(v)[:70]) for k, v in request.query_params.items()}
+    _cover_log("REQ", f"subpath={subpath!r} ua={_ua!r} q={_q}")
     guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
     if not guid and subpath.startswith("online:"):
         guid = subpath
@@ -5765,38 +5920,19 @@ async def static_cover(request: Request, subpath: str = ""):
         upstream_client = get_upstream_client(request.app)
         is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
         if not is_authed and auth_resp is not None:
+            _cover_log("AUTH_FAIL", f"guid={guid} subpath={subpath}")
             return auth_resp
         cached = dailyrec.load_daily_cache(user_guid, dailyrec.today_key(), playlist_kind)
         tracks = (cached or {}).get("tracks") or []
         picked = dailyrec.pick_playlist_cover_track(tracks)
         picked_guid = str((picked or {}).get("guid") or "")
         if not is_online_guid(picked_guid):
-            cover_id = str((picked or {}).get("coverId") or "")
-            if picked and cover_id and not is_online_guid(cover_id):
-                # 本地曲目封面：coverId 是真实官方封面 guid，透传官方静态封面端点
-                upstream_client = get_upstream_client(request.app)
-                headers = copy_incoming_headers(request)
-                cover_req = upstream_client.build_request(
-                    request.method,
-                    f"/music/api/v1/static/cover?coverId={quote(cover_id, safe='')}",
-                    headers=headers,
-                )
-                cover_resp = await upstream_client.send(cover_req, stream=True)
-                cover_headers = filter_headers(
-                    cover_resp.headers, exclude_keys={"content-length", "content-encoding"}
-                )
-
-                async def _cover_stream():
-                    try:
-                        async for chunk in cover_resp.aiter_bytes():
-                            yield chunk
-                    finally:
-                        await cover_resp.aclose()
-
-                return StreamingResponse(
-                    _cover_stream(), status_code=cover_resp.status_code, headers=cover_headers
-                )
+            if picked_guid:
+                # 本地曲目封面：飞牛 /static/cover 对本地 guid 固定 400（不服务本地封面），
+                # 改为本地解析（内嵌图优先，在线反查兜底）。
+                return await _local_cover_response(request, picked_guid)
             # 歌单里没有可用封面：不显示图标，客户端回落自带默认样式
+            _cover_log("PL_NOCOVER_404", f"guid={guid}")
             return Response(status_code=404)
         guid = picked_guid
     # 网易账号歌单封面：登记的封面直链直接 302（兼容重启后反查表未重建的裸假 id）
@@ -5807,7 +5943,10 @@ async def static_cover(request: Request, subpath: str = ""):
             return await _proxy_cover_response(cover, request, guid)
         return Response(status_code=404)
     if not is_online_guid(guid):
-        return await forward_to_upstream(request, get_upstream_client(request.app))
+        # 本地曲库封面：飞牛 /static/cover 对本地 guid 固定返回 400（不服务本地封面），
+        # 故不再转发上游，改为本地解析（内嵌图优先，在线反查兜底）。
+        _cover_log("LOCAL", f"guid={guid} ua={_ua[:60]}")
+        return await _local_cover_response(request, guid)
 
     # 专辑锚点 guid（/search/album 在线专辑的 coverId）：登记时存了封面直链，直接 302
     album_entry = album_entry_from_real_guid(guid)
@@ -5821,12 +5960,14 @@ async def static_cover(request: Request, subpath: str = ""):
     # 直接落占位图，避免每次列表渲染都重跑昂贵失败链（慢且扰上游）。成功解析的 guid
     # 不会进负缓存；服务重启会清空负缓存，重新尝试解析（部署新版本即自动刷新）。
     if _cover_negative_get(guid):
+        _cover_log("NEG_PH", f"guid={guid}")
         return _placeholder_cover_response(guid)
 
     data = await _online_info(request, guid)
     cover = str((data or {}).get("cover_url") or "")
     # ① 已知直链封面同源回源；酷我文本封面（artistpicserver 返回的是文本页）除外
     if cover and _KW_TEXT_COVER_HOST not in cover:
+        _cover_log("PROXY_COVER", f"guid={guid}")
         return await _proxy_cover_response(cover, request, guid)
 
     # ② 按源+ID 直构 CDN：
@@ -5841,6 +5982,7 @@ async def static_cover(request: Request, subpath: str = ""):
     if not direct:
         direct = _qq_cover_by_albummid((data or {}).get("albummid"))
     if direct:
+        _cover_log("PROXY_DIRECT", f"guid={guid} src={direct[:55]}")
         return await _proxy_cover_response(direct, request, guid)
 
     # ③ 网易 cloudsearch/pc 直连同名曲补全（免 musicbox 依赖；musicbox 未启用时唯一兜底）
@@ -5857,16 +5999,19 @@ async def static_cover(request: Request, subpath: str = ""):
     if not enriched:
         enriched = await _enrich_cover_via_netease(request, guid, data or {})
     if enriched:
+        _cover_log("PROXY_NETEASE", f"guid={guid}")
         return await _proxy_cover_response(enriched, request, guid)
 
     # ④ 本地边听边存文件的内嵌专辑图
     embedded = _embedded_cover_bytes(guid)
     if embedded:
         art, mime = embedded
+        _cover_log("EMBEDDED", f"guid={guid}")
         return Response(content=art, media_type=mime, headers={"Cache-Control": "public, max-age=86400"})
 
     # ⑤ 本地占位图池：在线曲目封面永不 404。整条链失败 → 记负缓存，TTL 内不再重跑
     _cover_negative_put(guid)
+    _cover_log("PH", f"guid={guid}")
     return _placeholder_cover_response(guid)
 
 
