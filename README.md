@@ -10,6 +10,12 @@ GitHub：https://github.com/javycoder/fnos_music_ext
 
 ![飞牛桌面里的 fnMusic 扩展管理](preview_image/preview.png)
 
+## 鸣谢（Acknowledgements）
+
+本项目是 [javycoder](https://github.com/javycoder/fnos_music_ext) 开源的飞牛音乐扩展 `fnmusic-ext` 的**分支维护版本**。零侵入接管官方音乐入口的核心代理架构、三大音源（musicbox / musicdl / lxmusic）接入与管理 WebUI 均完整继承自上游，感谢原作者无私开源。
+
+本分支（Gitee `yygitee118` / GitHub `haonanren118`）在沿用上游架构的基础上，重点对**封面系统**做了深度优化与根治（客户端各端/各页面真实封面兜底、图片字节缓存、歌单封面后台预热、缓存破除等），详见 [CHANGELOG](CHANGELOG.md) 的 `2.6.8`–`2.6.16` 优化点。
+
 ## 功能特性
 
 - **在线聚合搜播**：在官方搜索框输入歌名，聚合三大音源之一的曲库（见下），在线歌曲即点即播，自动补齐滚动歌词与高清封面。搜索结果严格**本地优先**：本地曲库条目始终排在前面，在线音源结果（网易 > musicdl > 洛雪）紧随其后；
