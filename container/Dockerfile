@@ -94,6 +94,10 @@ COPY --chown=appuser:appuser musicbox-service/app.py musicbox-service/runner.py 
 COPY --chown=appuser:appuser lxmusic-service/app.py lxmusic-service/source_runtime.py lxmusic-service/verify_source.py /srv/lxmusic-service/
 COPY --chown=appuser:appuser lxmusic-service/js/bridge.js /srv/lxmusic-service/js/bridge.js
 COPY --chown=appuser:appuser webui-service/app.py /srv/webui-service/
+# upgrade.py 必须随镜像分发：app.py 第 36 行 `import upgrade`，
+# 且 /api/upgrade/state、一键升级全靠它（start_upgrade / read_state / disk_free_mb）。
+# 漏掉它服务会在 import 阶段直接崩 —— 镜像里只放 app.py 是不够的。
+COPY --chown=appuser:appuser webui-service/upgrade.py /srv/webui-service/
 COPY --chown=appuser:appuser webui-service/static/ /srv/webui-service/static/
 # webui 复用 .env 安全合并（sys.path 上加 /srv 后 import proxy.env_merge），必须随镜像分发
 COPY --chown=appuser:appuser proxy/__init__.py proxy/env_merge.py /srv/proxy/

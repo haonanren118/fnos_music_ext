@@ -157,7 +157,18 @@ input[type="radio"] { accent-color: var(--accent); margin-top: 4px; }
 .dot.err { background: var(--err); }
 .dot.warn { background: var(--warn); }
 
-.state-line { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+/* 状态行。v2.6.18 修横向溢出：原本只有 flex + gap，没有任何断行保护。
+   文案由服务端 notices 下发（如「主版本源本次不可用…可能滞后于最新发行版」，
+   45 字 ≈ 594px）。.dot 是 flex:none，后面的文本是匿名 flex item，
+   匿名 item 拿不到 min-width:0，整行撑到 594px，窄屏下把整页顶出横向滚动条。
+   overflow-wrap:anywhere 会压低 min-content 尺寸，是 flex item 唯一可靠的
+   断行手段（break-word 不改 min-content，flex 下失效）。 */
+.state-line {
+  display: flex; align-items: flex-start; gap: 8px; font-size: 14px;
+  min-width: 0; flex-wrap: wrap; overflow-wrap: anywhere;
+}
+/* 换行后圆点仍对齐首行文字顶部 */
+.state-line > .dot { margin-top: 7px; }
 .kv { display: flex; gap: 8px; font-size: 14px; min-width: 0; flex-wrap: wrap; overflow-wrap: anywhere; }
 .kv b { flex: none; min-width: 84px; color: var(--muted); font-weight: 500; }
 
