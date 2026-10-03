@@ -566,6 +566,35 @@ function openExternal(url) {
   if (!w) window.location.href = url;
 }
 
+/* 选安装包。
+ *
+ * 踩坑：远端同时挂 `fnmusic-ext-2.6.17.fpk`（离线完整包，约 405MB）
+ * 和 `fnmusic-ext-2.6.17-online.fpk`（在线包，约 5MB，装机时现拉 Docker 镜像）。
+ * 早先写的是 assets.find(name.endsWith(".fpk"))，而 "-online.fpk" 同样以 .fpk 结尾，
+ * find() 取第一个就会命中 online 包 —— 用户的 NAS 拉不到 Docker 仓库时装不上。
+ * 这里改成显式分类，并把"离线完整包"作为默认（唯一在无外网镜像时仍能装的选项）。
+ */
+function pickFpk(assets, version) {
+  const list = (assets || []).filter((a) => /\.fpk$/i.test(String(a.name)));
+  if (!list.length) return { offline: null, online: null };
+  const isOnline = (a) => /-online\.fpk$/i.test(String(a.name));
+  const matchesVer = (a) => !version || String(a.name).includes(String(version));
+  // 离线包 = 名字里没有 -online 标记，且文件名里就是目标版本号
+  const offline = list.find((a) => !isOnline(a) && matchesVer(a))
+    || list.find((a) => !isOnline(a))
+    || null;
+  const online = list.find((a) => isOnline(a) && matchesVer(a))
+    || list.find(isOnline)
+    || null;
+  return { offline, online };
+}
+
+function fpkLabel(a) {
+  if (!a) return "";
+  const name = String(a.name);
+  return /-online\.fpk$/i.test(name) ? "在线包" : "离线完整包";
+}
+
 async function loadVersion(silent) {
   const btn = $("#ver-check");
   if (btn) { btn.disabled = true; btn.textContent = "检查中…"; }
@@ -595,7 +624,7 @@ function renderVersion(v) {
     badge.hidden = !v.has_update;
     if (v.has_update) {
       badge.innerHTML = `<span class="ver-dot"></span>新版本 ${esc(v.latest)}`;
-      badge.title = `发现新版本 v${v.latest}，点击查看升级点`;
+      badge.title = `发现新版本 v${v.latest}，点击查看升级内容`;
     }
   }
   // 窄屏侧边栏隐藏，用底部导航的「版本」项小圆点兜底提示
@@ -613,6 +642,15 @@ function renderVersion(v) {
       state.innerHTML =
         `<span class="state-line"><span class="dot ok"></span>已是最新版本（v${esc(v.current)}）</span>`;
     }
+    // 主版本源不可用时必须如实说明。
+    // 这不是可选的礼貌提示：GitHub 匿名 API 很容易限流，若此时镜像又落后，
+    // 用户会看到"已是最新"却其实有新版 —— 那是在拿错误的结论误导人。
+    const notices = v.notices || [];
+    if (notices.length) {
+      state.innerHTML += notices
+        .map((n) => `<span class="state-line"><span class="dot warn"></span>${esc(n)}</span>`)
+        .join("");
+    }
   }
 
   // 有更新才显示更新卡片
@@ -623,12 +661,25 @@ function renderVersion(v) {
       const rows = [`<div class="kv"><b>最新版本</b>v${esc(v.latest)}</div>`];
       if (v.published) rows.push(`<div class="kv"><b>发布时间</b>${esc(String(v.published).slice(0, 10))}</div>`);
       if (v.source) rows.push(`<div class="kv"><b>版本源</b>${esc(v.source)}</div>`);
-      const fpk = (v.assets || []).find((a) => String(a.name).endsWith(".fpk"));
-      if (fpk) {
-        const size = fmtBytes(fpk.size);
-        rows.push(`<div class="kv"><b>安装包</b>${esc(fpk.name)}${size ? "（" + size + "）" : ""}</div>`);
+      const { offline, online } = pickFpk(v.assets, v.latest);
+      // 离线包优先：唯一在拉不到 Docker 镜像时仍能装成功的选项
+      if (offline) {
+        const size = fmtBytes(offline.size);
+        rows.push(`<div class="kv"><b>安装包</b>${esc(offline.name)}${size ? "（" + size + "，" + fpkLabel(offline) + "）" : "（" + fpkLabel(offline) + "）"}</div>`);
       }
+      if (online) {
+        const size = fmtBytes(online.size);
+        rows.push(`<div class="kv"><b>备选</b>${esc(online.name)}${size ? "（" + size + "，" + fpkLabel(online) + "）" : "（" + fpkLabel(online) + "）"}</div>`);
+      }
+      if (!offline && !online) rows.push(`<div class="kv"><b>安装包</b>远端未附带 .fpk，请前往发行页手动下载</div>`);
       $("#ver-update").innerHTML = rows.join("");
+
+      // 只有存在离线完整包时才允许一键升级：online 包要现拉 Docker 镜像，装不上
+      const btn = $("#ver-install");
+      if (btn) {
+        btn.disabled = !offline;
+        btn.title = offline ? "" : "远端未提供离线完整安装包，请前往发行页手动下载安装";
+      }
     }
   }
 
@@ -644,15 +695,6 @@ function renderVersion(v) {
       return `<div class="subpanel"><div class="kv"><b>v${esc(g.version)}</b>${esc(g.date || "")}</div><ul>${items}${more}</ul></div>`;
     }).join("");
   }
-
-  // 镜像入口
-  const mir = $("#ver-mirrors");
-  if (mir) {
-    const list = v.mirrors || [];
-    mir.innerHTML = list.map((m) =>
-      `<div class="kv"><b>${esc(m.name)}</b><a href="${esc(m.page)}" target="_blank" rel="noopener">${esc(m.page)}</a></div>`
-    ).join("");
-  }
 }
 
 $("#ver-check") && $("#ver-check").addEventListener("click", () => loadVersion(false));
@@ -667,11 +709,110 @@ $("#ver-notes-btn") && $("#ver-notes-btn").addEventListener("click", () => {
   const v = versionInfo || {};
   openExternal(v.url || v.releases_page || "https://github.com/haonanren118/fnos_music_ext/releases");
 });
-$("#ver-download") && $("#ver-download").addEventListener("click", () => {
+$("#ver-install") && $("#ver-install").addEventListener("click", startUpgrade);
+
+/* -------------------------------------------------------------- 一键升级 */
+let upgradePoll = null;
+
+function upgradeUI(stage, text, percent) {
+  const hint = $("#ver-install-hint");
+  if (!hint) return;
+  if (stage === "downloading" || stage === "verifying") {
+    const p = Number(percent || 0);
+    hint.innerHTML = `正在下载安装包… ${p}%　请勿关闭页面`;
+  } else if (stage === "installing") {
+    hint.innerHTML = "安装包已校验，正在安装…　此间管理台会短暂断开，属正常现象，请勿断电";
+  } else if (stage === "done") {
+    hint.innerHTML = `升级完成，页面即将自动刷新…（${esc(text || "")}）`;
+  } else if (stage === "failed") {
+    hint.innerHTML = `<span style="color:var(--err)">升级失败：${esc(text || "未知错误")}</span>　可前往<a href="${esc(fallbackUrl())}" target="_blank" rel="noopener">发行页</a>手动下载安装`;
+  } else if (stage === "interrupted") {
+    hint.innerHTML = `<span style="color:var(--warn)">${esc(text || "上次升级被中断")}</span>　可重新发起升级`;
+  } else {
+    hint.innerHTML = "「一键升级」会自动下载并安装到本机，由飞牛应用中心接管；安装期间管理台会短暂断开，属正常现象。不升级的话当前版本功能完全不受影响。";
+  }
+}
+
+function fallbackUrl() {
   const v = versionInfo || {};
-  const fpk = (v.assets || []).find((a) => String(a.name).endsWith(".fpk"));
-  openExternal(fpk && fpk.url ? fpk.url : (v.url || v.releases_page));
-});
+  const { offline, online } = pickFpk(v.assets, v.latest);
+  return (offline || online || {}).url || v.url || v.releases_page || "";
+}
+
+function stopUpgradePoll() {
+  if (upgradePoll) { clearInterval(upgradePoll); upgradePoll = null; }
+}
+
+async function pollUpgrade() {
+  let s;
+  try {
+    s = await api("/api/upgrade/state");
+  } catch (e) {
+    // 安装期间 WebUI 会被重启打断，这里静默重试即可
+    return;
+  }
+  if (!s || !s.stage) return;
+  upgradeUI(s.stage, s.error || s.message, s.percent);
+  if (s.stage === "done") {
+    stopUpgradePoll();
+    toast("升级完成，正在刷新", "ok");
+    setTimeout(() => location.reload(), 6000);
+  } else if (s.stage === "failed" || s.stage === "interrupted") {
+    stopUpgradePoll();
+    const btn = $("#ver-install");
+    if (btn) { btn.disabled = false; btn.textContent = "一键升级"; }
+  } else if (s.stage === "starting" || s.stage === "downloading"
+             || s.stage === "verifying" || s.stage === "installing") {
+    const btn = $("#ver-install");
+    if (btn) { btn.disabled = true; btn.textContent = "升级中…"; }
+  }
+}
+
+async function startUpgrade() {
+  const v = versionInfo || {};
+  if (!v.has_update || !v.latest) return toast("没有可安装的新版本", "fail");
+  if (upgradePoll) return;
+  const size = fmtBytes((pickFpk(v.assets, v.latest).offline || {}).size) || "数百 MB";
+  // 装 fpk 等于以 root 执行安装脚本，必须让用户明确知情后再动手
+  if (!confirm(
+    `确认升级到 v${v.latest}？\n\n` +
+    `将自动下载并安装官方离线安装包（约 ${size}），由飞牛应用中心接管。\n` +
+    `安装期间管理台会短暂断开，设备请勿断电。\n\n` +
+    `不升级也完全不影响使用，随时可以关掉这个提示。`
+  )) return;
+
+  const btn = $("#ver-install");
+  if (btn) { btn.disabled = true; btn.textContent = "启动中…"; }
+  upgradeUI("downloading", "", 0);
+  upgradePoll = setInterval(pollUpgrade, 1500);
+  try {
+    const r = await api("/api/upgrade/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ target: v.latest }),
+    });
+    if (r && r.ok === false) throw new Error(r.error || "发起失败");
+  } catch (e) {
+    stopUpgradePoll();
+    if (btn) { btn.disabled = false; btn.textContent = "一键升级"; }
+    upgradeUI("failed", e.message);
+    toast("无法发起升级：" + e.message, "fail");
+  }
+}
+
+// 页面加载时若上次升级正在跑，接上轮询（刷新页面不丢进度）
+(async function resumeUpgrade() {
+  try {
+    const s = await api("/api/upgrade/state");
+    const running = s && ["starting", "downloading", "verifying", "installing"].includes(s.stage);
+    if (running) {
+      upgradePoll = setInterval(pollUpgrade, 1500);
+      pollUpgrade();
+    } else if (s && (s.stage === "failed" || s.stage === "interrupted")) {
+      upgradeUI(s.stage, s.error || s.message, s.percent);
+    }
+  } catch (e) { /* 忽略 */ }
+})();
 
 /* -------------------------------------------------------------- 启动 */
 (async function boot() {

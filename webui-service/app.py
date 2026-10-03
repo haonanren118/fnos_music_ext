@@ -26,12 +26,14 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # /repo：复用 proxy/env_merge
+sys.path.insert(0, str(Path(__file__).resolve().parent))       # 本目录：upgrade 模块
 from proxy.env_merge import (  # noqa: E402
     parse_env_file,
     preserve_user_comments,
     render_env,
     write_env_atomic,
 )
+import upgrade  # noqa: E402
 
 logger = logging.getLogger("webui_service")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -314,6 +316,11 @@ async def _lifespan(_app: FastAPI):
             except Exception:  # noqa: BLE001
                 logger.exception("预览清退循环异常")
     reaper = asyncio.create_task(_preview_reaper())
+    # 清掉上次升级残留的临时安装包（离线包 400MB+，不清会白占磁盘）
+    try:
+        upgrade.cleanup()
+    except Exception:  # noqa: BLE001
+        logger.exception("升级临时目录清理失败")
     try:
         yield
     finally:
@@ -391,7 +398,13 @@ RELEASE_SOURCES = (
         "api": f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases/latest",
         "list_api": f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases?per_page=10",
         "page": f"https://github.com/{REPO_OWNER}/{REPO_NAME}/releases",
-        "headers": {"Accept": "application/vnd.github+json"},
+        # GitHub 未认证 API 只有 60 次/小时/IP（实测被限流后整源不可用）。
+        # 配一个只读 PAT（环境变量 GITHUB_TOKEN，无需任何 scope）即可提到 5000 次/小时。
+        "headers": {
+            "Accept": "application/vnd.github+json",
+            **({"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}"}
+               if os.environ.get("GITHUB_TOKEN") else {}),
+        },
     },
     {
         # Gitee 镜像账号与 GitHub 不同：GitHub 是 haonanren118，Gitee 是 yygitee118。
@@ -514,8 +527,18 @@ async def _fetch_latest_release(request: Request) -> "tuple[dict | None, str]":
     这样既省一次请求，又不会因 latest 标记不规范而漏报新版本。
     草稿（draft）与预发布（prerelease）一律排除。
     单源超时 6 秒即换下一个源，避免管理台被慢源拖住。
+
+    踩坑（务必保留这里的"不提前 return"）：**不能拿到第一个能用的源就返回**。
+    GitHub 未认证 API 只有 60 次/小时/IP，很容易撞 403；而 Gitee 镜像常常没同步
+    新版本（实测停在 v2.6.16，资产还是 zip/tar）。早先"GitHub 失败就转 Gitee
+    并直接返回"，于是 GitHub 一限流就把「远端最新 2.6.17」降级成「Gitee 的 2.6.16」，
+    再拿 2.6.16 和本地 2.6.16 一比 —— 得到 has_update=false，
+    **有新版却提示"已是最新"**，错误被完美掩盖成正常。
+    现在改为遍历所有源取版本号最大者；只有全部源都失败才算检测失败。
     """
     client = get_http(request)
+    best_overall: "dict | None" = None
+    best_src = ""
     for src in RELEASE_SOURCES:
         headers = {"User-Agent": "fnmusic-ext"}
         headers.update(src.get("headers") or {})
@@ -549,8 +572,11 @@ async def _fetch_latest_release(request: Request) -> "tuple[dict | None, str]":
                                 best = cand
             except Exception as exc:  # noqa: BLE001 —— 列表失败不影响 latest 结果
                 logger.debug("release list %s failed: %s", src["name"], exc)
-        return best, src["name"]
-    return None, ""
+        # 不提前返回：继续试下一个源，最后在所有源里取版本号最大的那条
+        if best is not None and (best_overall is None
+                                 or _newer_than(best["version"], best_overall["version"])):
+            best_overall, best_src = best, src["name"]
+    return best_overall, best_src
 
 
 # 镜像可达性缓存：{源名: (是否可达, 时间戳)}，TTL 1 小时。
@@ -672,6 +698,13 @@ async def api_version(request: Request):
                              "error": "无法连接版本源（不影响使用）"})
 
     remote = rel["version"]
+    # 降级告警：主源（GitHub）未参与本次判定时必须如实说明，不能让用户以为
+    # 「所有源都没有更新」。GitHub 匿名 API 只有 60 次/小时/IP，很容易 403；
+    # 若同时 Gitee 镜像又落后，就会出现"明明有新版却显示已是最新"。
+    notices: list[str] = []
+    if source != RELEASE_SOURCES[0]["name"]:
+        notices.append(f"主版本源 {RELEASE_SOURCES[0]['name']} 本次不可用（多为访问频率限制），"
+                       f"当前结果来自镜像「{source}」，可能滞后于最新发行版")
     has_update = _newer_than(remote, local)
     # 镜像列表：只展示实测可达的源（探测失败/404 的不展示），避免用户点到死链
     mirrors = await _available_mirrors(request, working=source)
@@ -680,6 +713,7 @@ async def api_version(request: Request):
         "mirrors": mirrors,
         "checked": True,
         "source": source,
+        "notices": notices,
         "latest": remote,
         "latest_tag": rel["tag"],
         "latest_name": rel["name"],
@@ -689,7 +723,79 @@ async def api_version(request: Request):
         "published": rel["published"],
         "assets": rel["assets"],
         "changelog": _changelog_notes(local, remote),
+        # 一键升级可行性（只作提示用，真正的准入判断在 upgrade.start_upgrade 里）
+        "can_install": bool(_pick_offline_asset(rel["assets"], remote)),
+        "free_mb": _upgrade_free_mb(),
     }
+
+
+def _pick_offline_asset(assets: list, version: str) -> "dict | None":
+    """挑离线完整包。
+
+    远端同时挂 `fnmusic-ext-<v>.fpk`（离线，约 405MB）和 `fnmusic-ext-<v>-online.fpk`
+    （在线，约 5MB，装机时现拉 Docker 镜像）。带 -online 的一律排除：用户的 NAS
+    未必能连上 Docker 仓库，选错就装不上。
+    """
+    for a in assets or []:
+        name = str(a.get("name") or "")
+        if re.search(r"-online\.fpk$", name, re.I):
+            continue
+        if name.endswith(".fpk") and str(version) in name:
+            return a
+    for a in assets or []:
+        name = str(a.get("name") or "")
+        if name.endswith(".fpk") and not re.search(r"-online\.fpk$", name, re.I):
+            return a
+    return None
+
+
+def _upgrade_free_mb() -> int:
+    try:
+        return upgrade.disk_free_mb()
+    except Exception:  # noqa: BLE001
+        return -1
+
+
+@app.get("/api/upgrade/state")
+async def api_upgrade_state():
+    """轮询一键升级进度。安装过程会重启服务，故状态读的是落盘数据。"""
+    return {"ok": True, **(upgrade.read_state())}
+
+
+class UpgradeBody(BaseModel):
+    target: str = ""
+
+
+@app.post("/api/upgrade/start")
+async def api_upgrade_start(body: UpgradeBody, request: Request):
+    """发起一键升级：下载 → 校验 sha256 → 交给飞牛应用中心安装。
+
+    只做「可选动作」，任何失败都不影响当前版本继续使用。
+    """
+    local = _read_version()
+    target = (body.target or "").strip().lstrip("vV")
+    if not target:
+        return JSONResponse({"ok": False, "error": "缺少目标版本"}, status_code=400)
+    try:
+        rel, _src = await _fetch_latest_release(request)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": f"无法连接版本源：{exc}"}, status_code=503)
+    if not rel:
+        return JSONResponse({"ok": False, "error": "无法连接版本源"}, status_code=503)
+    # 只允许升级到远端真实存在的那个版本，不接受调用方随意指定
+    if target != rel["version"]:
+        return JSONResponse(
+            {"ok": False, "error": f"目标版本 v{target} 与远端最新 v{rel['version']} 不一致"},
+            status_code=400,
+        )
+    try:
+        result = await upgrade.start_upgrade(rel["assets"], target, local)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("start upgrade failed")
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    return result
 
 
 @app.get("/api/config")
@@ -931,12 +1037,44 @@ async def netease_qr(unikey: str = Query(...)):
 
 # ------------------------------------------------------------------ 静态前端 --
 
+class NoCacheStatic(StaticFiles):
+    """静态资源强制不缓存。
+
+    踩坑：StaticFiles 默认只发 ETag + Last-Modified，没有 Cache-Control。
+    浏览器于是对 app.js / style.css / index.html 做启发式缓存（典型 10% 剩余时间），
+    而飞牛桌面是常驻 iframe，会一直复用首次加载的那份旧脚本 —— 结果就是
+    「移动端能看到升级提示（每次新开页面，重新校验），
+      桌面端死活没有（一直吃缓存里的旧 app.js，里面根本没有渲染角标的逻辑）」。
+    这里显式 no-store，让每次进页面都拿当前版本，前端更新立刻生效。
+    版本检测/升级这类"提示型"功能最怕的就是提示被缓存吞掉。
+    """
+
+    def file_response(self, *args, **kwargs):  # noqa: ANN002, ANN003
+        resp = super().file_response(*args, **kwargs)
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        return resp
+
+
 @app.get("/")
 async def index():
-    return FileResponse(STATIC_DIR / "index.html")
+    resp = FileResponse(STATIC_DIR / "index.html")
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
 
 
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+@app.head("/")
+async def index_head():
+    """HEAD 也要支持：浏览器/代理发条件请求（If-None-Match）时用的是 HEAD，
+    只注册 GET 会返回 405，反而让"禁缓存"这条链路在某些客户端上失效。"""
+    return Response(status_code=200, headers={
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+    })
+
+
+app.mount("/static", NoCacheStatic(directory=str(STATIC_DIR)), name="static")
 
 # 飞牛桌面 iframe 不能嵌 http://主机:8774（桌面是 HTTPS，混合内容会被浏览器丢掉，窗口一片空白）。
 # 入口改走网关同源路径 /app/fnmusic-ext，这里把该前缀剥掉，直连 :8774 的 /api 不受影响。

@@ -16,7 +16,7 @@
           <div class="brand-name">fnmusic-ext</div>
           <div class="brand-sub-row">
             <span class="brand-sub" id="brand-version">管理台</span>
-            <button class="ver-badge" id="brand-upgrade" hidden title="发现新版本，点击查看升级点"></button>
+            <button class="ver-badge" id="brand-upgrade" hidden title="发现新版本，点击查看升级内容"></button>
           </div>
         </div>
       </div>
@@ -222,20 +222,15 @@
           <div class="card-title">有可用更新</div>
           <div id="ver-update" class="stack"></div>
           <div class="btn-row">
-            <button class="btn primary" id="ver-notes-btn">查看升级点</button>
-            <button class="btn" id="ver-download">前往下载</button>
+            <button class="btn primary" id="ver-install">一键升级</button>
+            <button class="btn" id="ver-notes-btn">查看升级内容</button>
           </div>
-          <p class="hint">升级通过飞牛「应用中心 → 手动安装」安装新的 <code>.fpk</code> 包完成。升级前建议先在应用中心备份当前配置；不升级的话当前版本功能不受影响。</p>
+          <p class="hint" id="ver-install-hint">「一键升级」会自动下载并安装到本机，由飞牛应用中心接管；安装期间管理台会短暂断开，属正常现象。不升级的话当前版本功能完全不受影响。</p>
         </div>
 
         <div class="card" id="ver-changelog-card" hidden>
           <div class="card-title">升级点明细</div>
           <div id="ver-changelog" class="stack"></div>
-        </div>
-
-        <div class="card">
-          <div class="card-title">下载与镜像</div>
-          <div id="ver-mirrors" class="stack"></div>
         </div>
       </section>
     </main>
