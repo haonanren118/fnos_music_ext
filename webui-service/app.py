@@ -764,7 +764,7 @@ async def api_version(request: Request):
         "published": rel["published"],
         "assets": rel["assets"],
         "changelog": _changelog_notes(local, remote),
-        # 一键升级可行性（只作提示用，真正的准入判断在 upgrade.start_upgrade 里）
+        # 能否提供离线完整包（只作提示用，真正的准入判断在 upgrade.start_upgrade 里）
         "can_install": bool(_pick_offline_asset(rel["assets"], remote)),
         "free_mb": _upgrade_free_mb(),
     }
@@ -799,7 +799,7 @@ def _upgrade_free_mb() -> int:
 
 @app.get("/api/upgrade/state")
 async def api_upgrade_state():
-    """轮询一键升级进度。安装过程会重启服务，故状态读的是落盘数据。"""
+    """轮询安装包下载进度。状态落盘，页面刷新或服务重启后仍能查到真实结果。"""
     return {"ok": True, **(upgrade.read_state())}
 
 
@@ -809,9 +809,11 @@ class UpgradeBody(BaseModel):
 
 @app.post("/api/upgrade/start")
 async def api_upgrade_start(body: UpgradeBody, request: Request):
-    """发起一键升级：下载 → 校验 sha256 → 交给飞牛应用中心安装。
+    """发起安装包下载：拉取官方 fpk → 校验 sha256 → 存到宿主可见目录。
 
     只做「可选动作」，任何失败都不影响当前版本继续使用。
+    注意：fnOS 未提供可用的自动安装接口（appcenter-cli install-fpk 对已安装
+    应用是空操作），所以这里**不装**，只把包准备好并指引用户手动安装。
     """
     local = _read_version()
     target = (body.target or "").strip().lstrip("vV")

@@ -1,39 +1,45 @@
-"""一键升级：下载远端 fpk → 校验 → 交给飞牛应用中心安装。
+"""下载安装包：拉取官方 fpk → 校验 sha256 → 存到宿主可见目录 → 指引用户手动安装。
 
 设计取舍（都是踩过坑才定下来的）：
 
 1. **必须校验 sha256，且只认官方发行页登记的值。**
    安装 fpk 等于以 root 跑任意安装脚本，拿到一个错误的包就是任意代码执行。
    所以校验值不从包自身读取、不从第三方取，只认 release 上并排发布的
-   `<name>.sha256`；取不到就拒绝安装，宁可让用户手动装。
+   `<name>.sha256`；取不到就不给下载，宁可让用户自己去发行页拿。
 
 2. **只允许升级到更高版本，且只允许官方仓库的资产。**
    防止把包指针指到任意 URL（等于任意下载），也防止"降级"覆盖掉更新的安装。
 
-3. **用 appcenter-cli install-fpk，不自己解包。**
-   fnOS 的安装流程（停服务、备份、迁移数据、装依赖、重启）由应用中心负责，
-   自己解包替换等于绕过系统管理，装坏了系统状态就乱了。
-   ⚠️ 但 install-fpk 对**已安装**的应用是**空操作**：只做文件校验，打印
-   `[Info]Application [x] is installed.` 并**返回 0**，实际既不升级也不报错
-   （日志里连一条 install 记录都不留）。只看退出码会把"什么都没发生"当成
-   "升级成功"。所以宿主端 `handle_host_upgrade()` 的成功判据是
-   **装完读回来的版本号 == 目标版本**，不是退出码。
-   `install-local` 更危险 —— 它会先 stop + uninstall 再因环境变量解析失败
-   中断，把应用留在「已卸载」的坏状态，**不要用**。
+3. **【实测结论】fnOS 没有可用的自动升级通道，最后一步只能交给用户。**
+   真机上把appcenter-cli 的所有姿势都试过了：
+   - `install-fpk <fpk>`（带/不带 `-e`）→ 只跑一遍 `Verifying files.`，
+     打印 `[Info]Application [fnmusic-ext] is installed.` 并**返回 0**，
+     但版本号、日志、install 记录全都不变 —— 对已安装应用是**纯空操作**；
+   - `install <appname>` → `[Error]Something wrong with appcenter: code 10030`；
+   - 顶层子命令里**根本没有 upgrade**（只有 install / uninstall / start / stop /
+     check / status / list / install-fpk / install-local / manual-install /
+     default-volume）；
+   - `install-local` 更危险：它先 stop + uninstall，再因环境变量解析失败中断，
+     把应用留在「已卸载」的坏状态且 repo/ 被清空，**不要用**。
+   所以「点一下就自动装完」在 fnOS 上做不到。**不把空操作包装成成功**
+   （那等于骗用户说升级了其实啥也没变），改为：自动下载 + 校验到宿主共享目录，
+   然后明确告诉用户包在哪、怎么装。宿主特权通道的代码全部保留在
+   `proxy/webui_gateway.py` 的 `POST /api/host-upgrade`，万一后续 fnOS 出了真接口，
+   重新接上即可，不用重写。
 
-4. **安装动作必须由宿主 root 执行，容器自己装不了。**
+4. **下载必须落在宿主可见的目录，容器自己 /tmp 不行。**
    WebUI 跑在容器里（uid 1000），既没有 root 也没有 appcenter-cli
-   （它在宿主 `/usr/local/bin/`，容器里 `which` 直接 not found）。
-   实测在容器里调会抛"一键升级需要 root 权限运行 WebUI"，一键升级必然失败。
-   现由宿主侧 root 进程 `proxy/webui_gateway.py` 的特权端点
-   `POST /api/host-upgrade` 代为执行，WebUI 经 Unix socket 请求。
+   （它在宿主 `/usr/local/bin/`，容器里 `which` 直接 not found）——
+   就算 fnOS 给了能用的安装接口，容器里也调不动。
+   现在包下到宿主仓库下的 `sources-data/upgrade/package.fpk`，用户在
+   文件管理器里就能直接看到并拿去装。
    ⚠️ 另一个坑：**容器 /tmp 与宿主 /tmp 是两套互不可见的空间**，包下到
    容器 /tmp 宿主根本看不到。必须放在共享挂载 `/repo/sources-data/upgrade/`
    （`/repo` 挂自宿主仓库目录，且该子目录在打包排除列表里）。
 
-5. **安装是长任务，接口立即返回 + 轮询状态。**
-   405MB 离线包下载+安装要好几分钟，HTTP 请求挂在那里必然超时。
-   进程还会被安装动作重启掉，所以状态要落盘，重启后仍能查到真实结果。
+5. **下载是长任务，接口立即返回 + 轮询状态。**
+   405MB 离线包要下好几分钟，HTTP 请求挂在那里必然超时。
+   状态落盘，页面刷新/重开仍能查到真实结果。
 
 6. **下载体积大，边下边报进度。**
    离线包 400MB+，不给进度用户会以为卡死。
@@ -132,11 +138,11 @@ def read_state() -> dict:
         data = json.loads(STATE_FILE.read_text("utf-8"))
     except Exception:  # noqa: BLE001
         return {"stage": "idle"}
-    # 下载/安装中途进程被杀会留下 running 状态，10 分钟后视为中断
-    if data.get("stage") in ("downloading", "verifying", "installing"):
+    # 下载中途进程被杀会留下 running 状态，10 分钟后视为中断
+    if data.get("stage") in ("downloading", "verifying"):
         if _now() - float(data.get("updated_at") or 0) > 600:
             data["stage"] = "interrupted"
-            data["message"] = "上次升级被中断（服务重启或网络断开），可重新发起升级"
+            data["message"] = "上次下载被中断（服务重启或网络断开），可重新发起"
     return data
 
 
@@ -278,6 +284,39 @@ def _host_upgrade(target: str) -> tuple[int, str]:
         return status or 500, text[-600:]
 
 
+def _host_visible_dir() -> str:
+    """给用户看的安装包目录（宿主真实路径）。
+
+    容器里的 /repo 只是挂载点，用户在「文件」App 里看到的是宿主路径。
+    优先用宿主网关告知的真实路径；拿不到就退回按 appname 推算的常见位置；
+    再不行只说相对位置 —— 宁可含糊也别给一个用户点不存在的 /repo/... 。
+    """
+    env = (os.environ.get("UPGRADE_HOST_DIR") or "").strip()
+    if env:
+        return env
+    # 容器里 /repo 只是挂载点，宿主真实路径推不出来（Path.exists 必然 False），
+    # 所以兜底不查存在性，只按 fnOS 的固定布局拼一个 —— 与 Dockerfile 的
+    # UPGRADE_HOST_DIR、宿主网关的 UPGRADE_FPK_DIRS 三处保持一致。
+    name = (os.environ.get("FNMUSIC_APP_NAME") or "").strip() or "fnmusic-ext"
+    return f"/vol1/@appcenter/{name}/repo/sources-data/{UPGRADE_SUBDIR}"
+
+
+def _ready_message(target: str) -> str:
+    """包下载校验完后的引导文案。
+
+    刻意写清楚三件事：包已完整可用、在哪、怎么装 —— 不让用户猜。
+    """
+    where = _host_visible_dir()
+    return (
+        f"安装包 v{target} 已下载完成，并通过官方 sha256 校验。\n"
+        f"飞牛系统没有可用的自动安装接口（应用中心会跳过对已安装应用的安装），"
+        f"最后一步需要你手动点一下：\n"
+        f"① 打开「应用中心」，在侧边栏底部开启「手动安装」\n"
+        f"② 点「手动安装」，选择 {where} 下的 {FPK_FILE.name}\n"
+        f"③ 确认后即完成升级；当前版本在升级前一直可用"
+    )
+
+
 async def _do_upgrade(asset_url: str, expect_sha: str, target: str) -> None:
     """后台任务：下载 → 校验 → 安装。全程写状态，供前端轮询。"""
     try:
@@ -296,25 +335,22 @@ async def _do_upgrade(asset_url: str, expect_sha: str, target: str) -> None:
                          error="安装包校验不通过，已中止安装（文件可能已损坏或被篡改）")
             return
 
-        _write_state(stage="installing", target=target, message="正在安装，请勿关闭设备电源")
-        code, out = await asyncio.get_running_loop().run_in_executor(
-            None, _host_upgrade, target,
+        # 校验通过 —— 包已就位。fnOS 无可用自动升级通道（见 docstring 第 3 条），
+        # 这里**不**去调 appcenter-cli装：它对已安装应用是空操作，会返回 0
+        # 却什么都没做，把它当成功就是骗用户。改为把包留在宿主目录并给出安装指引。
+        _write_state(
+            stage="ready", target=target, percent=100,
+            message=_ready_message(target),
+            file_path=str(FPK_FILE),
+            file_size=FPK_FILE.stat().st_size,
         )
-        if code == 0:
-            _write_state(stage="done", target=target,
-                         message=f"已升级到 v{target}，管理台可能会自动刷新")
-            FPK_FILE.unlink(missing_ok=True)
-        else:
-            tail = out[-600:] or f"退出码 {code}"
-            _write_state(stage="failed", target=target,
-                         error=f"应用中心安装失败：{tail}")
     except Exception as exc:  # noqa: BLE001
-        logger.exception("upgrade failed")
+        logger.exception("upgrade download failed")
         _write_state(stage="failed", target=target, error=str(exc))
 
 
 async def start_upgrade(assets: list, target: str, current: str) -> dict:
-    """发起升级。校验通过后丢后台任务，立即返回。"""
+    """发起下载。校验通过后丢后台任务，立即返回。"""
     if _ver_tuple(target) <= _ver_tuple(current):
         raise ValueError(f"目标版本 v{target} 不高于当前 v{current}，已拒绝")
 
@@ -335,7 +371,7 @@ async def start_upgrade(assets: list, target: str, current: str) -> dict:
                 name, url = n, str(a.get("url") or "")
                 break
     if not url:
-        raise ValueError("远端未提供离线完整安装包，无法自动升级；请用「下载安装包」手动安装")
+        raise ValueError("远端未提供离线完整安装包，无法自动下载")
     if not _host_allowed(url):
         raise ValueError("安装包来源不在允许的官方仓库列表内，已拒绝")
 
@@ -345,12 +381,12 @@ async def start_upgrade(assets: list, target: str, current: str) -> dict:
     try:
         expect = await _fetch_expected_sha(sha_url)
     except Exception as exc:  # noqa: BLE001
-        raise ValueError(f"取不到官方校验值（{exc}），为安全起见不自动安装") from exc
+        raise ValueError(f"取不到官方校验值（{exc}），为安全起见不提供下载") from exc
 
     async with _lock:
         cur = read_state()
-        if cur.get("stage") in ("downloading", "verifying", "installing"):
-            raise ValueError("已有升级任务在进行中")
+        if cur.get("stage") in ("downloading", "verifying"):
+            raise ValueError("已有下载任务在进行中")
         task = asyncio.create_task(_do_upgrade(url, expect, target))
         _TASKS.add(task)
         task.add_done_callback(_TASKS.discard)
@@ -362,7 +398,11 @@ _TASKS: set = set()
 
 
 def cleanup() -> None:
-    """服务启动时清掉上次残留的临时包（可能是 400MB+）。"""
+    """服务启动时清掉上次残留的临时包（可能是 400MB+）。
+
+    注意：只在 ready/failed 之外的状态下清理；若上一轮已 ready 且用户还没装，
+    保留状态与包，好让页面继续显示"包已就位"。
+    """
     try:
         if FPK_FILE.exists():
             FPK_FILE.unlink()

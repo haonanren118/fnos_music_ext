@@ -74,6 +74,23 @@ h2 { margin: 4px 0 14px; font-size: 20px; }
 .stack { display: flex; flex-direction: column; gap: 8px; }
 .pad { padding: 8px 0 2px; }
 
+/* ------------------------------------------- 安装包就位后的分步引导 */
+/* 下载完成后把「去哪找、怎么装」摆成有序步骤，避免用户自己猜目录 */
+.up-ready {
+  margin-top: 8px; padding: 12px 14px; font-size: 13px; line-height: 1.7;
+  color: var(--fg); background: var(--accent-soft);
+  border: 1px solid var(--line); border-left: 3px solid var(--accent);
+  border-radius: 8px;
+}
+.up-ready ol { margin: 8px 0 0; padding-left: 22px; }
+.up-ready li { margin: 4px 0; }
+.up-ready code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px; padding: 1px 5px; border-radius: 4px;
+  background: rgba(0, 0, 0, .06); word-break: break-all;
+}
+.up-ready-tip { margin-top: 10px; color: var(--muted); font-size: 12px; }
+
 /* -------------------------------------------------- 音源卡片 */
 .provider-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 16px; }
 .provider-card {

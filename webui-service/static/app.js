@@ -719,17 +719,25 @@ function upgradeUI(stage, text, percent) {
   if (!hint) return;
   if (stage === "downloading" || stage === "verifying") {
     const p = Number(percent || 0);
-    hint.innerHTML = `正在下载安装包… ${p}%　请勿关闭页面`;
-  } else if (stage === "installing") {
-    hint.innerHTML = "安装包已校验，正在安装…　此间管理台会短暂断开，属正常现象，请勿断电";
-  } else if (stage === "done") {
-    hint.innerHTML = `升级完成，页面即将自动刷新…（${esc(text || "")}）`;
+    hint.innerHTML = `正在下载并校验安装包… ${p}%　请勿关闭页面`;
+  } else if (stage === "ready") {
+    // 包已完整落在宿主目录，把三步操作直接摆出来，别让用户自己找
+    hint.innerHTML = `<div class="up-ready">${esc(text || "安装包已就位")}
+      <ol>
+        <li>打开飞牛「<b>应用中心</b>」→「我的应用」</li>
+        <li>点右上角<b>「手动安装」</b>（需先在侧边栏底部开启该功能）</li>
+        <li>选择已下载的 <code>fnmusic-ext-${esc((versionInfo || {}).latest || "")}.fpk</code> 完成升级</li>
+      </ol>
+      <div class="up-ready-tip">包已存到应用目录下，用「文件」App 也能直接找到它；校验已通过，可以放心安装。</div>
+    </div>`;
   } else if (stage === "failed") {
-    hint.innerHTML = `<span style="color:var(--err)">升级失败：${esc(text || "未知错误")}</span>　可前往<a href="${esc(fallbackUrl())}" target="_blank" rel="noopener">发行页</a>手动下载安装`;
+    hint.innerHTML = `<span style="color:var(--err)">下载失败：${esc(text || "未知错误")}</span>　可前往<a href="${esc(fallbackUrl())}" target="_blank" rel="noopener">发行页</a>手动下载`;
   } else if (stage === "interrupted") {
-    hint.innerHTML = `<span style="color:var(--warn)">${esc(text || "上次升级被中断")}</span>　可重新发起升级`;
+    hint.innerHTML = `<span style="color:var(--warn)">${esc(text || "上次下载被中断")}</span>　可重新发起`;
   } else {
-    hint.innerHTML = "「一键升级」会自动下载并安装到本机，由飞牛应用中心接管；安装期间管理台会短暂断开，属正常现象。不升级的话当前版本功能完全不受影响。";
+    hint.innerHTML = "「下载安装包」会自动从官方发行页拉取并校验安装包到本机；"
+      + "飞牛系统未提供自动安装接口，最后一步需要在应用中心点「手动安装」完成。"
+      + "不升级的话当前版本功能完全不受影响。";
   }
 }
 
@@ -753,18 +761,19 @@ async function pollUpgrade() {
   }
   if (!s || !s.stage) return;
   upgradeUI(s.stage, s.error || s.message, s.percent);
-  if (s.stage === "done") {
+  if (s.stage === "ready") {
     stopUpgradePoll();
-    toast("升级完成，正在刷新", "ok");
-    setTimeout(() => location.reload(), 6000);
+    toast("安装包已下载完成", "ok");
+    const btn = $("#ver-install");
+    if (btn) { btn.disabled = false; btn.textContent = "重新下载安装包"; }
   } else if (s.stage === "failed" || s.stage === "interrupted") {
     stopUpgradePoll();
     const btn = $("#ver-install");
-    if (btn) { btn.disabled = false; btn.textContent = "一键升级"; }
+    if (btn) { btn.disabled = false; btn.textContent = "下载安装包"; }
   } else if (s.stage === "starting" || s.stage === "downloading"
-             || s.stage === "verifying" || s.stage === "installing") {
+             || s.stage === "verifying") {
     const btn = $("#ver-install");
-    if (btn) { btn.disabled = true; btn.textContent = "升级中…"; }
+    if (btn) { btn.disabled = true; btn.textContent = "下载中…"; }
   }
 }
 
@@ -773,12 +782,12 @@ async function startUpgrade() {
   if (!v.has_update || !v.latest) return toast("没有可安装的新版本", "fail");
   if (upgradePoll) return;
   const size = fmtBytes((pickFpk(v.assets, v.latest).offline || {}).size) || "数百 MB";
-  // 装 fpk 等于以 root 执行安装脚本，必须让用户明确知情后再动手
+  // 说清楚到底会发生什么：只下载，不动已装的应用
   if (!confirm(
-    `确认升级到 v${v.latest}？\n\n` +
-    `将自动下载并安装官方离线安装包（约 ${size}），由飞牛应用中心接管。\n` +
-    `安装期间管理台会短暂断开，设备请勿断电。\n\n` +
-    `不升级也完全不影响使用，随时可以关掉这个提示。`
+    `下载 v${v.latest} 的官方安装包？\n\n` +
+    `将从官方发行页下载并校验安装包（约 ${size}），存到本机应用目录下。\n` +
+    `飞牛系统没有自动安装接口，装上这一步仍需你在「应用中心 → 手动安装」里点一下。\n` +
+    `当前版本不会受到任何影响，下载完不装也完全没问题。`
   )) return;
 
   const btn = $("#ver-install");
@@ -794,21 +803,22 @@ async function startUpgrade() {
     if (r && r.ok === false) throw new Error(r.error || "发起失败");
   } catch (e) {
     stopUpgradePoll();
-    if (btn) { btn.disabled = false; btn.textContent = "一键升级"; }
+    if (btn) { btn.disabled = false; btn.textContent = "下载安装包"; }
     upgradeUI("failed", e.message);
-    toast("无法发起升级：" + e.message, "fail");
+    toast("无法发起下载：" + e.message, "fail");
   }
 }
 
-// 页面加载时若上次升级正在跑，接上轮询（刷新页面不丢进度）
+// 页面加载时若上次下载正在跑，接上轮询（刷新页面不丢进度）
 (async function resumeUpgrade() {
   try {
     const s = await api("/api/upgrade/state");
-    const running = s && ["starting", "downloading", "verifying", "installing"].includes(s.stage);
+    const running = s && ["starting", "downloading", "verifying"].includes(s.stage);
     if (running) {
       upgradePoll = setInterval(pollUpgrade, 1500);
       pollUpgrade();
-    } else if (s && (s.stage === "failed" || s.stage === "interrupted")) {
+    } else if (s && (s.stage === "ready" || s.stage === "failed" || s.stage === "interrupted")) {
+      // ready 也要重绘：刷新页面后引导卡还得在，别让用户以为白下了
       upgradeUI(s.stage, s.error || s.message, s.percent);
     }
   } catch (e) { /* 忽略 */ }

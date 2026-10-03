@@ -14,7 +14,8 @@ ENV PYTHONUNBUFFERED=1 \
     XDG_CACHE_HOME=/data/cache \
     XDG_CONFIG_HOME=/data/config \
     LX_DATA_DIR=/data/lxmusic \
-    WEBUI_REPO_DIR=/repo
+    WEBUI_REPO_DIR=/repo \
+    UPGRADE_HOST_DIR=/vol1/@appcenter/fnmusic-ext/repo/sources-data/upgrade
 
 WORKDIR /srv
 

@@ -222,10 +222,11 @@
           <div class="card-title">有可用更新</div>
           <div id="ver-update" class="stack"></div>
           <div class="btn-row">
-            <button class="btn primary" id="ver-install">一键升级</button>
+            <button class="btn primary" id="ver-install">下载安装包</button>
             <button class="btn" id="ver-notes-btn">查看升级内容</button>
           </div>
-          <p class="hint" id="ver-install-hint">「一键升级」会自动下载并安装到本机，由飞牛应用中心接管；安装期间管理台会短暂断开，属正常现象。不升级的话当前版本功能完全不受影响。</p>
+          <p class="hint" id="ver-install-hint">「下载安装包」会自动从官方发行页拉取并校验安装包到本机；飞牛系统未提供自动安装接口，最后一步需要在应用中心点「手动安装」完成。不升级的话当前版本功能完全不受影响。</p>
+          <p class="hint" id="ver-install-path" hidden></p>
         </div>
 
         <div class="card" id="ver-changelog-card" hidden>
