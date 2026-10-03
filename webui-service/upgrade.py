@@ -13,13 +13,35 @@
 3. **用 appcenter-cli install-fpk，不自己解包。**
    fnOS 的安装流程（停服务、备份、迁移数据、装依赖、重启）由应用中心负责，
    自己解包替换等于绕过系统管理，装坏了系统状态就乱了。
+   ⚠️ 但 install-fpk 对**已安装**的应用是**空操作**：只做文件校验，打印
+   `[Info]Application [x] is installed.` 并**返回 0**，实际既不升级也不报错
+   （日志里连一条 install 记录都不留）。只看退出码会把"什么都没发生"当成
+   "升级成功"。所以宿主端 `handle_host_upgrade()` 的成功判据是
+   **装完读回来的版本号 == 目标版本**，不是退出码。
+   `install-local` 更危险 —— 它会先 stop + uninstall 再因环境变量解析失败
+   中断，把应用留在「已卸载」的坏状态，**不要用**。
 
-4. **安装是长任务，接口立即返回 + 轮询状态。**
+4. **安装动作必须由宿主 root 执行，容器自己装不了。**
+   WebUI 跑在容器里（uid 1000），既没有 root 也没有 appcenter-cli
+   （它在宿主 `/usr/local/bin/`，容器里 `which` 直接 not found）。
+   实测在容器里调会抛"一键升级需要 root 权限运行 WebUI"，一键升级必然失败。
+   现由宿主侧 root 进程 `proxy/webui_gateway.py` 的特权端点
+   `POST /api/host-upgrade` 代为执行，WebUI 经 Unix socket 请求。
+   ⚠️ 另一个坑：**容器 /tmp 与宿主 /tmp 是两套互不可见的空间**，包下到
+   容器 /tmp 宿主根本看不到。必须放在共享挂载 `/repo/sources-data/upgrade/`
+   （`/repo` 挂自宿主仓库目录，且该子目录在打包排除列表里）。
+
+5. **安装是长任务，接口立即返回 + 轮询状态。**
    405MB 离线包下载+安装要好几分钟，HTTP 请求挂在那里必然超时。
    进程还会被安装动作重启掉，所以状态要落盘，重启后仍能查到真实结果。
 
-5. **下载体积大，边下边报进度。**
+6. **下载体积大，边下边报进度。**
    离线包 400MB+，不给进度用户会以为卡死。
+
+7. **卸载会连带删掉 sources-data/ 里的用户数据。**
+   实测安装失败回滚、或误用 install-local 时，网易云登录态 / 洛雪源脚本 /
+   `sources-data/config/` 里的访问令牌都会一起消失。重装后必须重建这些，
+   令牌需重新下发（它不在安装包里）。
 """
 from __future__ import annotations
 
@@ -30,10 +52,14 @@ import logging
 import os
 import re
 import shutil
+import socket
 import time
 from pathlib import Path
 
 logger = logging.getLogger("webui.upgrade")
+
+# 与 app.py 的 CONF["repo_dir"] 同源（容器内 /repo，宿主为仓库实际路径）
+CONF_REPO_DIR = os.environ.get("WEBUI_REPO_DIR", "/repo")
 
 # 官方仓库（与 app.py 的 RELEASE_SOURCES 必须一致，双向核对过）
 REPO_OWNER = "haonanren118"
@@ -41,11 +67,27 @@ REPO_NAME = "fnos_music_ext"
 GITEE_OWNER = "yygitee118"
 
 APP_NAME = "fnmusic-ext"
-APPCENTER_CLI = "/usr/local/bin/appcenter-cli"
 
-WORK_DIR = Path("/tmp/fnmusic-upgrade")
+# 安装动作交给宿主 root 执行（见下）。
+#
+# ⚠️ WebUI 跑在容器里（uid 1000）：既没有 root，也没有 appcenter-cli
+# （它在宿主 /usr/local/bin/），容器自己装不了 fpk。宿主侧的
+# proxy/webui_gateway.py（root）提供 POST /api/host-upgrade 代为执行。
+#
+# ⚠️ 包必须放在**容器与宿主共享的目录**：`/repo` 挂自宿主仓库目录，
+# 容器里的 /tmp 与宿主 /tmp 是两套互不可见的空间 —— 下到容器 /tmp 的包
+# 宿主根本看不到。取 sources-data/upgrade：既是 /repo 下的共享子目录，
+# 又在打包排除列表里（不会混进发行包）。
+UPGRADE_SUBDIR = "upgrade"
+WORK_DIR = Path(CONF_REPO_DIR) / "sources-data" / UPGRADE_SUBDIR
 STATE_FILE = WORK_DIR / "state.json"
 FPK_FILE = WORK_DIR / "package.fpk"
+
+# 宿主 root 网关额外在 /repo 下 bind 的 socket（见 proxy/webui_gateway.py）：
+# 容器只挂了 /repo，看不到应用目录里那个；宿主 8774 绑在回环，容器也连不上。
+GATEWAY_SOCK = Path(CONF_REPO_DIR) / ".upgrade-gw.sock"
+# 兼容回退：桌面网关那个 socket（WebUI 若被部署在宿主上则可用）
+GATEWAY_SOCK_FALLBACK = ("/run/fnmusic-ext/fnmusic-ext.sock",)
 
 # 单个包上限：离线包约 405MB，留足余量；也是防止被诱导下载超大文件做 DoS
 MAX_FPK_BYTES = 900 * 1024 * 1024
@@ -164,20 +206,76 @@ async def _fetch_expected_sha(url: str) -> str:
     return m.group(1).lower()
 
 
-def _run_appcenter(args: list[str], timeout: int = 1800) -> tuple[int, str]:
-    """调应用中心 CLI。需要 root；WebUI 以 root 运行时可直接执行。"""
-    import subprocess
+def _host_socket() -> "socket.socket | None":
+    """连宿主 root 网关的 Unix socket；连不上返回 None（应降级为手动安装）。"""
+    for path in (GATEWAY_SOCK, *(Path(p) for p in GATEWAY_SOCK_FALLBACK)):
+        try:
+            if not path.exists():
+                continue
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(1800)
+            s.connect(str(path))
+            return s
+        except OSError:
+            continue
+    return None
 
-    if os.geteuid() != 0:
-        raise RuntimeError("一键升级需要 root 权限运行 WebUI；当前权限不足，请改用手动安装")
-    if not Path(APPCENTER_CLI).exists():
-        raise RuntimeError("未找到 appcenter-cli，无法自动安装")
-    proc = subprocess.run(  # noqa: S603
-        [APPCENTER_CLI, *args],
-        capture_output=True, text=True, timeout=timeout,
-    )
-    out = (proc.stdout or "") + (proc.stderr or "")
-    return proc.returncode, out.strip()
+
+def _host_upgrade(target: str) -> tuple[int, str]:
+    """请宿主 root 代为安装 fpk。返回 (状态码, 输出)。
+
+    走 webui_gateway.py 的特权端点：容器内没有 root 也没有 appcenter-cli，
+    只有宿主侧能装。socket 不存在时返回明确错误，让前端提示手动安装，
+    而不是静默"成功"。
+    """
+    s = _host_socket()
+    if s is None:
+        return 503, ("无法连接宿主升级通道（未找到网关 socket）。"
+                     "请改用手动安装：应用中心 → 手动安装 → 选择下载好的 fpk")
+    body = json.dumps({
+        "fpk": str(FPK_FILE),
+        "target": target,
+    }).encode("utf-8")
+    # 走网关的路径（与 proxy/webui_gateway.py 的 HOST_UPGRADE_PATHS 保持一致）
+    path = "/api/host-upgrade"
+    head = (
+        f"POST {path} HTTP/1.1\r\n"
+        f"Host: localhost\r\n"
+        "Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "X-Trim-Isadmin: true\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+    ).encode("latin-1")
+    try:
+        s.sendall(head + body)
+        chunks = []
+        while True:
+            data = s.recv(65536)
+            if not data:
+                break
+            chunks.append(data)
+    except OSError as exc:
+        return 502, f"与宿主升级通道通信失败: {exc}"
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+    raw = b"".join(chunks)
+    head_txt, _, payload = raw.partition(b"\r\n\r\n")
+    status = 0
+    first = head_txt.split(b"\r\n", 1)[0].decode("latin-1", "replace").split()
+    if len(first) >= 2 and first[1].isdigit():
+        status = int(first[1])
+    text = payload.decode("utf-8", "replace")
+    try:
+        obj = json.loads(text)
+        if status == 200 and obj.get("ok"):
+            return 0, f"已升级到 v{obj.get('version')}"
+        return status or 500, str(obj.get("error") or text)
+    except Exception:  # noqa: BLE001
+        return status or 500, text[-600:]
 
 
 async def _do_upgrade(asset_url: str, expect_sha: str, target: str) -> None:
@@ -200,7 +298,7 @@ async def _do_upgrade(asset_url: str, expect_sha: str, target: str) -> None:
 
         _write_state(stage="installing", target=target, message="正在安装，请勿关闭设备电源")
         code, out = await asyncio.get_running_loop().run_in_executor(
-            None, _run_appcenter, ["install-fpk", str(FPK_FILE)],
+            None, _host_upgrade, target,
         )
         if code == 0:
             _write_state(stage="done", target=target,
