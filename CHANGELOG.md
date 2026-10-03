@@ -35,6 +35,10 @@
 
 - **install-local 会把应用搞成「已卸载」状态**：它先 stop + uninstall，再因环境变量解析失败中断（Unsupported option）。实测把已装应用弄成了 Not Installed 且 repo/ 被清空，登录态与令牌全丢。已明确不使用它。另外该 CLI 的 -e 只认 key=value 且必须是 wizard 字段（wizard_sources / wizard_extend），传普通业务变量或 JSON 都会报同一个错。
 
+### 打包
+
+- **运行时 socket 混进 fpk 导致打包直接失败**：升级通道的 /repo/.upgrade-gw.sock 是宿主网关 bind 出来的 AF_UNIX socket，打包时被 rsync 一并带进 STAGE，fnpack 拷贝时报 `no such device or address` 而中止。已在打包排除规则中剔除 *.sock / *.pid / *.lock，并在组装阶段加了一道 find 类型自检（非普通文件直接判失败并打印路径），避免同类问题再次拖到打包末尾才暴露。
+
 ### 变更
 
 - 版本卡片按钮精简为「一键升级」+「查看升级内容」两个：原「查看升级点」文案改为「查看升级内容」，独立的「前往下载」按钮移除（下载改为升级失败提示里的发行页链接，避免和自动安装抢注意力）。
