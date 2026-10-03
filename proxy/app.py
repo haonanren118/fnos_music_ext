@@ -6154,32 +6154,60 @@ _OFFICIAL_GUID_PREFIX_KIND = {"album": "album", "artist": "artist", "track": "tr
 
 
 def _official_cover_file(guid: str, size: "int | None" = None) -> str:
-    """官方 guid（可带 album_/artist_/track_ 前缀）→ 磁盘封面文件路径；无则空串。
+    """官方 guid → 磁盘封面文件路径；无则空串。
 
     目录布局 <root>/<kind>/<guid[:2]>/<guid>，其中 <guid> 为 32-hex 主体。
     带 _wNNN.jpg 的是尺寸变体，优先按请求 size 就近选取。
+
+    **【v2.6.18 修复】guid 形态与 kind 的关系（此前写错，导致本地曲库全面无封面）**
+
+    官方 music.db 里 album.cover_guid / artist.cover_guid / track.cover_guid 存的就是
+    **裸 32-hex**，而客户端列表行下发的 coverId 也正是这个裸值（见 _track_cover_id：
+    本地 guid 原样返回）。该裸值同时就是官方封面目录里的文件名，即
+        cover/album/c5/c5c1a420a7b6422eb51be7ea62d9761c
+    所以 **kind 不能从 guid 字面推断**——裸值必须跨 album/artist/track 三类目录探测。
+
+    带 album_/artist_/track_ 前缀是客户端在歌单大图等场景的包装形态，此时 kind 已知，
+    可直接定位，不必探测。
+
+    旧实现对裸值一律 `return ""`，等于把最可靠的一级（官方磁盘直读，零外部依赖、
+    毫秒级）整个废掉，本地曲目只能落到内嵌图（实测覆盖率 7%）→ 在线反查 → 占位图，
+    于是本地曲库/专辑页/歌手页集体"没有封面"。实测 music.db 的 19 个 cover_guid
+    与磁盘文件名 100% 命中。
     """
     raw = str(guid or "").strip()
     if not raw:
         return ""
-    kind = ""
+    hinted = ""
     for prefix in ("album", "artist", "track"):
         if raw.startswith(prefix + "_"):
-            kind = prefix
+            hinted = prefix
             raw = raw[len(prefix) + 1:]
             break
-    if not kind or not re.fullmatch(r"[0-9a-fA-F]{32}", raw):
+    if not re.fullmatch(r"[0-9a-fA-F]{32}", raw):
         return ""
     root = _official_cover_root()
     if not root:
         return ""
+    # 带前缀 → kind 已知，优先只查该类；裸值 → 三类全查（album 命中率最高，放最前）
+    kinds = (hinted,) if hinted else ("album", "artist", "track")
+    for kind in kinds:
+        p = _official_cover_file_in(root, kind, raw, size)
+        if p:
+            return p
+    return ""
+
+
+def _official_cover_file_in(root: str, kind: str, raw: str, size: "int | None") -> str:
+    """在指定 kind 目录下定位 raw 的封面文件（按 size 选变体，再退无后缀原图）。"""
     base = os.path.join(root, kind, raw[:2])
     # 先按请求尺寸取变体（客户端 size 与官方变体名一致：600/400/160/120）
     if size:
         want = int(size)
-        order = [w for w in _OFFICIAL_COVER_SIZES if abs(w - want) <= 0]
         if want in _OFFICIAL_COVER_SIZES:
             order = [want] + [w for w in _OFFICIAL_COVER_SIZES if w != want]
+        else:
+            order = list(_OFFICIAL_COVER_SIZES)
         for w in order:
             p = os.path.join(base, f"{raw}_w{w}.jpg")
             if os.path.isfile(p) and os.path.getsize(p) > 0:
@@ -6418,22 +6446,31 @@ async def _local_cover_response(request: Request, guid: str, size: "int | None" 
 
 
 def _is_official_local_guid(guid: str) -> bool:
-    """是否为飞牛官方的本地曲库封面 id（<kind>_<32hex> 且官方磁盘确有该封面）。
+    """是否为飞牛官方的本地曲库封面 id（且官方磁盘确有该封面文件）。
 
     这些 id 由官方扫描入库时生成，无法从 md5 反查表还原，是本地各展示页
     （专辑页/歌手页/曲库列表）封面请求的主要形态。
 
-    注意字面形态本身不足以判定：本项目下发的在线伪装封面 id 同样是
-    track_<32hex>，故此处以官方封面目录中是否真实存在该文件为准。
+    **【v2.6.18 修复】必须同时接受裸 32-hex。** 官方 music.db 的
+    album/artist/track.cover_guid 存的就是裸 32-hex，客户端列表行下发的也是它，
+    而它正是官方封面目录里的文件名。旧实现只认 <kind>_<32hex>，于是本地曲库
+    100% 走不进「官方磁盘直读」这一级，只能落到内嵌图（覆盖率 7%）→ 在线反查 →
+    占位图，表现为本地各页面集体没有封面。
+
+    仍以「官方磁盘上是否真有该文件」为准，理由同前：本项目下发的在线伪装封面 id
+    也是 <prefix>_<32hex>，字面形态不足以区分，靠磁盘事实判定可避免走错分支。
     """
-    raw = str(guid or "")
+    raw = str(guid or "").strip()
+    if not raw:
+        return False
+    body = raw
     for prefix in ("album", "artist", "track"):
-        if raw.startswith(prefix + "_") and re.fullmatch(r"[0-9a-fA-F]{32}", raw[len(prefix) + 1:] or ""):
-            # 字面形态不足以区分「官方本地条目」与「本项目下发的在线伪装封面 id」
-            #（两者都是 <prefix>_<32hex>）。以官方磁盘上是否真有该封面文件为准，
-            # 避免把在线伪装 id 误当本地条目走错分支。
-            return bool(_official_cover_file(raw))
-    return False
+        if raw.startswith(prefix + "_"):
+            body = raw[len(prefix) + 1:]
+            break
+    if not re.fullmatch(r"[0-9a-fA-F]{32}", body or ""):
+        return False
+    return bool(_official_cover_file(raw))
 
 
 def _request_cover_size(request: Request) -> "int | None":

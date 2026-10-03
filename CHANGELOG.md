@@ -49,6 +49,14 @@
 
 - **install-local 会把应用搞成「已卸载」状态**：它先 stop + uninstall，再因环境变量解析失败中断（Unsupported option）。实测把已装应用弄成了 Not Installed 且 repo/ 被清空，登录态与令牌全丢。已明确不使用它。另外该 CLI 的 -e 只认 key=value 且必须是 wizard 字段（wizard_sources / wizard_extend），传普通业务变量或 JSON 都会报同一个错。
 
+### 修复（本地曲库全面没有封面）
+
+- **本地曲库 / 专辑页 / 歌手页集体不显示封面**：本轮为「官方封面目录直读」写的 `_official_cover_file()` 误把 kind 当成能从 guid 字面推断出来的东西，只接受 `album_` / `artist_` / `track_` 前缀，裸 32-hex 一律 `return ""`。但官方 `music.db` 里 `album.cover_guid` / `artist.cover_guid` / `track.cover_guid` 存的就是**裸 32-hex**，客户端列表行下发的也正是它（`_track_cover_id` 对本地 guid 原样返回）—— 而这个裸值同时就是官方封面目录里的文件名（`cover/album/c5/c5c1a420a7b6422eb51be7ea62d9761c`）。结果最可靠的一级（磁盘直读，零外部依赖、毫秒级）被整个废掉，本地曲目只能落到内嵌图（实测覆盖率 7%）→ 在线反查 → 占位图，于是到处都没封面。
+  - 修法：裸 guid 不再直接放弃，改为跨 `album` / `artist` / `track` 三类目录探测（album 命中率最高放最前）；带前缀时 kind 已知，仍直接定位不探测。尺寸变体选择逻辑抽成 `_official_cover_file_in()` 复用。
+  - 同步修 `_is_official_local_guid()` —— 它是那道「必须有前缀」的门，裸 guid 同样被挡在门外，现按剥离前缀后的 32-hex 主体判定，是否为官方封面仍以磁盘上是否真有该文件为准（避免把本项目下发的在线伪装 id 误当本地条目）。
+  - 实测：修复前 19 个真实 `cover_guid` **0 个**能出真封面；修复后 **19/19 全部命中**，专辑/歌手名一一对应（刀郎、刘德华、谭咏麟、周杰伦…），占位图 0 个。
+  - 排查时踩的一个坑值得记下来：**占位图也返回 HTTP 200**，只看状态码会把占位图误判成正常封面（当时误判为「服务端全部 200、问题在客户端」）。判定有没有封面必须比对响应 sha256 与占位图指纹，不能看状态码。
+
 ### 打包
 
 - **运行时 socket 混进 fpk 导致打包直接失败**：升级通道的 /repo/.upgrade-gw.sock 是宿主网关 bind 出来的 AF_UNIX socket，打包时被 rsync 一并带进 STAGE，fnpack 拷贝时报 `no such device or address` 而中止。已在打包排除规则中剔除 *.sock / *.pid / *.lock，并在组装阶段加了一道 find 类型自检（非普通文件直接判失败并打印路径），避免同类问题再次拖到打包末尾才暴露。
