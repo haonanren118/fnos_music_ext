@@ -399,11 +399,10 @@ RELEASE_SOURCES = (
         "list_api": f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases?per_page=10",
         "page": f"https://github.com/{REPO_OWNER}/{REPO_NAME}/releases",
         # GitHub 未认证 API 只有 60 次/小时/IP（实测被限流后整源不可用）。
-        # 配一个只读 PAT（环境变量 GITHUB_TOKEN，无需任何 scope）即可提到 5000 次/小时。
+        # 配一个只读 PAT（token=True，见 _github_token）即可提到 5000 次/小时。
+        "token": True,
         "headers": {
             "Accept": "application/vnd.github+json",
-            **({"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}"}
-               if os.environ.get("GITHUB_TOKEN") else {}),
         },
     },
     {
@@ -420,6 +419,50 @@ RELEASE_SOURCES = (
 )
 
 _VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)")
+
+# GitHub 只读令牌（fine-grained PAT，Contents:Read-only）。作用仅是把匿名 API 的
+# 60 次/小时提到 5000 次/小时，不写仓库、不上传、不参与版本检测以外任何请求。
+#
+# 为什么支持"从文件读"而不只用环境变量：容器由应用中心统一拉起，网关/systemd 单元
+# 里塞环境变量既难改又会随 fpk 复制到处走；而令牌文件放在 sources-data/config/ 下，
+# 打包脚本已 `--exclude='sources-data/'`，绝不会混进发行包。
+#
+# 优先级：环境变量 GITHUB_TOKEN > 令牌文件（容器内 /data/config，宿主仓库同名目录）。
+# 两者都取不到就是匿名访问，功能不会坏，只是可能因限流退化为只读 Gitee 镜像。
+_GITHUB_TOKEN_FILES = (
+    "/data/config/github_token.txt",
+    str(Path(CONF["repo_dir"]) / "sources-data" / "config" / "github_token.txt"),
+)
+
+
+def _github_token() -> str:
+    """取 GitHub 只读令牌；没有则返回空串（走匿名访问，功能不降级）。"""
+    tok = (os.environ.get("GITHUB_TOKEN") or "").strip()
+    if tok:
+        return tok
+    for raw in _GITHUB_TOKEN_FILES:
+        try:
+            tok = Path(raw).read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if tok:
+            return tok
+    return ""
+
+
+def _source_headers(src: dict) -> dict:
+    """构造某发行源的请求头；GitHub 源按需注入只读令牌。
+
+    令牌**每次请求时才读**，而不是模块导入时定死 —— 令牌文件是运维事后补写的，
+    导入时读会永远拿到空值，必须重启服务才生效（实测踩过：写完文件仍显示限流）。
+    """
+    headers = {"User-Agent": "fnmusic-ext"}
+    headers.update(src.get("headers") or {})
+    if src.get("token"):
+        tok = _github_token()
+        if tok:
+            headers["Authorization"] = f"Bearer {tok}"
+    return headers
 
 
 def _parse_version(raw: str) -> tuple:
@@ -540,8 +583,7 @@ async def _fetch_latest_release(request: Request) -> "tuple[dict | None, str]":
     best_overall: "dict | None" = None
     best_src = ""
     for src in RELEASE_SOURCES:
-        headers = {"User-Agent": "fnmusic-ext"}
-        headers.update(src.get("headers") or {})
+        headers = _source_headers(src)
         # --- 1) latest 接口 ---
         best: "dict | None" = None
         try:
@@ -595,8 +637,7 @@ async def _probe_source_reachable(client: httpx.AsyncClient, src: dict) -> bool:
     hit = _MIRROR_PROBE.get(name)
     if hit and time.time() - hit[1] < _MIRROR_PROBE_TTL_S:
         return hit[0]
-    headers = {"User-Agent": "fnmusic-ext"}
-    headers.update(src.get("headers") or {})
+    headers = _source_headers(src)
     ok = False
     try:
         resp = await client.get(src["api"], headers=headers, timeout=5.0)
