@@ -22,6 +22,12 @@ body {
   color: var(--text);
 }
 
+/* hidden 属性兜底：元素自身（或其类选择器）上的 display 声明会覆盖 UA 样式表的
+   [hidden] { display: none }，导致 el.hidden = true 失效、元素照常显示。
+   典型踩坑：.nav-dot{display:inline-block} 让"无新版本时的提示点"永远显示。
+   这里用 !important 统一兜底，新增带 display 的元素也不会再犯。 */
+[hidden] { display: none !important; }
+
 .layout { display: flex; min-height: 100vh; min-height: 100dvh; }
 
 /* -------------------------------------------------- 侧栏（桌面） */
@@ -194,10 +200,16 @@ input[type="radio"] { accent-color: var(--accent); margin-top: 4px; }
     background: rgba(255, 255, 255, 0.97); border-top: 1px solid var(--line);
     backdrop-filter: blur(6px);
     padding-bottom: env(safe-area-inset-bottom, 0px);
+    /* 菜单项增多后窄屏会挤成一团，改为横向可滑动条 */
+    overflow-x: auto; overflow-y: hidden;
+    scrollbar-width: none; -webkit-overflow-scrolling: touch;
   }
+  .bottom-nav::-webkit-scrollbar { display: none; }
   .bottom-nav .nav-item {
-    flex: 1; display: flex; align-items: center; justify-content: center;
-    height: 56px; text-align: center; padding: 0 2px; font-size: 13px;
+    /* 不再均分：每项按内容宽度，溢出可横向滑动 */
+    flex: 0 0 auto; min-width: 64px;
+    display: flex; align-items: center; justify-content: center;
+    height: 56px; text-align: center; padding: 0 14px; font-size: 13px;
     border-radius: 0; white-space: nowrap;
   }
   .bottom-nav .nav-item.active { background: transparent; color: var(--accent); font-weight: 700; }
@@ -213,4 +225,42 @@ input[type="radio"] { accent-color: var(--accent); margin-top: 4px; }
   #save-note { flex: 1 1 8rem; }
   .provider-grid { grid-template-columns: 1fr; }
   #qr-img { width: min(220px, 72vw); height: auto; aspect-ratio: 1; }
+}
+
+/* -------------------------------------------------- 版本与升级 */
+#ver-changelog ul {
+  margin: 6px 0 0; padding-left: 20px;
+  display: flex; flex-direction: column; gap: 4px;
+}
+#ver-changelog li { font-size: 13px; color: var(--text); overflow-wrap: anywhere; }
+#ver-changelog .subpanel { margin-bottom: 12px; }
+#ver-changelog .subpanel:last-child { margin-bottom: 0; }
+#ver-mirrors a { color: var(--accent); overflow-wrap: anywhere; }
+#ver-state { margin-top: 8px; }
+#ver-update-card .card-title { color: var(--warn); }
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: .92em; background: var(--accent-soft);
+  padding: 1px 5px; border-radius: 4px;
+}
+@media (max-width: 760px) {
+  #ver-changelog li { font-size: 14px; }
+  #ver-changelog .kv b { min-width: 64px; }
+}
+
+/* 版本号旁的升级提示角标 */
+.brand-sub-row { display: flex; align-items: center; gap: 6px; }
+.ver-badge {
+  display: inline-flex; align-items: center; gap: 3px;
+  border: 1px solid var(--warn); background: #fff4e5; color: var(--warn);
+  border-radius: 999px; padding: 0 7px; height: 17px;
+  font-size: 11px; line-height: 1; cursor: pointer; white-space: nowrap;
+}
+.ver-badge:hover { background: var(--warn); color: #fff; border-color: var(--warn); }
+.ver-badge .ver-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex: none; }
+
+/* 移动端底部导航的升级小圆点（侧边栏在窄屏隐藏时用它提示） */
+.nav-dot {
+  display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--warn); margin-left: 4px; vertical-align: middle; flex: none;
 }

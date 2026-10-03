@@ -539,10 +539,146 @@ window.addEventListener("beforeunload", (ev) => {
   if (dirty) ev.preventDefault();
 });
 
+/* -------------------------------------------------------------- 版本与升级
+ *
+ * 纯提示型：检测失败、新版本不下载、页面不跳转，功能完全不受影响。
+ * 唯一的"动作"是用户主动点按钮打开发行页（target=_blank 交给系统浏览器）。
+ */
+let versionInfo = null;
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function fmtBytes(n) {
+  const v = Number(n) || 0;
+  if (!v) return "";
+  if (v >= 1024 * 1024) return (v / 1024 / 1024).toFixed(1) + " MB";
+  if (v >= 1024) return (v / 1024).toFixed(0) + " KB";
+  return v + " B";
+}
+
+function openExternal(url) {
+  if (!url) return toast("没有可用的链接", "fail");
+  // 交给系统浏览器打开；App/WebView 场景下新标签最稳，失败则退回当前页跳转
+  const w = window.open(url, "_blank", "noopener");
+  if (!w) window.location.href = url;
+}
+
+async function loadVersion(silent) {
+  const btn = $("#ver-check");
+  if (btn) { btn.disabled = true; btn.textContent = "检查中…"; }
+  try {
+    const v = await api("/api/version");
+    versionInfo = v;
+    renderVersion(v);
+  } catch (exc) {
+    if (!silent) toast("版本检查失败：" + exc.message, "fail");
+    const state = $("#ver-state");
+    if (state) state.innerHTML = `<span class="state-line"><span class="dot err"></span>检查失败：${esc(exc.message)}（不影响使用）</span>`;
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "检查更新"; }
+  }
+}
+
+function renderVersion(v) {
+  // 当前版本
+  const cur = $("#ver-current");
+  if (cur) {
+    cur.innerHTML = `<div class="kv"><b>已安装</b>v${esc(v.current)}</div>`;
+  }
+
+  // 侧边栏版本号旁的升级角标（点击直达发行页看升级点）
+  const badge = $("#brand-upgrade");
+  if (badge) {
+    badge.hidden = !v.has_update;
+    if (v.has_update) {
+      badge.innerHTML = `<span class="ver-dot"></span>新版本 ${esc(v.latest)}`;
+      badge.title = `发现新版本 v${v.latest}，点击查看升级点`;
+    }
+  }
+  // 窄屏侧边栏隐藏，用底部导航的「版本」项小圆点兜底提示
+  const navDot = $("#nav-upgrade");
+  if (navDot) navDot.hidden = !v.has_update;
+
+  const state = $("#ver-state");
+  if (state) {
+    if (!v.checked) {
+      state.innerHTML = `<span class="state-line"><span class="dot warn"></span>${esc(v.error || "未检查到版本源")}</span>`;
+    } else if (v.has_update) {
+      state.innerHTML =
+        `<span class="state-line"><span class="dot warn"></span>发现新版本 v${esc(v.latest)}（当前 v${esc(v.current)}）</span>`;
+    } else {
+      state.innerHTML =
+        `<span class="state-line"><span class="dot ok"></span>已是最新版本（v${esc(v.current)}）</span>`;
+    }
+  }
+
+  // 有更新才显示更新卡片
+  const card = $("#ver-update-card");
+  if (card) {
+    card.hidden = !v.has_update;
+    if (v.has_update) {
+      const rows = [`<div class="kv"><b>最新版本</b>v${esc(v.latest)}</div>`];
+      if (v.published) rows.push(`<div class="kv"><b>发布时间</b>${esc(String(v.published).slice(0, 10))}</div>`);
+      if (v.source) rows.push(`<div class="kv"><b>版本源</b>${esc(v.source)}</div>`);
+      const fpk = (v.assets || []).find((a) => String(a.name).endsWith(".fpk"));
+      if (fpk) {
+        const size = fmtBytes(fpk.size);
+        rows.push(`<div class="kv"><b>安装包</b>${esc(fpk.name)}${size ? "（" + size + "）" : ""}</div>`);
+      }
+      $("#ver-update").innerHTML = rows.join("");
+    }
+  }
+
+  // 升级点明细（来自本地 CHANGELOG，仅含高于当前版本的段落）
+  const clCard = $("#ver-changelog-card");
+  const cl = $("#ver-changelog");
+  if (clCard && cl) {
+    const groups = v.changelog || [];
+    clCard.hidden = groups.length === 0;
+    cl.innerHTML = groups.map((g) => {
+      const items = g.items.map((it) => `<li>${esc(it.text)}</li>`).join("");
+      const more = g.total > g.items.length ? `<li class="muted">…… 另有 ${g.total - g.items.length} 项，见发行页</li>` : "";
+      return `<div class="subpanel"><div class="kv"><b>v${esc(g.version)}</b>${esc(g.date || "")}</div><ul>${items}${more}</ul></div>`;
+    }).join("");
+  }
+
+  // 镜像入口
+  const mir = $("#ver-mirrors");
+  if (mir) {
+    const list = v.mirrors || [];
+    mir.innerHTML = list.map((m) =>
+      `<div class="kv"><b>${esc(m.name)}</b><a href="${esc(m.page)}" target="_blank" rel="noopener">${esc(m.page)}</a></div>`
+    ).join("");
+  }
+}
+
+$("#ver-check") && $("#ver-check").addEventListener("click", () => loadVersion(false));
+$("#brand-upgrade") && $("#brand-upgrade").addEventListener("click", () => {
+  const v = versionInfo || {};
+  openExternal(v.url || v.releases_page || "https://github.com/haonanren118/fnos_music_ext/releases");
+});
+$("#ver-releases") && $("#ver-releases").addEventListener("click", () => {
+  openExternal((versionInfo && versionInfo.releases_page) || "https://github.com/haonanren118/fnos_music_ext/releases");
+});
+$("#ver-notes-btn") && $("#ver-notes-btn").addEventListener("click", () => {
+  const v = versionInfo || {};
+  openExternal(v.url || v.releases_page || "https://github.com/haonanren118/fnos_music_ext/releases");
+});
+$("#ver-download") && $("#ver-download").addEventListener("click", () => {
+  const v = versionInfo || {};
+  const fpk = (v.assets || []).find((a) => String(a.name).endsWith(".fpk"));
+  openExternal(fpk && fpk.url ? fpk.url : (v.url || v.releases_page));
+});
+
 /* -------------------------------------------------------------- 启动 */
 (async function boot() {
   await loadConfig();
   await loadStatus();
   await loadPlatforms(false);  // 页面加载不自动拉起预览进程，等用户点选音源
+  // 版本检测不阻塞启动：静默失败无所谓，用户可随时手动点「检查更新」
+  loadVersion(true);
   setInterval(loadStatus, 15000);
 })();

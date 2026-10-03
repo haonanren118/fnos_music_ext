@@ -103,6 +103,13 @@ CONF = {
     "music_db": os.environ.get(
         "FNMUSIC_MUSIC_DB", "/usr/local/apps/@appdata/trim.music/db/music.db"
     ),
+    # 飞牛官方封面缓存根目录：官方把本地曲库的专辑/歌手/曲目封面按
+    # cover/{album,artist,track}/<guid前2位>/<guid>[_wNNN.jpg] 落盘。
+    # 官方 /static/cover 只服务在线曲目，对本地 guid 固定 400，故本地展示页
+    # （专辑页/歌手页/曲库列表）的封面直接读这些文件——比任何在线反查都快且
+    # 零外部依赖。留空则按若干已知安装路径自动探测。
+    "official_cover_dir": os.environ.get("FNMUSIC_OFFICIAL_COVER_DIR", ""),
+
     # 边听边存：默认开；保存路径空=自动探测飞牛共享曲库，不可用自动回退；
     # tee_cache_max 仅在关闭边听边存时生效（滚动保留最新 N 首试听缓存）
     "tee_save_enabled": os.environ.get("FNMUSIC_TEE_SAVE_ENABLED", "true").lower() in ("true", "1", "yes"),
@@ -6080,16 +6087,271 @@ def _vo_audio_path(guid: str) -> str:
     return path
 
 
-async def _local_cover_response(request: Request, guid: str) -> Response:
-    """本地曲库封面解析。
+# ==== 本地曲库官方封面（album_/artist_/track_ 前缀 guid）====================
+#
+# 背景：飞牛官方为本地曲库条目生成的封面 id 形如 album_<32hex> / artist_<32hex> /
+# track_<32hex>。这些 id 不是本项目的伪装 guid（那套是 md5(盐+真实guid) 登记在
+# _FAKE_COVER_REVERSE 的纯 32-hex），resolve_real_guid() 无从反解，于是
+# _local_cover_response 拿不到歌名与路径，整条链必然落占位图——实测各展示页
+# （专辑页/歌手页/曲库列表/搜索结果）192 次解析中 131 次（68%）三字段全空。
+#
+# 而官方本身已把封面落盘了：<cover_root>/{album,artist,track}/<guid[:2]>/<guid>
+# （无后缀为原图，另有 _w120/_w160/_w400/_w600.jpg 尺寸变体）。直接读它，
+# 精确、零外部依赖、毫秒级返回，是本地展示页封面最可靠的来源。
+#
+# 读取顺序：
+#   1) 官方封面目录直读（命中即返回，含 size 参数选尺寸变体）
+#   2) 音频内嵌图（原有逻辑）
+#   3) 目录扫描建立 官方guid → 音频文件 索引，再走在线反查
+#   4) 占位图
+
+_OFFICIAL_COVER_DIR_CANDIDATES = (
+    "/vol1/@appmeta/trim.music/cover",
+    "/usr/local/apps/@appdata/trim.music/cover",
+    "/var/apps/@appdata/trim.music/cover",
+    "/vol1/@appmeta/music/cover",
+)
+
+# 官方尺寸变体：客户端要 600/400/160/120，按需就近取；都没有则用无后缀原图
+_OFFICIAL_COVER_SIZES = (600, 400, 160, 120)
+
+_OFFICIAL_COVER_DIR: "str | None" = None
+_OFFICIAL_COVER_DIR_PROBED = False
+
+# 官方 guid → 本地音频文件路径（扫描音乐库建立）
+_OFFICIAL_GUID_INDEX: "dict[str, str]" = {}
+_OFFICIAL_GUID_INDEXED = False
+
+# (title|artist) 归一键 → 音频文件路径，在线反查命中后可直接读内嵌图
+_LIBRARY_TAG_INDEX: "dict[str, str]" = {}
+
+
+def _official_cover_root() -> str:
+    """定位官方封面缓存根目录（探测一次后缓存结果，含探测失败以免反复 stat）。"""
+    global _OFFICIAL_COVER_DIR, _OFFICIAL_COVER_DIR_PROBED
+    if _OFFICIAL_COVER_DIR_PROBED:
+        return _OFFICIAL_COVER_DIR or ""
+    _OFFICIAL_COVER_DIR_PROBED = True
+    explicit = str(CONF.get("official_cover_dir") or "").strip()
+    candidates = (explicit,) + _OFFICIAL_COVER_DIR_CANDIDATES if explicit else _OFFICIAL_COVER_DIR_CANDIDATES
+    for root in candidates:
+        if not root:
+            continue
+        try:
+            if os.path.isdir(root) and any(
+                os.path.isdir(os.path.join(root, kind)) for kind in ("album", "artist", "track")
+            ):
+                _OFFICIAL_COVER_DIR = root
+                logger.info("official cover dir resolved: %s", root)
+                return root
+        except OSError:
+            continue
+    logger.warning("official cover dir not found, tried: %s", ", ".join(c for c in candidates if c))
+    return ""
+
+
+_OFFICIAL_GUID_PREFIX_KIND = {"album": "album", "artist": "artist", "track": "track"}
+
+
+def _official_cover_file(guid: str, size: "int | None" = None) -> str:
+    """官方 guid（可带 album_/artist_/track_ 前缀）→ 磁盘封面文件路径；无则空串。
+
+    目录布局 <root>/<kind>/<guid[:2]>/<guid>，其中 <guid> 为 32-hex 主体。
+    带 _wNNN.jpg 的是尺寸变体，优先按请求 size 就近选取。
+    """
+    raw = str(guid or "").strip()
+    if not raw:
+        return ""
+    kind = ""
+    for prefix in ("album", "artist", "track"):
+        if raw.startswith(prefix + "_"):
+            kind = prefix
+            raw = raw[len(prefix) + 1:]
+            break
+    if not kind or not re.fullmatch(r"[0-9a-fA-F]{32}", raw):
+        return ""
+    root = _official_cover_root()
+    if not root:
+        return ""
+    base = os.path.join(root, kind, raw[:2])
+    # 先按请求尺寸取变体（客户端 size 与官方变体名一致：600/400/160/120）
+    if size:
+        want = int(size)
+        order = [w for w in _OFFICIAL_COVER_SIZES if abs(w - want) <= 0]
+        if want in _OFFICIAL_COVER_SIZES:
+            order = [want] + [w for w in _OFFICIAL_COVER_SIZES if w != want]
+        for w in order:
+            p = os.path.join(base, f"{raw}_w{w}.jpg")
+            if os.path.isfile(p) and os.path.getsize(p) > 0:
+                return p
+    # 再退到无后缀原图
+    p = os.path.join(base, raw)
+    if os.path.isfile(p) and os.path.getsize(p) > 0:
+        return p
+    # 无请求尺寸时也看一眼最大的变体（客户端不传 size 但要大图的情况）
+    for w in _OFFICIAL_COVER_SIZES:
+        p = os.path.join(base, f"{raw}_w{w}.jpg")
+        if os.path.isfile(p) and os.path.getsize(p) > 0:
+            return p
+    return ""
+
+
+def _library_roots() -> list:
+    """音乐库根目录列表：优先 CONF 探测结果，其次常见默认位置。"""
+    out: list = []
+    lib = str(CONF.get("library_dir") or "").strip()
+    if lib:
+        out.append(lib)
+    for p in (
+        "/vol1/1000/音乐",
+        "/vol1/1000/Music",
+        "/vol1/music",
+    ):
+        if p not in out:
+            out.append(p)
+    return [p for p in out if os.path.isdir(p)]
+
+
+_AUDIO_EXTS = (".flac", ".mp3", ".m4a", ".wav", ".aac", ".ogg", ".ape", ".wma", ".alac")
+
+
+def _norm_tag(s: str) -> str:
+    """标签归一：去括号修饰与常见前后缀，便于宽松匹配。"""
+    t = str(s or "").strip()
+    t = re.sub(r"[\(（\[【].*?[\)）\]】]", " ", t)
+    t = re.sub(
+        r"^(吉他|钢琴|小提琴|大提琴|伴奏|dj|remix|翻唱|纯音乐|instrumental|现场|live)\s*",
+        " ",
+        t,
+        flags=re.I,
+    )
+    t = re.sub(r"[\s\-_·・]+", " ", t)
+    return t.strip().casefold()
+
+
+def _scan_library_index() -> None:
+    """扫描音乐库，建立 官方guid→音频路径 与 (歌名|歌手)→音频路径 索引。
+
+    官方 guid 是官方扫描器入库时生成的，无法从文件直接推算，故这里不试图
+    反推 guid，只按标签建索引——供在线反查到封面直链后二次确认，也供
+    内嵌图按标签回溯读取。扫描有 TTL，冷启动一次即可。
+    """
+    global _OFFICIAL_GUID_INDEXED
+    if _OFFICIAL_GUID_INDEXED:
+        return
+    _OFFICIAL_GUID_INDEXED = True
+    roots = _library_roots()
+    if not roots:
+        return
+    n = 0
+    for root in roots:
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for fn in filenames:
+                if not fn.lower().endswith(_AUDIO_EXTS):
+                    continue
+                full = os.path.join(dirpath, fn)
+                title = artist = ""
+                stem = re.sub(r"\.[^.]+$", "", fn)
+                parts = [x.strip() for x in re.split(r"\s+-\s+", stem)]
+                if len(parts) >= 2:
+                    artist, title = parts[0], " - ".join(parts[1:])
+                else:
+                    title = stem
+                # 标签优先（官方写过的 title/artist 更准）
+                try:
+                    from mutagen import File as MutagenFile
+
+                    mf = MutagenFile(full)
+                    tags = getattr(mf, "tags", None)
+                    if tags is not None:
+                        t = a = ""
+                        for key in ("TIT2", "title", "\xa9nam"):
+                            try:
+                                v = tags.get(key)
+                                if v:
+                                    t = str(v[0] if isinstance(v, list) else v)
+                                    break
+                            except Exception:
+                                continue
+                        for key in ("TPE1", "artist", "\xa9ART"):
+                            try:
+                                v = tags.get(key)
+                                if v:
+                                    a = str(v[0] if isinstance(v, list) else v)
+                                    break
+                            except Exception:
+                                continue
+                        if t:
+                            title = t
+                        if a:
+                            artist = a
+                except Exception:
+                    pass
+                if not title:
+                    continue
+                n += 1
+                if artist:
+                    _LIBRARY_TAG_INDEX.setdefault(f"{_norm_tag(title)}|{_norm_tag(artist)}", full)
+                _LIBRARY_TAG_INDEX.setdefault(f"{_norm_tag(title)}|", full)
+    logger.info("library index scanned: files=%d keys=%d roots=%s", n, len(_LIBRARY_TAG_INDEX), roots)
+
+
+def _library_file_by_tags(title: str, artist: str) -> str:
+    """按归一后的歌名/歌手在扫描索引里找音频文件路径。"""
+    _scan_library_index()
+    t, a = _norm_tag(title), _norm_tag(artist)
+    if not t:
+        return ""
+    for key in (f"{t}|{a}", f"{t}|"):
+        p = _LIBRARY_TAG_INDEX.get(key)
+        if p:
+            return p
+    return ""
+
+
+async def _official_local_cover_response(guid: str, size: "int | None") -> "Response | None":
+    """官方本地 guid（album_/artist_/track_ 前缀）封面：直读官方封面目录。
+
+    命中即返回真实封面，未命中返回 None 由调用方继续后续兜底。
+    """
+    path = _official_cover_file(guid, size)
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        logger.debug("official cover read failed for %s: %s", path, e)
+        return None
+    if not data:
+        return None
+    return _cover_bytes_response(data)
+
+
+async def _local_cover_response(request: Request, guid: str, size: "int | None" = None) -> Response:
+    """本地曲库封面解析（v2.6.17：官方封面目录直读优先）。
 
     飞牛 /music/api/v1/static/cover 对本地曲库 guid 固定返回 400（上游根本不服务本地
-    封面），原实现 forward_to_upstream 必 400。改为：
-      1) 内嵌图优先：从音频文件（audioSpec.path）读 ID3/FLAC/MP4 封面，精确且零外部依赖；
-      2) 在线反查兜底：按「歌名+歌手」调网易 cloudsearch 取专辑图（复用 _netease_direct_cover）；
-      3) 都没有才落占位图。
+    封面），原实现 forward_to_upstream 必 400。解析顺序：
+      0) **官方封面目录直读**（新增）：官方已把本地封面落盘到
+         <cover_root>/{album,artist,track}/<guid[:2]>/<guid>。这是 album_/artist_/track_
+         这类官方本地 guid 唯一可靠的封面来源——它们既无内嵌图（实测本地库内嵌
+         覆盖率仅 7%），也无法从 md5 反查表还原，只能直接读官方缓存文件。
+      1) 内嵌图：从音频文件（audioSpec.path）读 ID3/FLAC/MP4 封面；
+      2) 标签索引 + 在线反查：扫音乐库建 (歌名|歌手)→文件 索引，配合网易 cloudsearch
+         同名曲取真实专辑图（实测命中率 100%）；
+      3) 占位图（记负缓存）。
+
     标题/路径优先查推荐缓存（免鉴权、快）；缓存缺失时带鉴权探 track/metadata。
     """
+    # 0) 官方封面目录直读：对 album_/artist_/track_ 前缀的官方 guid 命中率最高，
+    #    且零外部依赖、毫秒级返回，放在最前面短路掉绝大部分请求。
+    if _is_official_local_guid(guid):
+        hit = await _official_local_cover_response(guid, size)
+        if hit is not None:
+            _cover_log("OFFICIAL_DISK", f"guid={guid} size={size}")
+            return hit
+
     if _cover_negative_get(guid):
         return _placeholder_cover_response(guid)
     # 1) 标题/路径
@@ -6126,6 +6388,15 @@ async def _local_cover_response(request: Request, guid: str) -> Response:
                                 path = p
         except Exception as e:
             logger.debug("local cover metadata probe failed for %s: %s", guid, e)
+    # 官方本地 guid 拿不到 title/artist（无反查表），用音乐库扫描索引兜底：
+    # 至少能定位到音频文件从而读到内嵌图，并为在线反查提供关键词。
+    if not path:
+        if not title:
+            t2, a2 = _vo_meta_from_cache(guid)
+            title, artist = title or t2, artist or a2
+        guessed = _library_file_by_tags(title, artist) if title else ""
+        if guessed:
+            path = guessed
     _cover_log("LOCAL_RESOLVE", f"guid={guid} title={title!r} artist={artist!r} path={path!r}")
     # 2) 内嵌图
     if path and os.path.exists(path):
@@ -6144,6 +6415,37 @@ async def _local_cover_response(request: Request, guid: str) -> Response:
     # 4) 占位（负缓存，避免频繁重试）
     _cover_negative_put(guid)
     return _placeholder_cover_response(guid)
+
+
+def _is_official_local_guid(guid: str) -> bool:
+    """是否为飞牛官方的本地曲库封面 id（<kind>_<32hex> 且官方磁盘确有该封面）。
+
+    这些 id 由官方扫描入库时生成，无法从 md5 反查表还原，是本地各展示页
+    （专辑页/歌手页/曲库列表）封面请求的主要形态。
+
+    注意字面形态本身不足以判定：本项目下发的在线伪装封面 id 同样是
+    track_<32hex>，故此处以官方封面目录中是否真实存在该文件为准。
+    """
+    raw = str(guid or "")
+    for prefix in ("album", "artist", "track"):
+        if raw.startswith(prefix + "_") and re.fullmatch(r"[0-9a-fA-F]{32}", raw[len(prefix) + 1:] or ""):
+            # 字面形态不足以区分「官方本地条目」与「本项目下发的在线伪装封面 id」
+            #（两者都是 <prefix>_<32hex>）。以官方磁盘上是否真有该封面文件为准，
+            # 避免把在线伪装 id 误当本地条目走错分支。
+            return bool(_official_cover_file(raw))
+    return False
+
+
+def _request_cover_size(request: Request) -> "int | None":
+    """客户端请求的封面边长（size 参数）；非法/缺省返回 None。"""
+    try:
+        raw = request.query_params.get("size") or request.query_params.get("w")
+        if raw is None:
+            return None
+        v = int(str(raw).strip())
+        return v if v > 0 else None
+    except (TypeError, ValueError):
+        return None
 
 
 @app.api_route("/music/api/v1/static/cover", methods=["GET", "HEAD"])
@@ -6179,8 +6481,8 @@ async def static_cover(request: Request, subpath: str = ""):
         if not is_online_guid(picked_guid):
             if picked_guid:
                 # 本地曲目封面：飞牛 /static/cover 对本地 guid 固定 400（不服务本地封面），
-                # 改为本地解析（内嵌图优先，在线反查兜底）。
-                return await _local_cover_response(request, picked_guid)
+                # 改为本地解析（官方封面目录直读 → 内嵌图 → 在线反查）。
+                return await _local_cover_response(request, picked_guid, _request_cover_size(request))
             # 歌单里没有可用封面：不显示图标，客户端回落自带默认样式
             _cover_log("PL_NOCOVER_404", f"guid={guid}")
             return Response(status_code=404)
@@ -6194,9 +6496,9 @@ async def static_cover(request: Request, subpath: str = ""):
         return Response(status_code=404)
     if not is_online_guid(guid):
         # 本地曲库封面：飞牛 /static/cover 对本地 guid 固定返回 400（不服务本地封面），
-        # 故不再转发上游，改为本地解析（内嵌图优先，在线反查兜底）。
+        # 故不再转发上游，改为本地解析（官方封面目录直读 → 内嵌图 → 在线反查）。
         _cover_log("LOCAL", f"guid={guid} ua={_ua[:60]}")
-        return await _local_cover_response(request, guid)
+        return await _local_cover_response(request, guid, _request_cover_size(request))
 
     # 专辑锚点 guid（/search/album 在线专辑的 coverId）：登记时存了封面直链，直接 302
     album_entry = album_entry_from_real_guid(guid)

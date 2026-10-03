@@ -12,6 +12,7 @@ import asyncio
 import io
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -360,6 +361,243 @@ def _read_version() -> str:
         return SERVICE_VERSION
 
 
+# ------------------------------------------------------------------ 版本检测 --
+#
+# 定位：**只做「提示 + 跳转」，不做强制升级，也不代为安装**。
+# 用户可完全无视新版本提示继续使用当前版本；任何检测失败都必须静默降级，
+# 绝不影响管理台其余功能（拉不到远端就当作「未检查」，不报错、不阻塞）。
+#
+# 检测走 GitHub / Gitee 双通道：国内 NAS 直连 GitHub 常被墙，Gitee 作为镜像
+# 兜底，任一通道成功即返回；两个都失败则降级为 checked=False。
+#
+# ⚠️ 两个关键约束（都踩过）：
+#  1. 仓库必须是 REPO_OWNER/REPO_NAME 指向的自建 fork，不能用上游 javycoder ——
+#     上游只发到 2.6.3，用错仓库会让检测永远停在旧版却显示"已是最新"。
+#  2. 不盲信 releases/latest：它是"被标记为 latest 的版本"，不保证版本号最大
+#     （预发布/草稿会被排除，latest 标记也可能指向旧版）。故同时拉 releases 列表，
+#     取其中版本号最大的那条为准，避免版本号倒退的误判。
+
+CHANGELOG_PATH = Path(CONF["repo_dir"]) / "CHANGELOG.md"
+
+# 仓库坐标：本项目 fork 自 javycoder/fnos_music_ext，上游只发到 2.6.3；
+# 2.6.16 及之后的发行版发布在 haonanren118/fnos_music_ext（自建发行页）。
+# 指向错仓库会让版本检测永远停在旧版（表现为"已是最新"的假象）。
+REPO_OWNER = "haonanren118"
+REPO_NAME = "fnos_music_ext"
+
+RELEASE_SOURCES = (
+    {
+        "name": "GitHub",
+        "api": f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases/latest",
+        "list_api": f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases?per_page=10",
+        "page": f"https://github.com/{REPO_OWNER}/{REPO_NAME}/releases",
+        "headers": {"Accept": "application/vnd.github+json"},
+    },
+    {
+        # Gitee 镜像账号与 GitHub 不同：GitHub 是 haonanren118，Gitee 是 yygitee118。
+        # 曾误用 GitHub 用户名拼 Gitee 地址 → gitee.com/haonanren118/... 整站 404
+        # （该账号在 Gitee 上根本不存在），用户点击镜像链接直接落到死链。
+        # 现两侧各用各的账号，且展示前会探测可达性，不可达的一律不展示。
+        "name": "Gitee",
+        "api": "https://gitee.com/api/v5/repos/yygitee118/fnos_music_ext/releases/latest",
+        "list_api": "https://gitee.com/api/v5/repos/yygitee118/fnos_music_ext/releases?per_page=10",
+        "page": "https://gitee.com/yygitee118/fnos_music_ext/releases",
+        "headers": {},
+    },
+)
+
+_VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)")
+
+
+def _parse_version(raw: str) -> tuple:
+    """把 'v2.6.16' / '2.6.3' / '2.6' 解析为 (major, minor, patch) 元组；失败返回 ()。
+
+    仅做语义化版本的三段数字比较，不引入打包依赖。'2.6' 视作 (2,6,0)。
+    """
+    m = _VERSION_RE.match(str(raw or "").strip())
+    if not m:
+        return ()
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+
+def _newer_than(remote: str, local: str) -> bool:
+    """远端是否新于本地。任一版本号不可解析时保守返回 False（不打扰用户）。"""
+    r, l = _parse_version(remote), _parse_version(local)
+    if not r or not l:
+        return False
+    return r > l
+
+
+def _changelog_notes(local: str, remote: str, limit: int = 12) -> list:
+    """从本地 CHANGELOG.md 抽取 (local, remote] 之间的升级点条目。
+
+    CHANGELOG 格式为 '## [2.6.3] - 2026-09-30' + '### 修复/变更/新增' + 列表项。
+    只取严格高于本机版本的段落，按版本从新到旧倒序，每个版本最多 limit 条。
+    解析失败一律返回空列表（前端据此隐藏升级点区块，不影响其他功能）。
+    """
+    try:
+        text = CHANGELOG_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return []
+
+    local_v = _parse_version(local)
+    remote_v = _parse_version(remote)
+    if not local_v:
+        return []
+
+    # 按 '## [x.y.z] - date' 切段
+    chunks = re.split(r"^##\s+\[([^\]]+)\]\s*-\s*(.+)$", text, flags=re.M)
+    # chunks[0] 是文件头，之后每两个元素一组：版本号、日期、段落正文…
+    out: list = []
+    for i in range(1, len(chunks) - 2, 3):
+        ver_raw, _date, body = chunks[i], chunks[i + 1], chunks[i + 2]
+        if ver_raw.strip().lower() == "unreleased":
+            continue
+        v = _parse_version(ver_raw)
+        if not v:
+            continue
+        if v <= local_v:
+            continue
+        if remote_v and v > remote_v:
+            continue
+        # 取该版本段落下所有 '- ' 列表项（升级点）
+        items = []
+        for line in body.splitlines():
+            s = line.strip()
+            if not s.startswith("- "):
+                continue
+            title = re.sub(r"\*\*(.+?)\*\*.*", r"\1", s[2:]).strip()
+            title = re.sub(r"\s+", " ", title)
+            if title:
+                items.append({"text": title[:160], "raw": s[2:][:400]})
+        if items:
+            out.append({
+                "version": ver_raw.strip(),
+                "date": _date.strip(),
+                "items": items[:limit],
+                "total": len(items),
+            })
+    out.sort(key=lambda x: _parse_version(x["version"]) or (0,), reverse=True)
+    return out
+
+
+def _normalize_release(data: dict, src: dict) -> "dict | None":
+    """把一条 release JSON 归一成内部结构；无版本号返回 None。"""
+    tag = str(data.get("tag_name") or data.get("name") or "").strip()
+    if not tag:
+        return None
+    return {
+        "version": tag.lstrip("vV"),
+        "tag": tag,
+        "name": str(data.get("name") or tag),
+        "notes": str(data.get("body") or "")[:20000],
+        "url": str(data.get("html_url") or "") or src["page"],
+        "page": src["page"],
+        "published": str(data.get("published_at") or data.get("created_at") or ""),
+        "assets": [
+            {
+                "name": str(a.get("name") or ""),
+                "size": a.get("size") or 0,
+                "url": str(a.get("browser_download_url") or ""),
+            }
+            for a in (data.get("assets") or [])
+            if isinstance(a, dict) and str(a.get("name") or "").endswith(".fpk")
+        ],
+    }
+
+
+async def _fetch_latest_release(request: Request) -> "tuple[dict | None, str]":
+    """依次尝试各发行源，返回 (release_dict, 来源名)；全失败返回 (None, "")。
+
+    策略：先打 releases/latest（快、权威），再用 releases 列表交叉校验 —— 若列表里
+    存在版本号更大的正式版（latest 标记陈旧 / 预发布被排除等），以更大的那条为准。
+    这样既省一次请求，又不会因 latest 标记不规范而漏报新版本。
+    草稿（draft）与预发布（prerelease）一律排除。
+    单源超时 6 秒即换下一个源，避免管理台被慢源拖住。
+    """
+    client = get_http(request)
+    for src in RELEASE_SOURCES:
+        headers = {"User-Agent": "fnmusic-ext"}
+        headers.update(src.get("headers") or {})
+        # --- 1) latest 接口 ---
+        best: "dict | None" = None
+        try:
+            resp = await client.get(src["api"], headers=headers, timeout=6.0)
+            if resp.status_code < 400:
+                data = resp.json()
+                if isinstance(data, dict) and not data.get("draft") and not data.get("prerelease"):
+                    best = _normalize_release(data, src)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("release latest %s failed: %s", src["name"], exc)
+        if best is None:
+            continue
+        # --- 2) 列表交叉校验，取版本号最大者 ---
+        list_api = src.get("list_api")
+        if list_api:
+            try:
+                resp = await client.get(list_api, headers=headers, timeout=6.0)
+                if resp.status_code < 400:
+                    items = resp.json()
+                    if isinstance(items, list):
+                        for it in items:
+                            if not isinstance(it, dict):
+                                continue
+                            if it.get("draft") or it.get("prerelease"):
+                                continue
+                            cand = _normalize_release(it, src)
+                            if cand and _newer_than(cand["version"], best["version"]):
+                                best = cand
+            except Exception as exc:  # noqa: BLE001 —— 列表失败不影响 latest 结果
+                logger.debug("release list %s failed: %s", src["name"], exc)
+        return best, src["name"]
+    return None, ""
+
+
+# 镜像可达性缓存：{源名: (是否可达, 时间戳)}，TTL 1 小时。
+# 展示镜像前先探一次可达性，绝不把点不开的链接（如未开通的 Gitee 账号）呈现给用户。
+_MIRROR_PROBE_TTL_S = 3600.0
+_MIRROR_PROBE: "dict[str, tuple[bool, float]]" = {}
+
+
+async def _probe_source_reachable(client: httpx.AsyncClient, src: dict) -> bool:
+    """探测某发行源是否真实可用（仓库存在且能读到 release）。
+
+    判据：latest 接口返回 2xx/3xx。404（Not Found Project）即视为不可用 ——
+    这正是 Gitee 侧「账号/仓库不存在」的表现。探测失败一律记为不可达，不抛异常。
+    """
+    name = src.get("name") or ""
+    hit = _MIRROR_PROBE.get(name)
+    if hit and time.time() - hit[1] < _MIRROR_PROBE_TTL_S:
+        return hit[0]
+    headers = {"User-Agent": "fnmusic-ext"}
+    headers.update(src.get("headers") or {})
+    ok = False
+    try:
+        resp = await client.get(src["api"], headers=headers, timeout=5.0)
+        ok = resp.status_code < 400
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("mirror probe %s failed: %s", name, exc)
+        ok = False
+    if len(_MIRROR_PROBE) > 20:
+        _MIRROR_PROBE.clear()
+    _MIRROR_PROBE[name] = (ok, time.time())
+    return ok
+
+
+async def _available_mirrors(request: Request, working: str = "") -> list:
+    """返回可点击的镜像列表（已过滤掉探测不可达的源）。
+
+    working：本次实际取到数据的源，优先排在前；探测不可达的一律不展示，
+    避免用户点到 404 死链。
+    """
+    client = get_http(request)
+    out: list = []
+    for src in RELEASE_SOURCES:
+        if src["name"] == working or await _probe_source_reachable(client, src):
+            out.append({"name": src["name"], "page": src["page"]})
+    return out
+
+
 # ------------------------------------------------------------------ API --
 
 @app.get("/healthz")
@@ -405,6 +643,52 @@ async def api_status(request: Request):
         "previews": {p: round(preview_seconds_left(p)) for p in list(_preview_until)},
         "services": services,
         "lx_source": lx_source,
+    }
+
+
+@app.get("/api/version")
+async def api_version(request: Request):
+    """版本检测与升级点查询（只提示不强制）。
+
+    无论远端是否可达都返回 200：拉不到时 checked=False，前端显示「未检查到
+    新版本」并保留手动重试按钮，绝不因版本检测失败影响其他功能。
+    """
+    local = _read_version()
+    base = {
+        "ok": True,
+        "current": local,
+        "releases_page": RELEASE_SOURCES[0]["page"],
+        # 镜像列表在检测到具体来源后再补齐（见下方），此处先留空避免展示未探测的死链
+        "mirrors": [],
+    }
+    try:
+        rel, source = await _fetch_latest_release(request)
+    except Exception as exc:  # noqa: BLE001 —— 永不因检测失败而报错
+        logger.info("version check failed: %s", exc)
+        return JSONResponse({**base, "checked": False, "has_update": False,
+                             "error": "无法连接版本源（不影响使用）"})
+    if rel is None:
+        return JSONResponse({**base, "checked": False, "has_update": False,
+                             "error": "无法连接版本源（不影响使用）"})
+
+    remote = rel["version"]
+    has_update = _newer_than(remote, local)
+    # 镜像列表：只展示实测可达的源（探测失败/404 的不展示），避免用户点到死链
+    mirrors = await _available_mirrors(request, working=source)
+    return {
+        **base,
+        "mirrors": mirrors,
+        "checked": True,
+        "source": source,
+        "latest": remote,
+        "latest_tag": rel["tag"],
+        "latest_name": rel["name"],
+        "has_update": has_update,
+        "url": rel["url"],
+        "notes": rel["notes"],
+        "published": rel["published"],
+        "assets": rel["assets"],
+        "changelog": _changelog_notes(local, remote),
     }
 
 

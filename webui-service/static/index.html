@@ -14,7 +14,10 @@
         <img class="brand-mark" src="/app/fnmusic-ext/static/icon.png" width="38" height="38" alt="">
         <div>
           <div class="brand-name">fnmusic-ext</div>
-          <div class="brand-sub" id="brand-version">管理台</div>
+          <div class="brand-sub-row">
+            <span class="brand-sub" id="brand-version">管理台</span>
+            <button class="ver-badge" id="brand-upgrade" hidden title="发现新版本，点击查看升级点"></button>
+          </div>
         </div>
       </div>
       <nav class="nav" id="nav">
@@ -24,6 +27,7 @@
         <button class="nav-item" data-page="search">搜索</button>
         <button class="nav-item" data-page="tee">边听边存</button>
         <button class="nav-item" data-page="llm">高级 · 大模型</button>
+        <button class="nav-item" data-page="version">版本与升级</button>
       </nav>
       <div class="sidebar-foot" id="sidebar-foot"></div>
     </aside>
@@ -198,6 +202,42 @@
           <label class="field"><span>模型</span><input class="input" id="llm-model" placeholder="gpt-4o-mini"></label>
         </div>
       </section>
+
+      <!-- 版本与升级 -->
+      <section class="page" id="page-version">
+        <h2>版本与升级</h2>
+        <p class="hint">升级是可选项：不检查、不提示也不影响任何功能，当前版本可以一直用下去。这里只帮你看清「有没有新版本、升级点了什么」，要不要升、什么时候升都由你决定。</p>
+
+        <div class="card">
+          <div class="card-title">当前版本</div>
+          <div id="ver-current" class="stack">加载中…</div>
+          <div class="btn-row">
+            <button class="btn" id="ver-check">检查更新</button>
+            <button class="btn" id="ver-releases">查看全部版本</button>
+          </div>
+          <div id="ver-state"></div>
+        </div>
+
+        <div class="card" id="ver-update-card" hidden>
+          <div class="card-title">有可用更新</div>
+          <div id="ver-update" class="stack"></div>
+          <div class="btn-row">
+            <button class="btn primary" id="ver-notes-btn">查看升级点</button>
+            <button class="btn" id="ver-download">前往下载</button>
+          </div>
+          <p class="hint">升级通过飞牛「应用中心 → 手动安装」安装新的 <code>.fpk</code> 包完成。升级前建议先在应用中心备份当前配置；不升级的话当前版本功能不受影响。</p>
+        </div>
+
+        <div class="card" id="ver-changelog-card" hidden>
+          <div class="card-title">升级点明细</div>
+          <div id="ver-changelog" class="stack"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">下载与镜像</div>
+          <div id="ver-mirrors" class="stack"></div>
+        </div>
+      </section>
     </main>
   </div>
 
@@ -209,6 +249,7 @@
     <button class="nav-item" data-page="search">搜索</button>
     <button class="nav-item" data-page="tee">缓存</button>
     <button class="nav-item" data-page="llm">高级</button>
+    <button class="nav-item" data-page="version">版本<span class="nav-dot" id="nav-upgrade" hidden></span></button>
   </nav>
 
   <!-- 保存条 -->
