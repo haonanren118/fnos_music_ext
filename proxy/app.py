@@ -1894,6 +1894,39 @@ async def forward_to_upstream(request: Request, client: httpx.AsyncClient) -> Re
         finally:
             await resp.aclose()
 
+    # v2.6.18：本地专辑/歌手/歌曲列表走的是本函数的默认分支（StreamingResponse
+    # 原样透传），JSON 从不被解析，所以 coverId=null 一直没被补 —— 实测
+    # /album/list、/track/list、/artist/list 共 12 条无 coverId，客户端拿不到
+    # id 便不会请求 /static/cover，那几行必然空白。
+    # 这里只在「响应是 JSON 且含 coverId 字段」时才读进内存改写；其余
+    # （音频、大文件、流式接口）保持流式直通不变，风险面严格受限。
+    ctype = (resp.headers.get("content-type") or "").lower()
+    if "json" in ctype and resp.status_code == 200:
+        try:
+            raw = await resp.aread()
+        except Exception:
+            raw = b""
+        finally:
+            await resp.aclose()
+        if raw and b"coverId" in raw:
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                obj = None
+            if isinstance(obj, (dict, list)):
+                hdrs = {k: v for k, v in resp_headers.items()
+                        if k.lower() not in ("content-length", "content-encoding")}
+                return JSONResponse(content=disguise_client_json(obj),
+                                    status_code=resp.status_code, headers=hdrs)
+        # 不含 coverId 或解析失败：按原样回放，行为与改写前一致
+        return StreamingResponse(
+            iter([raw]),
+            status_code=resp.status_code,
+            headers={k: v for k, v in resp_headers.items()
+                     if k.lower() not in ("content-length", "content-encoding")},
+            media_type="application/json",
+        )
+
     return StreamingResponse(
         body_stream(),
         status_code=resp.status_code,
@@ -2715,12 +2748,26 @@ def disguise_client_json(obj):
     """
     if isinstance(obj, dict):
         out = {}
+        # v2.6.18：本地曲目 coverId 为 null 时，用本行 guid 补上。
+        # 官方库里多数曲目 cover_guid 为空，列表下发 null，客户端便不会请求
+        # /static/cover —— 哪怕服务端已能解析出封面，那几行仍是空白。
+        # 必须是「本行自己的 guid」：服务端 _local_cover_response 会把它解析到
+        # 所属专辑的封面文件（新增的 track→album 索引），零外部依赖、毫秒级。
+        _local_guid = ""
+        for _lk in ("guid", "trackGUID", "trackGuid"):
+            _lv = obj.get(_lk)
+            if isinstance(_lv, str) and not _lv.startswith("online:") \
+                    and re.fullmatch(r"[0-9a-fA-F]{32}", _lv):
+                _local_guid = _lv
+                break
         for k, v in obj.items():
             if isinstance(v, str) and v.startswith("online:"):
                 if k in ("coverId", "cover_id"):
                     out[k] = "track_" + _cover_fake_guid(v)
                 else:
                     out[k] = fake_official_guid(v)
+            elif k in ("coverId", "cover_id") and not v and _local_guid:
+                out[k] = _local_guid
             else:
                 out[k] = disguise_client_json(v)
         return out
@@ -3109,7 +3156,11 @@ async def search_track(request: Request):
         return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
 
     if not keyword:
-        return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
+        # v2.6.18：原先这里原文返回，绕过了 disguise_client_json —— 而本地
+        # 专辑/歌手/歌曲列表正是走这条路径。官方对 cover_guid 为空的条目下发
+        # coverId=null，客户端拿不到 id 便不会请求 /static/cover，那几行必然空白。
+        # 该函数对已有 coverId 与 online: 伪装的行为不变，只补 null 的本地行。
+        return JSONResponse(content=disguise_client_json(upstream_json), status_code=upstream_resp.status_code, headers=resp_headers)
 
     scope = _credential_scope(request)
     if _USER_SEARCH_WORD.get(scope) != keyword:
@@ -6380,6 +6431,18 @@ async def _local_cover_response(request: Request, guid: str, size: "int | None" 
             _cover_log("OFFICIAL_DISK", f"guid={guid} size={size}")
             return hit
 
+    # 0.5) 本地曲目 guid -> 所属专辑封面（v2.6.18 新增）。
+    #      官方 music.db 里绝大多数曲目 cover_guid 为空，客户端列表行下发的是裸
+    #      track.guid，而官方封面目录只按 cover_guid 落盘（track.guid 命中 0/31）。
+    #      不补这一级，本地曲库列表的每一行都会落占位图。
+    if re.fullmatch(r"[0-9a-fA-F]{32}", guid or ""):
+        mapped = _track_cover_index().get(guid)
+        if mapped:
+            hit = await _official_local_cover_response(mapped, size)
+            if hit is not None:
+                _cover_log("TRACK_ALBUM_DISK", f"guid={guid} cover={mapped} size={size}")
+                return hit
+
     if _cover_negative_get(guid):
         return _placeholder_cover_response(guid)
     # 1) 标题/路径
@@ -6425,6 +6488,20 @@ async def _local_cover_response(request: Request, guid: str, size: "int | None" 
         guessed = _library_file_by_tags(title, artist) if title else ""
         if guessed:
             path = guessed
+    # 2.0) **补齐歌名/歌手**（v2.6.18 修复）：本地曲目的 title/artist 常一路拿不到
+    #   ——推荐缓存没有、track/metadata 对无 cover_guid 的条目返空、标签索引又需要
+    #   title 才能定位文件。结果第 3 级 `if title:` 为假，在线反查被整段跳过，
+    #   明明网易能搜到封面（实测 4/4 命中）却直接落占位图。
+    #   这里按可靠性从高到低补：music.db 规范名 → 音频文件名反解。
+    if not title:
+        dt, da = _track_meta_from_db(guid)
+        if dt:
+            title, artist = dt, (artist or da)
+    if not title and path:
+        pt, pa = _title_artist_from_path(path)
+        title, artist = title or pt, artist or pa
+    if not path and title:
+        path = _library_file_by_tags(title, artist)
     _cover_log("LOCAL_RESOLVE", f"guid={guid} title={title!r} artist={artist!r} path={path!r}")
     # 2) 内嵌图
     if path and os.path.exists(path):
@@ -6440,9 +6517,83 @@ async def _local_cover_response(request: Request, guid: str, size: "int | None" 
         cover = await _netease_direct_cover(title, artist)
         if cover:
             return await _proxy_cover_response(cover, request, guid)
+    # 3.5) **按 guid 反查出的专辑/歌手名再试一次**（v2.6.18 新增）。
+    #      官方库里部分专辑/歌手 cover_guid 为 NULL，官方封面目录对它们没有
+    #      文件，磁盘直读天生无效；而裸 guid 本身不含任何名称信息，于是前面
+    #      拿不到 title，这一段以前根本不会执行 —— 直接落占位图。
+    #      实测本机 8 个这样的条目，用名称去网易反查 8/8 都能拿到真实封面。
+    if not title:
+        nm, alt = _name_by_guid(guid)
+        for kw in ((nm, ""), (alt, nm), (nm, nm)):
+            if not kw[0]:
+                continue
+            cover = await _netease_direct_cover(kw[0], kw[1])
+            if cover:
+                _cover_log("NAME_NETEASE", f"guid={guid} kw={kw[0][:24]!r}")
+                return await _proxy_cover_response(cover, request, guid)
     # 4) 占位（负缓存，避免频繁重试）
     _cover_negative_put(guid)
     return _placeholder_cover_response(guid)
+
+
+# === 本地曲目 guid -> 专辑封面 cover_guid 映射（v2.6.18） ===
+#
+# 官方 music.db 里 31 首本地曲目有 29 首 cover_guid 为空，客户端列表行下发的是
+# 裸 track.guid；而官方封面目录只按 cover_guid 落盘（实测 track.guid 命中 0/31），
+# 于是本地曲库列表的每一行都落占位图 —— 表现为"歌都有，封面没有"。
+#
+# track.guid 无法从封面文件名反推，但 track -> album_id -> album.cover_guid 这条
+# 关联链在 music.db 里是现成的（实测可覆盖 27/31 首）。这里建一张
+# track.guid -> cover_guid 的内存索引，把这一级补上：仍然零外部依赖、毫秒级返回。
+#
+# 只用 album.cover_guid / track.cover_guid 本身确实存在于官方封面目录的值，
+# 避免把没有封面的专辑（实测有 6 张专辑 cover_guid 为空）也塞进索引。
+
+_TRACK_COVER_INDEX: "dict[str, str]" = {}
+_TRACK_COVER_INDEXED = False
+
+
+def _track_cover_index() -> "dict[str, str]":
+    """建 track.guid -> cover_guid 索引（扫一次 music.db，进程内缓存）。"""
+    global _TRACK_COVER_INDEXED
+    if _TRACK_COVER_INDEXED:
+        return _TRACK_COVER_INDEX
+    _TRACK_COVER_INDEXED = True
+    db = str(CONF.get("music_db") or "")
+    if not db or not os.path.isfile(db):
+        return _TRACK_COVER_INDEX
+    n = 0
+    try:
+        import sqlite3
+
+        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+        try:
+            cur = con.cursor()
+            # 只取确实能在官方封面目录定位到的 cover_guid（track 自己的优先，
+            # 为空则回退所属专辑的 —— 与官方 App 的取图优先级一致）
+            rows = cur.execute(
+                """
+                SELECT t.guid,
+                       COALESCE(NULLIF(t.cover_guid, ''), a.cover_guid)
+                FROM track t
+                LEFT JOIN album a ON a.id = t.album_id
+                """
+            ).fetchall()
+            for g, c in rows:
+                g, c = str(g or ""), str(c or "")
+                if not g or not c:
+                    continue
+                if not _official_cover_file(c):
+                    continue  # 该专辑官方也没落盘封面，索引它只会把请求推向占位图
+                _TRACK_COVER_INDEX.setdefault(g, c)
+                n += 1
+        finally:
+            con.close()
+    except Exception as e:
+        logger.warning("track cover index build failed: %s", e)
+        return _TRACK_COVER_INDEX
+    logger.info("track cover index: tracks=%d db=%s", n, db)
+    return _TRACK_COVER_INDEX
 
 
 def _is_official_local_guid(guid: str) -> bool:
@@ -6471,6 +6622,129 @@ def _is_official_local_guid(guid: str) -> bool:
     if not re.fullmatch(r"[0-9a-fA-F]{32}", body or ""):
         return False
     return bool(_official_cover_file(raw))
+
+
+def _title_artist_from_path(path: str) -> "tuple[str, str]":
+    """从音频文件路径反解 (歌名, 歌手)。
+
+    与 _scan_library_index 的切分规则保持一致：去掉扩展名后按 " - " 切，
+    前段为歌手、后段为歌名（"夏鸣 - 孟婆的碗.flac" → ("孟婆的碗", "夏鸣")）。
+    mutagen 里若写了标签则优先用标签（官方写入的更准）。
+    """
+    if not path:
+        return "", ""
+    title = artist = ""
+    try:
+        from mutagen import File as MutagenFile
+
+        m = MutagenFile(path, easy=True)
+        if m is not None:
+            t = (m.get("title") or [""])[0]
+            a = (m.get("artist") or m.get("albumartist") or [""])[0]
+            if t:
+                title = str(t).strip()
+            if a:
+                artist = str(a).strip()
+    except Exception:
+        pass
+    if title and artist:
+        return title, artist
+    stem = re.sub(r"\.[^.]+$", "", os.path.basename(path))
+    parts = [x.strip() for x in re.split(r"\s+-\s+", stem)]
+    if len(parts) >= 2:
+        artist = artist or parts[0]
+        title = title or " - ".join(parts[1:])
+    else:
+        title = title or stem
+    return title, artist
+
+
+_TRACK_META_INDEX: "dict[str, tuple]" = {}
+_TRACK_META_INDEXED = False
+
+
+_ALBUM_ARTIST_NAME_INDEX: "dict[str, tuple]" = {}
+_ALBUM_ARTIST_NAME_INDEXED = False
+
+
+def _name_by_guid(guid: str) -> "tuple[str, str]":
+    """裸 guid -> (名称, 备用关键词)；查 album / artist 两张表。
+
+    官方库里不少专辑/歌手的 cover_guid 为 NULL（实测本机 4 张专辑 + 4 位歌手），
+    官方封面目录对它们没有文件，磁盘直读这一级天生无效。此时唯一的出路是
+    拿名称去在线反查真实专辑/歌手图，所以这里把 guid → 名称补上。
+
+    专辑额外返回其下第一首曲目标题作为备用关键词：专辑名与网易上的专辑名
+    往往不完全一致（如"菩提劝我莫回头" vs 曲名"菩提劝我莫回头（看那花开花又落）"），
+    用曲名搜反而更容易命中。
+    """
+    global _ALBUM_ARTIST_NAME_INDEXED
+    g = str(guid or "")
+    if not re.fullmatch(r"[0-9a-fA-F]{32}", g):
+        return "", ""
+    if not _ALBUM_ARTIST_NAME_INDEXED:
+        _ALBUM_ARTIST_NAME_INDEXED = True
+        db = str(CONF.get("music_db") or "")
+        if db and os.path.isfile(db):
+            try:
+                import sqlite3
+
+                con = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+                try:
+                    cur = con.cursor()
+                    for gid, nm in cur.execute("SELECT guid, name FROM album"):
+                        if gid and nm:
+                            _ALBUM_ARTIST_NAME_INDEX.setdefault(str(gid), (str(nm), ""))
+                    for gid, nm in cur.execute("SELECT guid, name FROM artist"):
+                        if gid and nm:
+                            _ALBUM_ARTIST_NAME_INDEX.setdefault(str(gid), (str(nm), ""))
+                    # 专辑的备用关键词：其下第一首曲目标题
+                    for gid, t in cur.execute("""
+                        SELECT a.guid, MIN(t.title)
+                        FROM album a JOIN track t ON t.album_id = a.id
+                        GROUP BY a.guid
+                    """):
+                        if gid and t and str(gid) in _ALBUM_ARTIST_NAME_INDEX:
+                            nm, _old = _ALBUM_ARTIST_NAME_INDEX[str(gid)]
+                            _ALBUM_ARTIST_NAME_INDEX[str(gid)] = (nm, str(t))
+                finally:
+                    con.close()
+            except Exception as e:
+                logger.warning("album/artist name index build failed: %s", e)
+    return _ALBUM_ARTIST_NAME_INDEX.get(g, ("", ""))
+
+
+def _track_meta_from_db(guid: str) -> "tuple[str, str]":
+    """直查 music.db 取本地曲目的 (歌名, 歌手)。
+
+    比路径反解更准：库里存的就是官方整理过的歌名/歌手，路径里的
+    "歌手 - 歌名" 只是扫描器按文件名猜的（实测部分条目文件名带版本后缀，
+    如 "（石红豆版)"，与库里的规范名不一致，网易反查用规范名命中率更高）。
+    """
+    global _TRACK_META_INDEXED
+    if not _TRACK_META_INDEXED:
+        _TRACK_META_INDEXED = True
+        db = str(CONF.get("music_db") or "")
+        if db and os.path.isfile(db):
+            try:
+                import sqlite3
+
+                con = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+                try:
+                    for g, t, p in con.execute("""
+                        SELECT t.guid, t.title, MIN(ar.name)
+                        FROM track t
+                        LEFT JOIN track_artist ta ON ta.track_id = t.id
+                        LEFT JOIN artist ar ON ar.id = ta.artist_id
+                        GROUP BY t.guid
+                    """):
+                        if g and t:
+                            _TRACK_META_INDEX[str(g)] = (str(t), str(p or ""))
+                finally:
+                    con.close()
+            except Exception as e:
+                logger.warning("track meta index build failed: %s", e)
+    return _TRACK_META_INDEX.get(str(guid or ""), ("", ""))
 
 
 def _request_cover_size(request: Request) -> "int | None":
