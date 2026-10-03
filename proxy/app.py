@@ -2778,6 +2778,41 @@ def disguise_client_json(obj):
     return obj
 
 
+def disguise_official_items(official: list) -> list:
+    """就地改写「官方原样下发」的那半边列表（v2.6.18）。
+
+    收藏/歌单/最近播放三个端点都是 online + official 合并下发：online 半边由
+    build_*_track_obj 产出、已逐条 disguise 过；official 半边却是官方信封原样塞进
+    data["list"] 后整体 JSONResponse 出去的，从未经改写。官方库里多数曲目的
+    cover_guid 为 NULL，客户端拿到 coverId=null 就不会去请求 /static/cover ——
+    于是服务端明明解析得出封面，那一行在 App 里仍是灰色音符占位符。
+
+    这里对 official 半边补一次同样的改写：online: 前缀伪装 + coverId 空值兜底。
+    幂等（对已伪装过的对象再跑一次结果不变），所以对 online 半边也无副作用。
+    """
+    if not isinstance(official, list):
+        return official
+    for i, item in enumerate(official):
+        if isinstance(item, dict):
+            official[i] = disguise_client_json(item)
+    return official
+
+
+def disguise_envelope_list(envelope: dict) -> dict:
+    """改写信封里 data.list 的每个条目（v2.6.18）。
+
+    用于「鉴权探测被拒→降级为官方原样」这类分支：那几条return 直接把官方信封
+    原样下发，列表同样没经过 disguise_client_json，官方曲目 coverId=null 的行
+    在App 里就还是占位符。降级只应砍掉本地注入，不该连带砍掉封面修复。
+    """
+    if not isinstance(envelope, dict):
+        return envelope
+    data = envelope.get("data")
+    if isinstance(data, dict):
+        disguise_official_items(data.get("list"))
+    return envelope
+
+
 def extract_guid(request: Request, path_guid: str | None = None) -> str:
     if path_guid:
         return resolve_real_guid(path_guid)
@@ -7289,7 +7324,7 @@ async def favorite_track_list(request: Request):
     is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
     if not is_authed:
         logger.warning("favorite list degraded to official-only: auth probe rejected after official list ok")
-        return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
+        return JSONResponse(content=disguise_envelope_list(upstream_json), status_code=upstream_resp.status_code, headers=resp_headers)
 
     # 成功获取官方列表，合并本地在线收藏
     data = upstream_json.get("data")
@@ -7339,7 +7374,7 @@ async def favorite_track_list(request: Request):
 
     data["list"] = official_list + online_tracks
     data["total"] = official_total + len(online_tracks)
-
+    disguise_official_items(official_list)
     return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
 
 
@@ -7818,14 +7853,14 @@ async def playlist_list(request: Request):
 
     is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
     if not is_authed:
-        return auth_resp or JSONResponse(content=envelope, headers=headers)
+        return auth_resp or JSONResponse(content=disguise_envelope_list(envelope), headers=headers)
 
     kinds = _recommend_injectable_kinds(user_guid)
     # 网易账号歌单：实例级内容（同热门推荐），shared 会话同样可见
     nm_on = bool(CONF.get("netease_my_playlists")) and bool(CONF.get("netease_enabled"))
     if not kinds and not nm_on:
         # 两个推荐开关全关（或 shared 会话无任何可注入类型）且账号歌单关闭：不注入
-        return JSONResponse(content=envelope, headers=headers)
+        return JSONResponse(content=disguise_envelope_list(envelope), headers=headers)
 
     data = envelope.get("data")
     if not isinstance(data, dict):
@@ -7867,7 +7902,7 @@ async def playlist_list(request: Request):
         it for it in official
         if not (isinstance(it, dict) and dailyrec.is_recommend_playlist_guid(str(it.get("guid") or "")))
     ]
-    data["list"] = recs + nm_cards + official
+    data["list"] = recs + nm_cards + disguise_official_items(official)
     total = data.get("total")
     data["total"] = (total if isinstance(total, int) else len(official)) + len(recs) + len(nm_cards)
     try:
@@ -7916,14 +7951,14 @@ async def playlist_detail(request: Request):
         # 官方明细已成功，此时探测被拒不能回传鉴权错误，降级为官方原样（同收藏列表）
         is_authed, user_guid, _ = await _probe_upstream_auth(request, upstream_client)
         if not is_authed:
-            return JSONResponse(content=envelope, headers=headers)
+            return JSONResponse(content=disguise_envelope_list(envelope), headers=headers)
         extras = load_playlist_tracks(user_guid).get(resolve_real_guid(guid)) or []
         if extras:
             data = envelope.get("data")
             if isinstance(data, dict):
                 tc = data.get("trackCount")
                 data["trackCount"] = (tc if isinstance(tc, int) else 0) + len(extras)
-        return JSONResponse(content=envelope, headers=headers)
+        return JSONResponse(content=disguise_envelope_list(envelope), headers=headers)
 
     upstream_client = get_upstream_client(request.app)
     is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
@@ -8059,11 +8094,11 @@ async def playlist_track_list(request: Request):
         # 官方列表已成功，此时探测被拒不能回传鉴权错误，降级为官方原样（同收藏列表）
         is_authed, user_guid, _ = await _probe_upstream_auth(request, upstream_client)
         if not is_authed:
-            return JSONResponse(content=envelope, headers=headers)
+            return JSONResponse(content=disguise_envelope_list(envelope), headers=headers)
         resolved_pl_guid = resolve_real_guid(guid)
         extras = load_playlist_tracks(user_guid).get(resolved_pl_guid) or []
         if not extras:
-            return JSONResponse(content=envelope, headers=headers)
+            return JSONResponse(content=disguise_envelope_list(envelope), headers=headers)
         # 自愈：bind=pending 的歌单条目在此补发官方绑定/下载
         _maybe_retry_official_binds(request, user_guid, plt_map={resolved_pl_guid: extras})
 
@@ -8841,7 +8876,7 @@ async def play_history_list(request: Request):
     is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
     if not is_authed:
         logger.warning("play history list degraded to official-only: auth probe rejected after official list ok")
-        return JSONResponse(content=envelope, headers=headers)
+        return JSONResponse(content=disguise_envelope_list(envelope), headers=headers)
 
     data = envelope.get("data")
     if not isinstance(data, dict):
@@ -8882,7 +8917,7 @@ async def play_history_list(request: Request):
 
     seen = {str(x.get("guid")) for x in official if isinstance(x, dict)}
     merged_online = [t for t in online_tracks if t.get("guid") not in seen]
-    data["list"] = merged_online + official
+    data["list"] = merged_online + disguise_official_items(official)
     official_total = data.get("total")
     if not isinstance(official_total, int):
         official_total = len(official)
