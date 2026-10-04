@@ -90,6 +90,26 @@ h2 { margin: 4px 0 14px; font-size: 20px; }
   display: inline-block; margin-top: 3px; padding: 3px 6px;
   background: rgba(0, 0, 0, .1); user-select: all;
 }
+
+/* -------------------------------------------------- 下载进度条 */
+/* 428MB 离线包要下很久（实测直连可达 6 小时），纯文字看不出在动，
+   必须有可视化进度条 + 实时速度/剩余时间。 */
+#ver-install-progress { margin-top: 10px; }
+.up-bar {
+  height: 8px; border-radius: 999px; overflow: hidden;
+  background: var(--line);
+}
+.up-bar-fill {
+  height: 100%; width: 0; border-radius: 999px;
+  background: var(--accent);
+  transition: width .4s linear;
+}
+/* 校验阶段：进度条已满，换个颜色区分「还在校验」 */
+#ver-install-progress.verifying .up-bar-fill { background: var(--warn, #c98a2e); }
+.up-bar-text {
+  margin-top: 6px; font-size: 12px; color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
 .up-ready code {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px; padding: 1px 5px; border-radius: 4px;

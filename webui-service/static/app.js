@@ -774,23 +774,48 @@ $("#ver-install") && $("#ver-install").addEventListener("click", startUpgrade);
 /* -------------------------------------------------------------- 一键升级 */
 let upgradePoll = null;
 
+// 下载进度条：宽度 + 文字。428MB 要下很久，只靠一句文字看不出在动。
+function upgradeProgress(stage, st) {
+  const box = $("#ver-install-progress");
+  if (!box) return;
+  const on = stage === "downloading" || stage === "verifying";
+  box.hidden = !on;
+  box.classList.toggle("verifying", stage === "verifying");
+  if (!on) return;
+
+  const got = Number(st.received || 0), total = Number(st.total || 0);
+  const spd = Number(st.speed || 0), eta = Number(st.eta || 0);
+  const pct = total ? Math.min(100, got * 100 / total) : Number(st.percent || 0);
+  const fill = $("#up-bar-fill");
+  if (fill) fill.style.width = (total ? pct : 0).toFixed(1) + "%";
+
+  const mb = (n) => (n / 1048576).toFixed(1);
+  const txt = $("#up-bar-text");
+  if (!txt) return;
+  if (stage === "verifying") {
+    txt.textContent = "下载完成，正在校验 sha256…";
+    return;
+  }
+  const bits = [];
+  if (total) bits.push(`${mb(got)} / ${mb(total)} MB（${pct.toFixed(1)}%）`);
+  else bits.push("正在连接…");
+  if (spd > 0) bits.push(`${Math.round(spd / 1024)} KB/s`);
+  if (eta > 0) bits.push(`约剩 ${eta < 60 ? eta + " 秒" : Math.ceil(eta / 60) + " 分钟"}`);
+  if (st.source) bits.push(st.source);
+  txt.textContent = bits.join("　");
+}
+
 function upgradeUI(stage, text, percent) {
   const hint = $("#ver-install-hint");
   if (!hint) return;
   const st = window.__upgradeState || {};
+  upgradeProgress(stage, st);
   if (stage === "downloading" || stage === "verifying") {
-    // 整百分比在慢速下长时间不动，看着像卡死。补上已下载量、速度、剩余时间，
-    // 让"在动"这件事看得见。
-    const p = Number(percent || 0);
-    const got = Number(st.received || 0), total = Number(st.total || 0);
-    const spd = Number(st.speed || 0), eta = Number(st.eta || 0);
-    const mb = (n) => (n / 1048576).toFixed(1);
-    const parts = [`正在下载并校验安装包… ${p}%`];
-    if (total) parts.push(`${mb(got)} / ${mb(total)} MB`);
-    if (spd > 0) parts.push(`${Math.round(spd / 1024)} KB/s`);
-    if (eta > 0) parts.push(`约剩 ${eta < 60 ? eta + " 秒" : Math.ceil(eta / 60) + " 分钟"}`);
-    if (st.source) parts.push(`来源：${st.source}`);
-    hint.innerHTML = `${esc(parts.join("　"))}　请勿关闭页面`;
+    // 整百分比在慢速下长时间不动，看着像卡死。进度条已承担可视化，
+    // 这里只留一句状态与「请勿关闭页面」。
+    hint.innerHTML = stage === "verifying"
+      ? "下载完成，正在校验…"
+      : "正在下载安装包，请勿关闭页面";
   } else if (stage === "ready") {
     // 包已完整落在宿主目录。**路径必须原样显示**：后端下发的 host_dir/file_name
     // 才是真实落盘位置，之前这里自己拼了个文件名，与实际落盘不一致，
@@ -889,18 +914,20 @@ async function startUpgrade() {
   }
 }
 
-// 页面加载时若上次下载正在跑，接上轮询（刷新页面不丢进度）
+// 页面加载时接上轮询（刷新页面不丢进度）
+// ⚠️ 不能只在running 时接：服务重启后状态是 interrupted，页面若就此
+// 停止轮询，就再也不会感知到之后新发起的下载（实测踩过：页面一直挂着
+// 「上次下载被中断」，而后台其实已经在下载了）。改为只要状态不是 idle
+// 就接上，由 pollUpgrade 在到达终态时自行 stopUpgradePoll。
 (async function resumeUpgrade() {
   try {
     const s = await api("/api/upgrade/state");
-    const running = s && ["starting", "downloading", "verifying"].includes(s.stage);
-    if (running) {
-      upgradePoll = setInterval(pollUpgrade, 1500);
-      pollUpgrade();
-    } else if (s && (s.stage === "ready" || s.stage === "failed" || s.stage === "interrupted")) {
-      // ready 也要重绘：刷新页面后引导卡还得在，别让用户以为白下了
+    if (s && s.stage && s.stage !== "idle") {
       window.__upgradeState = s;
       upgradeUI(s.stage, s.error || s.message, s.percent);
+      if (!["ready", "failed", "interrupted"].includes(s.stage)) {
+        upgradePoll = setInterval(pollUpgrade, 1500);
+      }
     }
   } catch (e) { /* 忽略 */ }
 })();

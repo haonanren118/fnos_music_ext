@@ -231,6 +231,12 @@
             <button class="btn" id="ver-notes-btn">查看升级内容</button>
           </div>
           <p class="hint" id="ver-install-hint">「下载安装包」会自动从官方发行页拉取并校验安装包到本机；飞牛系统未提供自动安装接口，最后一步需要在应用中心点「手动安装」完成。不升级的话当前版本功能完全不受影响。</p>
+          <!-- 下载进度条：428MB 要下很久，只靠文字看不出在动。
+               ver-install-path 是历史遗留的空元素（JS/CSS 均未引用），不碰。 -->
+          <div id="ver-install-progress" hidden>
+            <div class="up-bar"><div class="up-bar-fill" id="up-bar-fill"></div></div>
+            <div class="up-bar-text" id="up-bar-text"></div>
+          </div>
           <p class="hint" id="ver-install-path" hidden></p>
         </div>
 
