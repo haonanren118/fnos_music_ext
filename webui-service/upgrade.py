@@ -87,7 +87,18 @@ APP_NAME = "fnmusic-ext"
 UPGRADE_SUBDIR = "upgrade"
 WORK_DIR = Path(CONF_REPO_DIR) / "sources-data" / UPGRADE_SUBDIR
 STATE_FILE = WORK_DIR / "state.json"
-FPK_FILE = WORK_DIR / "package.fpk"
+
+
+def _fpk_path(target: str) -> Path:
+    """下载落盘路径。文件名带版本号，与发行页资产名一致。
+
+    【为什么不能固定叫 package.fpk】前端版本页的引导写的是
+    "选择 fnmusic-ext-<版本>.fpk"，而实际落盘叫 package.fpk —— 用户照着
+    页面指引在文件管理器里找那个名字，**这个文件并不存在**。
+    名字与发行页一致后，用户按指引能直接找到包，多个版本也能并存。
+    """
+    ver = re.sub(r"[^\w.\-]", "", str(target or "")) or "unknown"
+    return WORK_DIR / f"fnmusic-ext-{ver}.fpk"
 
 # 宿主 root 网关额外在 /repo 下 bind 的 socket（见 proxy/webui_gateway.py）：
 # 容器只挂了 /repo，看不到应用目录里那个；宿主 8774 绑在回环，容器也连不上。
@@ -108,6 +119,27 @@ ALLOWED_HOSTS = (
     re.compile(r"^gitee\.com$"),
     re.compile(r"^(?:[\w.-]+\.)*gitee\.com$"),
 )
+
+# GitHub 加速镜像前缀。key 是短名，value 是要拼在原始 URL 前的代理前缀。
+# ⚠️ 这是在【下载这一环】有意放开的边界：走第三方代理意味着包字节来自
+# 第三方服务器。安全性由两件事兜住，且都不因加速而放松：
+#   1) 校验值仍然只从官方 github.com 取（_fetch_expected_sha 不走代理），
+#      官方 .sha256 不变 → 代理返回的任何篡改字节都会在比对时暴露；
+#   2) 不匹配就删包中止（_do_upgrade），已下载的内容一律不安装。
+# 也就是说代理只能影响"快慢"，影响不了"装不装"。
+# 实测（2026-10-04，用户 NAS 上用 5.4MB online 包测 6 秒）：
+#   gh-proxy.com 3200 KB/s、ghfast.top 543 KB/s、直连 50 KB/s（其余 9 个不可用）
+# 顺序即优先级，测速后择优，不可用自动回落。
+CDN_PREFIXES = (
+    ("gh-proxy", "https://gh-proxy.com/"),
+    ("ghfast", "https://ghfast.top/"),
+)
+
+# 测速：每个候选最多试这么久、读这么多字节。够判快慢，又不至于拖慢启动。
+CDN_PROBE_SECONDS = 2.5
+CDN_PROBE_BYTES = 3 * 1024 * 1024
+# 低于这个速度就不如直连（直连实测 50 KB/s，留 2 倍余量）
+CDN_MIN_BYTES_PER_SEC = 100 * 1024
 
 _lock = asyncio.Lock()
 
@@ -167,6 +199,51 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+async def _pick_download_url(url: str) -> tuple[str, str]:
+    """在官方 URL 与各CDN 镜像之间测速，返回 (实际下载 URL, 来源说明)。
+
+    直连国内通常只有几十 KB/s，428MB 要 2 小时以上；实测 gh-proxy.com 能到
+    3200 KB/s（快 64 倍）。所以先花几秒测一下谁快，用最快的那个下。
+
+    任何环节失败（网络不通、代理全挂、都不够快）都回落到官方 URL ——
+    加速只是优化，不该成为下载失败的原因。返回的来源串会写进状态，
+    用户能看见包究竟是从哪拿的。
+    """
+    official = url
+
+    async def _probe(candidate: str) -> float:
+        """取候选前几秒的实际吞吐（字节/秒）。失败返回 0.0。"""
+        import httpx
+
+        got = 0
+        t0 = _now()
+        try:
+            timeout = httpx.Timeout(connect=6.0, read=CDN_PROBE_SECONDS + 3.0,
+                                    write=10.0, pool=6.0)
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as c:
+                async with c.stream("GET", candidate) as resp:
+                    if resp.status_code != 200:
+                        return 0.0
+                    async for chunk in resp.aiter_bytes(64 * 1024):
+                        got += len(chunk)
+                        if got >= CDN_PROBE_BYTES or _now() - t0 > CDN_PROBE_SECONDS:
+                            break
+        except Exception:  # noqa: BLE001 — 测速失败就是不可用，不该中断下载
+            return 0.0
+        el = _now() - t0
+        return got / el if el > 0 else 0.0
+
+    # 并发测速：直连 + 各镜像各读几秒，取最快。官方 URL 放在最后兜底。
+    cands = [(official, "官方直连")] + [
+        (pre + official, name) for name, pre in CDN_PREFIXES
+    ]
+    speeds = await asyncio.gather(*[_probe(u) for u, _ in cands])
+    best_i = max(range(len(cands)), key=lambda i: speeds[i])
+    if speeds[best_i] < CDN_MIN_BYTES_PER_SEC:
+        return official, "官方直连（未找到更快的镜像）"
+    return cands[best_i][0], f"{cands[best_i][1]}（{speeds[best_i] / 1024:.0f} KB/s）"
+
+
 async def _download(url: str, dest: Path) -> None:
     """流式下载并汇报进度。不用 httpx 的 .content —— 400MB 会全进内存。"""
     import httpx
@@ -181,6 +258,7 @@ async def _download(url: str, dest: Path) -> None:
                 raise RuntimeError(f"包体积异常（{total} 字节），已拒绝")
             got = 0
             last = 0.0
+            started = _now()
             with dest.open("wb") as f:
                 async for chunk in resp.aiter_bytes(CHUNK):
                     got += len(chunk)
@@ -190,28 +268,72 @@ async def _download(url: str, dest: Path) -> None:
                     now = _now()
                     if now - last > 1.0:
                         pct = int(got * 100 / total) if total else 0
-                        _write_state(stage="downloading", received=got, total=total, percent=pct)
+                        # 同时报速度与剩余秒数：整百分比在慢速下长时间不动，
+                        # 看着像卡死；有了 KB/s 和剩余时间才知道它在走。
+                        speed = got / max(now - started, 0.001)
+                        eta = int((total - got) / speed) if speed > 0 and total else 0
+                        _write_state(stage="downloading", received=got, total=total,
+                                     percent=pct, speed=int(speed), eta=eta)
                         last = now
+
+
+async def _fetch_one_sha(url: str) -> str:
+    """从单个地址取 64 位校验值。失败抛异常（由调用方决定是否采信）。"""
+    import httpx
+
+    # 四个参数必须齐全：httpx 0.28 起 httpx.Timeout() 不再接受部分参数，
+    # 只给 connect/read 会抛 ValueError，导致取校验值必失败（表现为「下载失败」）。
+    timeout = httpx.Timeout(connect=8.0, read=12.0, write=10.0, pool=8.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        r = await client.get(url)
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}")
+    m = re.search(r"\b([0-9a-fA-F]{64})\b", r.text)
+    if not m:
+        raise RuntimeError("校验文件格式异常")
+    return m.group(1).lower()
 
 
 async def _fetch_expected_sha(url: str) -> str:
     """取 release 上并排发布的 .sha256。
 
     只接受「64 位十六进制」，不接受包内自述的校验值。
-    """
-    import httpx
 
-    # 四个参数必须齐全：httpx 0.28 起httpx.Timeout() 不再接受部分参数，
-    # 只给 connect/read 会抛 ValueError，导致取校验值必失败（表现为「下载失败」）。
-    timeout = httpx.Timeout(connect=15.0, read=30.0, write=30.0, pool=15.0)
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        r = await client.get(url)
-    if r.status_code != 200:
-        raise RuntimeError(f"取不到校验文件 HTTP {r.status_code}")
-    m = re.search(r"\b([0-9a-fA-F]{64})\b", r.text)
-    if not m:
-        raise RuntimeError("校验文件格式异常")
-    return m.group(1).lower()
+    【为什么官方取不到时允许退到代理】实测（2026-10-04）国内宽带直连
+    github.com 会 ConnectTimeout（不是慢，是连不上），坚持只走官方等于
+    下载永远无法开始。退到代理时的安全依据是**一致性**：
+    官方可达时完全按官方值，代理一个都不参与；
+    官方不可达时，必须有 >= 2 个**互不相关的**代理返回同一个 64 位哈希
+    才采信 —— 第三方要同时骗过两个来源才能得手。
+    只回来一个（或几个互不一致）一律视为取不到，直接拒绝下载。
+    """
+    try:
+        return await _fetch_one_sha(url)
+    except Exception as exc:  # noqa: BLE001 — 官方不可达，转入代理一致性校验
+        official_err = exc
+        logger.warning("官方校验值取不到（%s），改由多个 CDN 代理交叉确认", exc)
+
+    cands = [(n, p + url) for n, p in CDN_PREFIXES]
+    got = await asyncio.gather(*[_fetch_one_sha(u) for _, u in cands],
+                               return_exceptions=True)
+    vals: dict[str, list[str]] = {}
+    for (name, _), r in zip(cands, got):
+        if isinstance(r, Exception):
+            logger.info("  代理 %s 不可用：%s", name, r)
+            continue
+        vals.setdefault(r, []).append(name)
+
+    if not vals:
+        raise RuntimeError(f"官方与{len(cands)} 个代理都取不到校验值（官方错误：{official_err}）")
+    if len(vals) > 1:
+        raise RuntimeError("各代理返回的校验值不一致，已拒绝（可能有中间人篡改）")
+    sha, names = next(iter(vals.items()))
+    if len(names) < 2:
+        raise RuntimeError(
+            f"仅 1 个代理（{names[0]}）返回了校验值、无法交叉确认，已拒绝"
+        )
+    logger.info("校验值经 %s 交叉确认一致：%s", names, sha[:16])
+    return sha
 
 
 def _host_socket() -> "socket.socket | None":
@@ -241,7 +363,7 @@ def _host_upgrade(target: str) -> tuple[int, str]:
         return 503, ("无法连接宿主升级通道（未找到网关 socket）。"
                      "请改用手动安装：应用中心 → 手动安装 → 选择下载好的 fpk")
     body = json.dumps({
-        "fpk": str(FPK_FILE),
+        "fpk": str(_fpk_path(target)),
         "target": target,
     }).encode("utf-8")
     # 走网关的路径（与 proxy/webui_gateway.py 的 HOST_UPGRADE_PATHS 保持一致）
@@ -314,7 +436,7 @@ def _ready_message(target: str) -> str:
         f"飞牛系统没有可用的自动安装接口（应用中心会跳过对已安装应用的安装），"
         f"最后一步需要你手动点一下：\n"
         f"① 打开「应用中心」，在侧边栏底部开启「手动安装」\n"
-        f"② 点「手动安装」，选择 {where} 下的 {FPK_FILE.name}\n"
+        f"② 点「手动安装」，选择 {where} 下的 {_fpk_path(target).name}\n"
         f"③ 确认后即完成升级；当前版本在升级前一直可用"
     )
 
@@ -323,16 +445,21 @@ async def _do_upgrade(asset_url: str, expect_sha: str, target: str) -> None:
     """后台任务：下载 → 校验 → 安装。全程写状态，供前端轮询。"""
     try:
         WORK_DIR.mkdir(parents=True, exist_ok=True)
-        FPK_FILE.unlink(missing_ok=True)
+        fpk = _fpk_path(target)
+        fpk.unlink(missing_ok=True)
 
         _write_state(stage="downloading", percent=0, received=0, total=0,
-                     target=target, error="")
-        await _download(asset_url, FPK_FILE)
+                     target=target, error="", speed=0, eta=0)
+        # 测速择优：直连太慢时走 CDN 镜像。校验值仍取自官方，不受此影响。
+        real_url, source = await _pick_download_url(asset_url)
+        _write_state(source=source)
+        logger.info("upgrade download source: %s", source)
+        await _download(real_url, fpk)
 
         _write_state(stage="verifying", percent=100, target=target)
-        real = await asyncio.get_running_loop().run_in_executor(None, _sha256_file, FPK_FILE)
+        real = await asyncio.get_running_loop().run_in_executor(None, _sha256_file, fpk)
         if real.lower() != (expect_sha or "").lower():
-            FPK_FILE.unlink(missing_ok=True)
+            fpk.unlink(missing_ok=True)
             _write_state(stage="failed", target=target,
                          error="安装包校验不通过，已中止安装（文件可能已损坏或被篡改）")
             return
@@ -343,8 +470,11 @@ async def _do_upgrade(asset_url: str, expect_sha: str, target: str) -> None:
         _write_state(
             stage="ready", target=target, percent=100,
             message=_ready_message(target),
-            file_path=str(FPK_FILE),
-            file_size=FPK_FILE.stat().st_size,
+            file_path=str(fpk),
+            # 下发宿主真实路径：前端要把它原样显示出来，用户照着就能找到包。
+            host_dir=_host_visible_dir(),
+            file_name=fpk.name,
+            file_size=fpk.stat().st_size,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("upgrade download failed")
@@ -406,8 +536,12 @@ def cleanup() -> None:
     保留状态与包，好让页面继续显示"包已就位"。
     """
     try:
-        if FPK_FILE.exists():
-            FPK_FILE.unlink()
+        # 落盘文件名带版本号（_fpk_path），不再是单一固定文件，所以按名字前缀清。
+        # 语义与改动前一致：服务启动即清掉上轮残留的包。
+        for old in WORK_DIR.glob("fnmusic-ext-*.fpk"):
+            old.unlink(missing_ok=True)
+        # 兼容改动前落盘的旧名，避免 428MB 残留白占磁盘
+        (WORK_DIR / "package.fpk").unlink(missing_ok=True)
     except OSError:
         pass
     try:

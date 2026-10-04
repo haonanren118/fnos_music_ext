@@ -84,6 +84,12 @@ h2 { margin: 4px 0 14px; font-size: 20px; }
 }
 .up-ready ol { margin: 8px 0 0; padding-left: 22px; }
 .up-ready li { margin: 4px 0; }
+/* 安装包真实落盘路径：这是用户下载完最需要照着找的东西，单独一行突出 */
+.up-ready-path { margin-top: 8px; font-size: 13px; }
+.up-ready-path code {
+  display: inline-block; margin-top: 3px; padding: 3px 6px;
+  background: rgba(0, 0, 0, .1); user-select: all;
+}
 .up-ready code {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px; padding: 1px 5px; border-radius: 4px;

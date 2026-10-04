@@ -777,18 +777,34 @@ let upgradePoll = null;
 function upgradeUI(stage, text, percent) {
   const hint = $("#ver-install-hint");
   if (!hint) return;
+  const st = window.__upgradeState || {};
   if (stage === "downloading" || stage === "verifying") {
+    // 整百分比在慢速下长时间不动，看着像卡死。补上已下载量、速度、剩余时间，
+    // 让"在动"这件事看得见。
     const p = Number(percent || 0);
-    hint.innerHTML = `正在下载并校验安装包… ${p}%　请勿关闭页面`;
+    const got = Number(st.received || 0), total = Number(st.total || 0);
+    const spd = Number(st.speed || 0), eta = Number(st.eta || 0);
+    const mb = (n) => (n / 1048576).toFixed(1);
+    const parts = [`正在下载并校验安装包… ${p}%`];
+    if (total) parts.push(`${mb(got)} / ${mb(total)} MB`);
+    if (spd > 0) parts.push(`${Math.round(spd / 1024)} KB/s`);
+    if (eta > 0) parts.push(`约剩 ${eta < 60 ? eta + " 秒" : Math.ceil(eta / 60) + " 分钟"}`);
+    if (st.source) parts.push(`来源：${st.source}`);
+    hint.innerHTML = `${esc(parts.join("　"))}　请勿关闭页面`;
   } else if (stage === "ready") {
-    // 包已完整落在宿主目录，把三步操作直接摆出来，别让用户自己找
+    // 包已完整落在宿主目录。**路径必须原样显示**：后端下发的 host_dir/file_name
+    // 才是真实落盘位置，之前这里自己拼了个文件名，与实际落盘不一致，
+    // 用户照着指引找会找不到文件。改成直接用后端给的路径。
+    const dir = st.host_dir || "";
+    const fname = st.file_name || "";
     hint.innerHTML = `<div class="up-ready">${esc(text || "安装包已就位")}
+      <div class="up-ready-path">安装包位置：<code>${esc(dir ? dir + "/" + fname : fname)}</code></div>
       <ol>
         <li>打开飞牛「<b>应用中心</b>」→「我的应用」</li>
         <li>点右上角<b>「手动安装」</b>（需先在侧边栏底部开启该功能）</li>
-        <li>选择已下载的 <code>fnmusic-ext-${esc((versionInfo || {}).latest || "")}.fpk</code> 完成升级</li>
+        <li>选择上面这个文件完成升级</li>
       </ol>
-      <div class="up-ready-tip">包已存到应用目录下，用「文件」App 也能直接找到它；校验已通过，可以放心安装。</div>
+      <div class="up-ready-tip">已通过官方 sha256 校验，可放心安装；用「文件」App 打开上面这个目录也能直接找到它。</div>
     </div>`;
   } else if (stage === "failed") {
     hint.innerHTML = `<span style="color:var(--err)">下载失败：${esc(text || "未知错误")}</span>　可前往<a href="${esc(fallbackUrl())}" target="_blank" rel="noopener">发行页</a>手动下载`;
@@ -820,6 +836,9 @@ async function pollUpgrade() {
     return;
   }
   if (!s || !s.stage) return;
+  // upgradeUI 要用完整状态（received/total/speed/eta/host_dir/file_name/source），
+  // 签名只传了三个参数，其余字段挂在这里取。
+  window.__upgradeState = s;
   upgradeUI(s.stage, s.error || s.message, s.percent);
   if (s.stage === "ready") {
     stopUpgradePoll();
@@ -852,6 +871,7 @@ async function startUpgrade() {
 
   const btn = $("#ver-install");
   if (btn) { btn.disabled = true; btn.textContent = "启动中…"; }
+  window.__upgradeState = {};   // 清掉上一轮的 received/speed，避免闪现旧数字
   upgradeUI("downloading", "", 0);
   upgradePoll = setInterval(pollUpgrade, 1500);
   try {
@@ -879,6 +899,7 @@ async function startUpgrade() {
       pollUpgrade();
     } else if (s && (s.stage === "ready" || s.stage === "failed" || s.stage === "interrupted")) {
       // ready 也要重绘：刷新页面后引导卡还得在，别让用户以为白下了
+      window.__upgradeState = s;
       upgradeUI(s.stage, s.error || s.message, s.percent);
     }
   } catch (e) { /* 忽略 */ }
