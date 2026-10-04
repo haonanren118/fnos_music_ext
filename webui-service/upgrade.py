@@ -439,34 +439,86 @@ def _host_upgrade(target: str) -> tuple[int, str]:
 
 
 def _host_visible_dir() -> str:
-    """给用户看的安装包目录（宿主真实路径）。
+    """给用户看的安装包目录（宿主真实路径，「我的文件」里能直接看到）。
 
-    容器里的 /repo 只是挂载点，用户在「文件」App 里看到的是宿主路径。
-    优先用宿主网关告知的真实路径；拿不到就退回按 appname 推算的常见位置；
-    再不行只说相对位置 —— 宁可含糊也别给一个用户点不存在的 /repo/... 。
+    【为什么指向 /vol1/1000 而不是应用目录】飞牛「应用中心 → 手动安装」的
+    文件选择器只浏览「我的文件」，实测其根为 /vol1/<uid>/（admin 即
+    /vol1/1000/，里面有 Photos / data / 各应用目录）。包原先落在
+    /vol1/@appcenter/... 下，选择器里根本看不到 —— 用户找不到文件。
+    所以下载完成后由宿主网关把包复制一份到「我的文件」根（见_host_publish），
+    页面显示的就是这个真实位置。
     """
     env = (os.environ.get("UPGRADE_HOST_DIR") or "").strip()
     if env:
         return env
-    # 容器里 /repo 只是挂载点，宿主真实路径推不出来（Path.exists 必然 False），
-    # 所以兜底不查存在性，只按 fnOS 的固定布局拼一个 —— 与 Dockerfile 的
-    # UPGRADE_HOST_DIR、宿主网关的 UPGRADE_FPK_DIRS 三处保持一致。
-    name = (os.environ.get("FNMUSIC_APP_NAME") or "").strip() or "fnmusic-ext"
-    return f"/vol1/@appcenter/{name}/repo/sources-data/{UPGRADE_SUBDIR}"
+    # 与宿主网关 webui_gateway.py 的 MY_FILES_ROOT 保持一致。
+    # 拿不到真实 uid 时按 admin=1000 兜底：fnOS 首个用户就是 uid 1000。
+    uid = (os.environ.get("FNMUSIC_UID") or "").strip() or "1000"
+    return f"/vol1/{uid}"
 
 
-def _ready_message(target: str) -> str:
+async def _host_publish(fpk: Path) -> tuple[int, str]:
+    """请宿主 root 把包复制到「我的文件」。返回 (状态码, 宿主路径或错误)。
+
+    容器只挂了 /repo 与 /data，**看不到 /vol1**（实测 ls /vol1 → No such file
+    or directory），所以这一步只能由宿主代劳。走的是与 host-upgrade 同一个
+    特权socket（proxy/webui_gateway.py 的 POST /api/host-publish）。
+
+    失败不阻断下载：包还在升级目录里，用户仍可手动去取，只是选择器里没有而已。
+    """
+    s = _host_socket()
+    if s is None:
+        return 503, "（未找到宿主通道，包仍在应用目录，需手动拷贝到「我的文件」）"
+    body = json.dumps({"fpk": str(fpk)}).encode("utf-8")
+    path = "/api/host-publish"
+    head = (
+        f"POST {path} HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "X-Trim-Isadmin: true\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+    ).encode("latin-1")
+    try:
+        s.sendall(head + body)
+        chunks = []
+        s.settimeout(1800)
+        while True:
+            b = s.recv(65536)
+            if not b:
+                break
+            chunks.append(b)
+    except OSError as exc:
+        return 500, f"（宿主通道出错：{exc}）"
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+    text = b"".join(chunks).decode("utf-8", "replace")
+    try:
+        obj = json.loads(text.split("\r\n\r\n", 1)[-1])
+    except Exception:  # noqa: BLE001
+        return 500, "（宿主返回无法解析）"
+    if obj.get("ok"):
+        return 200, str(obj.get("path") or "")
+    return int(obj.get("code") or 500), str(obj.get("error") or "（未知错误）")
+
+
+def _ready_message(target: str, where: str | None = None) -> str:
     """包下载校验完后的引导文案。
 
     刻意写清楚三件事：包已完整可用、在哪、怎么装 —— 不让用户猜。
+    where 是「我的文件」里的真实落点（宿主网关复制后的路径）。
     """
-    where = _host_visible_dir()
+    at = where or _host_visible_dir()
     return (
         f"安装包 v{target} 已下载完成，并通过官方 sha256 校验。\n"
-        f"飞牛系统没有可用的自动安装接口（应用中心会跳过对已安装应用的安装），"
-        f"最后一步需要你手动点一下：\n"
+        f"已为你放到「我的文件」，飞牛系统没有可用的自动安装接口"
+        f"（应用中心会跳过对已安装应用的安装），最后一步需要你手动点一下：\n"
         f"① 打开「应用中心」，在侧边栏底部开启「手动安装」\n"
-        f"② 点「手动安装」，选择 {where} 下的 {_fpk_path(target).name}\n"
+        f"② 点「手动安装」，在「我的文件」里选择 {at}\n"
         f"③ 确认后即完成升级；当前版本在升级前一直可用"
     )
 
@@ -495,16 +547,26 @@ async def _do_upgrade(asset_url: str, expect_sha: str, target: str) -> None:
             return
 
         # 校验通过 —— 包已就位。fnOS 无可用自动升级通道（见 docstring 第 3 条），
-        # 这里**不**去调 appcenter-cli装：它对已安装应用是空操作，会返回 0
-        # 却什么都没做，把它当成功就是骗用户。改为把包留在宿主目录并给出安装指引。
+        # 这里**不**去调 appcenter-cli 装：它对已安装应用是空操作，会返回 0
+        # 却什么都没做，把它当成功就是骗用户。
+        #
+        # 再把包复制一份到「我的文件」：手动安装的文件选择器只认那里，
+        # 放在应用目录用户根本选不到。容器够不到 /vol1，只能请宿主 root 代劳。
+        code, published = await _host_publish(fpk)
+        if code == 200:
+            where = published
+        else:
+            where = f"{_host_visible_dir()}（复制到「我的文件」未成功：{published}；"
+            where += "包仍在应用目录，可手动拷贝过去）"
         _write_state(
             stage="ready", target=target, percent=100,
-            message=_ready_message(target),
+            message=_ready_message(target, where),
             file_path=str(fpk),
             # 下发宿主真实路径：前端要把它原样显示出来，用户照着就能找到包。
             host_dir=_host_visible_dir(),
             file_name=fpk.name,
             file_size=fpk.stat().st_size,
+            published_path=where if code == 200 else "",
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("upgrade download failed")

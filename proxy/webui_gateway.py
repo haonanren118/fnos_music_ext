@@ -12,14 +12,18 @@
 2. POST /app/fnmusic-ext/api/host-upgrade —— 一键升级的**安装动作**。
    WebUI 跑在容器里（uid 1000，既没有 root 也没有 appcenter-cli），自己装不了
    fpk；这里由宿主 root 代为执行 `appcenter-cli install-fpk`。
+3. POST /app/fnmusic-ext/api/host-publish —— 把已校验的 fpk **复制到「我的文件」**。
+   飞牛「手动安装」的文件选择器只浏览「我的文件」（实测根为 /vol1/<uid>/），
+   而容器只挂 /repo 与 /data、**看不到 /vol1**，自己放不进去，故由宿主代劳。
 
-这两个端点要求网关注入的 X-Trim-Isadmin: true。其余请求一律原样转发，不动字节。
+这三个端点要求网关注入的 X-Trim-Isadmin: true。其余请求一律原样转发，不动字节。
 """
 from __future__ import annotations
 
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -40,6 +44,7 @@ HOST_FILE_MAX_BODY = 1 << 20          # 请求体上限 1MB（只装一个路径
 HOST_FILE_MAX_BYTES = 9_000_000       # 与 lxmusic SCRIPT_MAX_BYTES 对齐
 
 HOST_UPGRADE_PATHS = ("/app/fnmusic-ext/api/host-upgrade", "/api/host-upgrade")
+HOST_PUBLISH_PATHS = ("/app/fnmusic-ext/api/host-publish", "/api/host-publish")
 HOST_UPGRADE_MAX_BODY = 1 << 16
 APPCENTER_CLI = "/usr/local/bin/appcenter-cli"
 # 只允许应用仓库的数据目录下那个升级子目录，挡住"任意路径喂给 install-fpk"。
@@ -51,6 +56,11 @@ UPGRADE_FPK_DIRS = (
 )
 UPGRADE_MAX_FPK_BYTES = 900 * 1024 * 1024
 APP_NAME = "fnmusic-ext"
+
+# 「手动安装」的文件选择器只浏览「我的文件」。实测其根为 /vol1/<uid>/：
+# admin(uid=1000) 即 /vol1/1000/，里面是 Photos / data / 各应用目录。
+# 目标目录固定写死，不接受调用方指定 —— 这是特权端点，不能让人指到任意路径。
+MY_FILES_ROOT = "/vol1/1000"
 
 # 容器把仓库挂在 /repo，本进程在宿主 —— 收到容器发来的路径要按前缀换算。
 CONTAINER_REPO_PREFIX = "/repo"
@@ -376,6 +386,106 @@ def _is_host_upgrade_request(head_raw: bytes) -> bool:
     return _is_post_to(head_raw, HOST_UPGRADE_PATHS)
 
 
+def handle_host_publish(client: socket.socket, headers: dict[str, str], head_raw: bytes) -> None:
+    """POST /api/host-publish：把已校验的 fpk 复制到「我的文件」目录。
+
+    【为什么需要这一步】飞牛「应用中心 → 手动安装」的文件选择器只浏览
+    「我的文件」（实测其根为 /vol1/<uid>/，admin 即 /vol1/1000/），而容器
+    只挂了 /repo 与 /data，**根本没有 /vol1**（实测 ls: No such file or
+    directory），无法自己把包放进那里。所以必须由宿主 root 代劳。
+
+    请求体：{"fpk": "/repo/sources-data/upgrade/fnmusic-ext-2.6.19.fpk"}
+    响应：  {"ok": true, "path": "/vol1/1000/fnmusic-ext-2.6.19.fpk"}
+
+    安全约束（这是特权入口，规矩与 host-upgrade 同级）：
+      - 必须是管理员；
+      - 源路径必须落在 UPGRADE_FPK_DIRS 之内（挡住任意路径读取）；
+      - 目标目录固定为该uid 的「我的文件」根，不接受调用方指定；
+      - 目标后缀必须 .fpk，体积不超过 900MB；
+      - 用 copy 而不是 move/rename —— 升级目录里的包要留着，
+        用户若选错版本还能重新选；只读源文件，不删。
+    """
+    try:
+        if headers.get("x-trim-isadmin", "").lower() != "true":
+            client.sendall(_json_response(403, {"ok": False, "error": "仅管理员可执行"}))
+            return
+        body = _read_full_body(client, headers, head_raw)
+        if body is None:
+            client.sendall(_json_response(400, {"ok": False, "error": "请求体无效"}))
+            return
+        try:
+            req = json.loads(body.decode("utf-8"))
+            fpk = str(req.get("fpk") or "")
+        except Exception:  # noqa: BLE001
+            client.sendall(_json_response(400, {"ok": False, "error": "请求体必须是 JSON"}))
+            return
+
+        # 容器发来的是容器视角（/repo/...），本进程在宿主，必须换算
+        fpk_host = fpk
+        if fpk.startswith(CONTAINER_REPO_PREFIX):
+            fpk_host = str(HOST_REPO_ROOT / fpk[len(CONTAINER_REPO_PREFIX):].lstrip("/"))
+
+        target_path = Path(fpk_host)
+        if not fpk_host.startswith("/") or ".." in target_path.parts:
+            client.sendall(_json_response(400, {"ok": False, "error": "路径必须是绝对路径且不含 .."}))
+            return
+        if str(target_path.parent) not in UPGRADE_FPK_DIRS:
+            client.sendall(_json_response(403, {
+                "ok": False, "error": f"源包必须位于 {UPGRADE_FPK_DIRS[0]}"}))
+            return
+        if target_path.suffix.lower() != ".fpk":
+            client.sendall(_json_response(400, {"ok": False, "error": "只接受 .fpk 安装包"}))
+            return
+        try:
+            size = target_path.stat().st_size
+        except OSError:
+            client.sendall(_json_response(404, {"ok": False, "error": f"安装包不存在: {fpk_host}"}))
+            return
+        if size <= 0 or size > UPGRADE_MAX_FPK_BYTES:
+            client.sendall(_json_response(400, {"ok": False, "error": f"安装包大小异常: {size} 字节"}))
+            return
+
+        # 目标固定为「我的文件」根下，不接受调用方指定 —— 避免被指到任意路径
+        dest_dir = Path(MY_FILES_ROOT)
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            client.sendall(_json_response(500, {"ok": False, "error": f"目标目录不可用: {exc}"}))
+            return
+        dest = dest_dir / target_path.name
+        try:
+            # 已是最新且大小一致则跳过，避免每次都重拷 428MB
+            if not (dest.exists() and dest.stat().st_size == size
+                    and dest.stat().st_mtime >= target_path.stat().st_mtime):
+                shutil.copy2(str(target_path), str(dest))
+                # copy2 会连权限位一起搬过来，而源包是 0600 root（升级目录
+                # 本来就是 root 私有）。落到「我的文件」后属主若仍是 root，
+                # 文件管理器里会显示成 root 的文件，且与同目录里admin 拥有
+                # 的其他文件不一致。按目标目录的属主纠正 —— 只是让文件在
+                # 「我的文件」里看起来正常，不放宽任何权限位。
+                owner = dest_dir.stat()
+                try:
+                    os.chown(str(dest), owner.st_uid, owner.st_gid)
+                except (OSError, AttributeError):
+                    pass
+        except OSError as exc:
+            client.sendall(_json_response(500, {"ok": False, "error": f"复制失败: {exc}"}))
+            return
+        client.sendall(_json_response(200, {
+            "ok": True, "path": str(dest), "size": size, "skipped": False}))
+    except OSError:
+        pass
+    finally:
+        try:
+            client.close()
+        except OSError:
+            pass
+
+
+def _is_host_publish_request(head_raw: bytes) -> bool:
+    return _is_post_to(head_raw, HOST_PUBLISH_PATHS)
+
+
 def _handle(client: socket.socket, upstream: tuple[str, int]) -> None:
     head = _read_request_head(client)
     if head is None:
@@ -387,6 +497,9 @@ def _handle(client: socket.socket, upstream: tuple[str, int]) -> None:
         return
     if _is_host_upgrade_request(head_raw):
         handle_host_upgrade(client, headers, head_raw)
+        return
+    if _is_host_publish_request(head_raw):
+        handle_host_publish(client, headers, head_raw)
         return
     try:
         remote = socket.create_connection(upstream, timeout=CONNECT_TIMEOUT)

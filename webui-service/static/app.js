@@ -817,19 +817,21 @@ function upgradeUI(stage, text, percent) {
       ? "下载完成，正在校验…"
       : "正在下载安装包，请勿关闭页面";
   } else if (stage === "ready") {
-    // 包已完整落在宿主目录。**路径必须原样显示**：后端下发的 host_dir/file_name
-    // 才是真实落盘位置，之前这里自己拼了个文件名，与实际落盘不一致，
-    // 用户照着指引找会找不到文件。改成直接用后端给的路径。
-    const dir = st.host_dir || "";
-    const fname = st.file_name || "";
+    // 包已完整落盘。**路径必须原样显示**：`published_path` 是宿主网关把它
+    // 复制到「我的文件」后的真实位置（手动安装的选择器只认那里）；
+    // 没复制成功时退回 host_dir/file_name，并说明包还在应用目录。
+    // 之前这里自己拼路径，拼出来的位置用户选不到，等于没说。
+    const shown = st.published_path || st.file_path
+      || [st.host_dir, st.file_name].filter(Boolean).join("/");
+    const inMyFiles = !!st.published_path;
     hint.innerHTML = `<div class="up-ready">${esc(text || "安装包已就位")}
-      <div class="up-ready-path">安装包位置：<code>${esc(dir ? dir + "/" + fname : fname)}</code></div>
+      <div class="up-ready-path">${inMyFiles ? "已放在「我的文件」" : "安装包位置"}：<code>${esc(shown)}</code></div>
       <ol>
         <li>打开飞牛「<b>应用中心</b>」→「我的应用」</li>
         <li>点右上角<b>「手动安装」</b>（需先在侧边栏底部开启该功能）</li>
-        <li>选择上面这个文件完成升级</li>
+        <li>在文件选择器里选中上面这个 <code>.fpk</code> 文件</li>
       </ol>
-      <div class="up-ready-tip">已通过官方 sha256 校验，可放心安装；用「文件」App 打开上面这个目录也能直接找到它。</div>
+      <div class="up-ready-tip">已通过官方 sha256 校验，可放心安装。${inMyFiles ? "「我的文件」App 里也能直接找到它。" : ""}</div>
     </div>`;
   } else if (stage === "failed") {
     hint.innerHTML = `<span style="color:var(--err)">下载失败：${esc(text || "未知错误")}</span>　可前往<a href="${esc(fallbackUrl())}" target="_blank" rel="noopener">发行页</a>手动下载`;
