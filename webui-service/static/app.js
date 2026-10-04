@@ -210,6 +210,66 @@ async function saveConfig() {
 }
 $("#save-btn").addEventListener("click", saveConfig);
 
+/* -------------------------------------------------------------- 大模型配置测试 */
+$("#llm-test").addEventListener("click", async () => {
+  const btn = $("#llm-test");
+  const box = $("#llm-report");
+  box.hidden = false;
+  box.className = "report";
+  box.textContent = "测试中（向接口发一次最小请求）…";
+  btn.disabled = true;
+  btn.textContent = "测试中…";
+  let r = null;
+  let fatal = "";
+  try {
+    r = await api("/api/llm/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        values: {
+          base_url: $("#llm-base").value.trim(),
+          api_key: $("#llm-key").value.trim(),
+          model: $("#llm-model").value.trim(),
+        },
+      }),
+    });
+  } catch (exc) {
+    fatal = exc.message || String(exc);
+  }
+  btn.disabled = false;
+  btn.textContent = "测试连接";
+
+  if (fatal) {
+    box.className = "report fail";
+    box.innerHTML = `<div class="kv"><b>结论</b>测试失败 ✗</div>` +
+      `<div class="kv"><b>原因</b>${esc(fatal)}</div>`;
+    return;
+  }
+  const echo = r.model_echo && r.model_echo !== r.model
+    ? `<div class="kv"><b>实际模型</b>${esc(r.model_echo)}（与填写不一致，服务端可能忽略了 model）</div>` : "";
+  if (r.ok) {
+    box.className = "report ok";
+    box.innerHTML =
+      `<div class="kv"><b>结论</b>配置正确 ✓ 保存后即可生效</div>` +
+      `<div class="kv"><b>接口</b>${esc(r.url)}</div>` +
+      `<div class="kv"><b>模型</b>${esc(r.model)}</div>` +
+      echo +
+      `<div class="kv"><b>耗时</b>${r.elapsed_ms} ms</div>` +
+      (r.reply ? `<div class="kv"><b>回应</b>${esc(r.reply)}</div>` : "");
+    return;
+  }
+  box.className = "report fail";
+  box.innerHTML =
+    `<div class="kv"><b>结论</b>配置不可用 ✗</div>` +
+    `<div class="kv"><b>接口</b>${esc(r.url)}</div>` +
+    `<div class="kv"><b>模型</b>${esc(r.model)}</div>` +
+    (r.status ? `<div class="kv"><b>状态</b>HTTP ${r.status}</div>`
+              : `<div class="kv"><b>阶段</b>连接${r.timeout_s ? `（超时上限 ${r.timeout_s}s）` : ""}</div>`) +
+    `<div class="kv"><b>耗时</b>${r.elapsed_ms} ms</div>` +
+    (r.message ? `<div class="kv"><b>返回</b>${esc(r.message)}</div>` : "") +
+    (r.hint ? `<div class="kv"><b>可能原因</b>${esc(r.hint)}</div>` : "");
+});
+
 /* -------------------------------------------------------------- 音源选择 */
 function savedProvider() {
   const v = configValues;

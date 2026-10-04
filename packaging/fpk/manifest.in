@@ -1,7 +1,7 @@
 appname               = fnmusic-ext
 version               = @VERSION@
 display_name          = fnMusic 音源扩展
-desc                  = 飞牛音乐第三方音源扩展：零侵入接管官方音乐入口，提供 musicdl 聚合、网易云、洛雪自定义源在线搜索播放，内置管理页（音源切换/扫码登录/平台选择/边听边存）。
+desc                  = 飞牛音乐第三方音源扩展：零侵入接管官方音乐入口，提供 musicdl 聚合、网易云、洛雪自定义源在线搜索播放，内置管理页（音源切换/扫码登录/平台选择/边听边存/大模型配置测试）。
 platform              = all
 source                = thirdparty
 maintainer            = javycoder

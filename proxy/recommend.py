@@ -824,7 +824,10 @@ async def call_llm(http_client: httpx.AsyncClient, prompt: str) -> list[dict]:
     payload = {
         "model": llm_model(),
         "temperature": 0.8,
-        "max_tokens": 4096,
+        # 8192：候选默认 36 首、每首 8 个中文字段，实测 36 首约需 5.1k tokens。
+        # 原 4096 会把长响应截断 → JSON 不完整 → parse 返回 [] → 整层白跑，
+        # 表现为「配了大模型但每日推荐仍没内容」。8192 对现代模型都是安全上限。
+        "max_tokens": 8192,
         "messages": [
             {"role": "system", "content": "你只输出合法 JSON 数组，不要 markdown。"},
             {"role": "user", "content": prompt},

@@ -971,6 +971,130 @@ async def api_lx_verify(body: ConfigBody, request: Request):
         raise HTTPException(status_code=502, detail=f"lxmusic 服务不可达: {exc}") from exc
 
 
+# 大模型连接测试：探测用固定 20s，允许跟随 .env 里的 FNMUSIC_LLM_TIMEOUT_S（5~60s，与
+# proxy/recommend.py 的 llm_timeout_s 同一口径），但绝不因测试而无限等。
+_LLM_TEST_TIMEOUT_S = 20.0
+
+# 上游 4xx/5xx 各状态的常见成因，直接给用户看，省得对着英文报错猜
+_LLM_STATUS_HINTS = {
+    400: "请求被拒绝：模型名可能不存在，或该模型不接受 messages 格式",
+    401: "鉴权失败：API Key 无效或已过期",
+    403: "无权限：Key 有效但无权访问该模型（常见于未开通或欠费）",
+    404: "接口不存在：Base URL 只填到 /v1 一级，/chat/completions 由程序自动补",
+    408: "网关超时",
+    413: "请求体过大",
+    422: "参数不被接受：多为模型名写错",
+    429: "限流或额度耗尽",
+    500: "服务端内部错误",
+    502: "网关错误：Base URL 可能指向了异常的反代后端",
+    503: "服务暂不可用",
+    504: "网关超时",
+}
+
+
+def _llm_test_timeout_s() -> float:
+    try:
+        raw = float(read_env().get("FNMUSIC_LLM_TIMEOUT_S", "") or _LLM_TEST_TIMEOUT_S)
+    except ValueError:
+        raw = _LLM_TEST_TIMEOUT_S
+    return min(60.0, max(5.0, raw))
+
+
+def _redact(text: str, secret: str) -> str:
+    """上游报错里可能回显 Authorization 的值，回显即泄漏，出网关前必须抹掉。"""
+    out = text or ""
+    if secret:
+        out = out.replace(secret, "***")
+        if len(secret) > 8:  # 部分中转只回显前缀
+            out = out.replace(secret[:8], "***")
+    return out[:400]
+
+
+@app.post("/api/llm/test")
+async def api_llm_test(body: ConfigBody, request: Request):
+    """用输入框当前值实测一次 /chat/completions（不写 .env），判断大模型配置是否正确。
+
+    字段留空则回落到已保存的 .env 值，便于「保存后想复验」和「只改一项试其他项」。
+    URL 拼接与鉴权方式同 proxy/recommend.py 的 call_llm()，保证测试通过即真实可用。
+    """
+    values = body.values or {}
+    saved = read_env()
+    base = (str(values.get("base_url") or "").strip().rstrip("/")
+            or saved.get("FNMUSIC_LLM_BASE_URL", "").strip().rstrip("/"))
+    key = (str(values.get("api_key") or "").strip()
+           or saved.get("FNMUSIC_LLM_API_KEY", "").strip())
+    model = (str(values.get("model") or "").strip()
+             or saved.get("FNMUSIC_LLM_MODEL", "").strip() or "gpt-4o-mini")
+    if not base:
+        raise HTTPException(status_code=400, detail="请先填写 Base URL")
+    if not base.lower().startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="Base URL 必须以 http:// 或 https:// 开头")
+    if not key:
+        raise HTTPException(status_code=400, detail="请先填写 API Key")
+    url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
+    timeout = _llm_test_timeout_s()
+    started = time.monotonic()
+
+    def elapsed_ms() -> int:
+        return int((time.monotonic() - started) * 1000)
+
+    client = get_http(request)
+    try:
+        resp = await client.post(
+            url,
+            json={
+                "model": model,
+                "temperature": 0,
+                "max_tokens": 1,  # 只验连通与鉴权，不烧用户额度
+                "messages": [{"role": "user", "content": "ping"}],
+            },
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            timeout=timeout,
+        )
+    except httpx.TimeoutException:
+        return {"ok": False, "stage": "connect", "url": url, "model": model,
+                "timeout_s": timeout, "elapsed_ms": elapsed_ms(),
+                "message": f"连接超时：{timeout:.0f}s 内没有响应"}
+    except httpx.HTTPError as exc:
+        return {"ok": False, "stage": "connect", "url": url, "model": model,
+                "timeout_s": timeout, "elapsed_ms": elapsed_ms(),
+                "message": _redact(f"无法连接（{type(exc).__name__}）：{exc}", key)}
+
+    status = resp.status_code
+    detail = ""
+    reply = ""
+    model_echo = ""
+    try:
+        payload = resp.json()
+    except Exception:  # noqa: BLE001 —— 非 JSON 响应体按纯文本处理
+        payload = None
+    if isinstance(payload, dict):
+        model_echo = str(payload.get("model") or "")
+        err = payload.get("error")
+        if isinstance(err, dict):
+            detail = str(err.get("message") or err.get("code") or "")
+        elif isinstance(err, str):
+            detail = err
+        if not detail:
+            choices = payload.get("choices") or []
+            if choices and isinstance(choices[0], dict):
+                reply = str((choices[0].get("message") or {}).get("content") or "")[:120]
+    if not detail:
+        detail = (resp.text or "").strip()
+    return {
+        "ok": status < 400,
+        "stage": "response",
+        "url": url,
+        "model": model,
+        "model_echo": model_echo,
+        "status": status,
+        "elapsed_ms": elapsed_ms(),
+        "reply": _redact(reply, key),
+        "message": _redact(detail, key),
+        "hint": _LLM_STATUS_HINTS.get(status, "" if status < 400 else f"HTTP {status}"),
+    }
+
+
 def _lx_script_limits(filename: str, script: str) -> None:
     if not (filename or "").strip().lower().endswith(".js"):
         raise HTTPException(status_code=400, detail="只支持 .js 后缀的洛雪源脚本文件")

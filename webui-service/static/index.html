@@ -200,6 +200,11 @@
           <label class="field"><span>Base URL</span><input class="input" id="llm-base" placeholder="https://api.example.com/v1"></label>
           <label class="field"><span>API Key</span><input class="input" id="llm-key" type="password" placeholder="sk-…"></label>
           <label class="field"><span>模型</span><input class="input" id="llm-model" placeholder="gpt-4o-mini"></label>
+          <div class="btn-row">
+            <button class="btn" id="llm-test">测试连接</button>
+            <span class="muted">按当前填写的值实测一次，不写入配置</span>
+          </div>
+          <div id="llm-report" class="report" hidden></div>
         </div>
       </section>
 
