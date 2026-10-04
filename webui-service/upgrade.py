@@ -121,24 +121,36 @@ ALLOWED_HOSTS = (
 )
 
 # GitHub 加速镜像前缀。key 是短名，value 是要拼在原始 URL 前的代理前缀。
-# ⚠️ 这是在【下载这一环】有意放开的边界：走第三方代理意味着包字节来自
-# 第三方服务器。安全性由两件事兜住，且都不因加速而放松：
-#   1) 校验值仍然只从官方 github.com 取（_fetch_expected_sha 不走代理），
-#      官方 .sha256 不变 → 代理返回的任何篡改字节都会在比对时暴露；
-#   2) 不匹配就删包中止（_do_upgrade），已下载的内容一律不安装。
+# ⚠️ 这是在【下载与取校验值】有意放开的边界：走第三方代理意味着字节来自
+# 第三方服务器。安全性由三件事兜住，且都不因加速而放松：
+#   1) 校验值优先只从官方 github.com 取，此时代理一个都不参与；
+#   2) 官方不可达时（实测国内直连常为 ConnectTimeout），要求 >= 2 个
+#      互不相关的代理返回同一哈希才采信 —— 一致性本身就是校验；
+#   3) 无论来源如何，最终都以该哈希比对整包，不匹配就删包中止。
 # 也就是说代理只能影响"快慢"，影响不了"装不装"。
-# 实测（2026-10-04，用户 NAS 上用 5.4MB online 包测 6 秒）：
-#   gh-proxy.com 3200 KB/s、ghfast.top 543 KB/s、直连 50 KB/s（其余 9 个不可用）
-# 顺序即优先级，测速后择优，不可用自动回落。
+#
+# 实测（2026-10-04 22:18，用户 NAS，5.4MB online 包，每源 6 秒，扫 24 个）：
+#   ghfast.top 990 KB/s、gh-proxy.com 446、ghproxy.imciel.com 163、
+#   gh.noki.icu 104、官方直连 19 KB/s；其余 19 个不可用
+#   （大量 ConnectTimeout/403/404/429）。
+# ⚠️ 速度波动极大：同一镜像 5 分钟前 ghfast 是 15 KB/s、gh-proxy 是 26 KB/s。
+# 所以下面的顺序不代表快慢，只代表「都试一遍」，由 _pick_download_url 择优。
 CDN_PREFIXES = (
-    ("gh-proxy", "https://gh-proxy.com/"),
     ("ghfast", "https://ghfast.top/"),
+    ("gh-proxy", "https://gh-proxy.com/"),
+    ("imciel", "https://ghproxy.imciel.com/"),
+    ("noki", "https://gh.noki.icu/"),
 )
 
 # 测速：每个候选最多试这么久、读这么多字节。够判快慢，又不至于拖慢启动。
-CDN_PROBE_SECONDS = 2.5
-CDN_PROBE_BYTES = 3 * 1024 * 1024
-# 低于这个速度就不如直连（直连实测 50 KB/s，留 2 倍余量）
+# 【为什么是 8 秒而不是 2.5】实测各源「首字节延迟」就有 1.2~2.8 秒，
+# 窗口太短则大半时间都在等首字节，几乎没读到数据，算出来是噪声：
+#   同一时刻实测 gh-proxy/官方直连的真实差距是 846 vs 31 KB/s（27 倍），
+#   但 2.5 秒窗口只能测出 97 vs 68（1.4 倍）→ 择优完全失效。
+# 5 秒能测出 9 倍差距，8 秒能测出 27 倍。取 8 秒。
+CDN_PROBE_SECONDS = 8.0
+# 低于这个速度就不如直连。直连实测在 19~88 KB/s 间波动，
+# 取 100 KB/s 作为「值得走代理」的门槛：低于它的代理不如老实直连。
 CDN_MIN_BYTES_PER_SEC = 100 * 1024
 
 _lock = asyncio.Lock()
@@ -202,8 +214,9 @@ def _sha256_file(path: Path) -> str:
 async def _pick_download_url(url: str) -> tuple[str, str]:
     """在官方 URL 与各CDN 镜像之间测速，返回 (实际下载 URL, 来源说明)。
 
-    直连国内通常只有几十 KB/s，428MB 要 2 小时以上；实测 gh-proxy.com 能到
-    3200 KB/s（快 64 倍）。所以先花几秒测一下谁快，用最快的那个下。
+    直连国内通常只有几十 KB/s甚至连不上（实测 19~88 KB/s，
+    428MB 要 3~6 小时）；好的镜像能到几百 KB/s 以上。所以先花几秒
+    并发测一下谁快，用最快的那个下。
 
     任何环节失败（网络不通、代理全挂、都不够快）都回落到官方 URL ——
     加速只是优化，不该成为下载失败的原因。返回的来源串会写进状态，
@@ -212,7 +225,12 @@ async def _pick_download_url(url: str) -> tuple[str, str]:
     official = url
 
     async def _probe(candidate: str) -> float:
-        """取候选前几秒的实际吞吐（字节/秒）。失败返回 0.0。"""
+        """取候选的实际吞吐（字节/秒）。失败返回 0.0。
+
+        纯按时间窗口收尾，不设「读满 N 字节就提前退出」：快的源几秒就
+        读满并提前停，网络正好在提速时会低估它；慢的源本来就读不满，
+        两种源用同一把尺子（同一个时间窗口）才可比。
+        """
         import httpx
 
         got = 0
@@ -226,7 +244,7 @@ async def _pick_download_url(url: str) -> tuple[str, str]:
                         return 0.0
                     async for chunk in resp.aiter_bytes(64 * 1024):
                         got += len(chunk)
-                        if got >= CDN_PROBE_BYTES or _now() - t0 > CDN_PROBE_SECONDS:
+                        if _now() - t0 > CDN_PROBE_SECONDS:
                             break
         except Exception:  # noqa: BLE001 — 测速失败就是不可用，不该中断下载
             return 0.0
@@ -237,7 +255,19 @@ async def _pick_download_url(url: str) -> tuple[str, str]:
     cands = [(official, "官方直连")] + [
         (pre + official, name) for name, pre in CDN_PREFIXES
     ]
-    speeds = await asyncio.gather(*[_probe(u) for u, _ in cands])
+    # gather 要等**最慢的**那个返回。实测最慢的镜像能拖到13.5 秒
+    # （8 秒窗口 + 缓冲读取），点一次按钮干等十几秒不可接受。
+    # 超时的源按 0.0（不可用）处理，不影响其余候选的择优。
+    try:
+        speeds = await asyncio.wait_for(
+            asyncio.gather(*[_probe(u) for u, _ in cands]),
+            timeout=CDN_PROBE_SECONDS + 4.0,
+        )
+    except asyncio.TimeoutError:
+        # 整体超时：按已完成的重新择优代价高，直接回落官方，
+        # 至少不会卡住用户（官方仍是可用的兜底路径）。
+        logger.info("CDN 测速整体超时，回落官方直连")
+        return official, "官方直连（镜像测速超时）"
     best_i = max(range(len(cands)), key=lambda i: speeds[i])
     if speeds[best_i] < CDN_MIN_BYTES_PER_SEC:
         return official, "官方直连（未找到更快的镜像）"
