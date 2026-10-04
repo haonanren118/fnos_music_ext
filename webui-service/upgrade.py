@@ -201,7 +201,9 @@ async def _fetch_expected_sha(url: str) -> str:
     """
     import httpx
 
-    timeout = httpx.Timeout(connect=15.0, read=30.0)
+    # 四个参数必须齐全：httpx 0.28 起httpx.Timeout() 不再接受部分参数，
+    # 只给 connect/read 会抛 ValueError，导致取校验值必失败（表现为「下载失败」）。
+    timeout = httpx.Timeout(connect=15.0, read=30.0, write=30.0, pool=15.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         r = await client.get(url)
     if r.status_code != 200:

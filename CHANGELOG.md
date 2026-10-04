@@ -23,6 +23,12 @@
 `call_llm()` 的 `max_tokens` 写死 4096，而 36 首候选的 JSON 实测约需 5119 tokens，必然超限。
 截断 → JSON 不完整 → 解析返回 `[]` → 整层白跑，**且不报任何错**。
 
+### 修复（版本页点「下载安装包」报 httpx.Timeout 错误）
+
+`upgrade.py` 取官方校验值时 `httpx.Timeout(connect=15.0, read=30.0)` 只给了两个参数，
+httpx 0.28 起不再接受，该行直接抛 `ValueError`，于是每次下载都失败。
+已补齐四个参数。
+
 ## [2.6.18] - 2026-10-03
 
 
