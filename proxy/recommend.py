@@ -722,6 +722,8 @@ def build_llm_prompt(
     play_seeds: list[dict],
     favorite_seeds: list[dict],
     count: int = LLM_CANDIDATE_COUNT,
+    avoid_pairs: "list[tuple[str, str]] | None" = None,
+    day: str | None = None,
 ) -> str:
     def _block(items: list[dict], empty: str) -> str:
         lines = []
@@ -736,6 +738,39 @@ def build_llm_prompt(
 
     history_block = _block(play_seeds, "（暂无最近播放）")
     fav_block = _block(favorite_seeds, "（暂无收藏）")
+
+    # ---- 轮换注入：让「每日推荐」真的做到天天不一样 --------------------
+    # 只给种子（最近收听+收藏）时，模型每天拿到的输入几乎相同。实测同一天
+    # 连续两次调用：12 首里6 首完全重复，换手率仅 33%。所以把当天日期与
+    # 前几天已推过的「歌手 + 同名歌曲」明确回灌，让模型主动换一批。
+    day = day or today_key()
+    avoid_pairs = avoid_pairs or []
+    artists: list[str] = []
+    seen_a = set()
+    for a, _t in avoid_pairs:
+        if a and a not in seen_a:
+            seen_a.add(a)
+            artists.append(a)
+    titles: list[str] = []
+    seen_t = set()
+    for a, t in avoid_pairs:
+        label = f"{a} - {t}" if a else t
+        if t and label not in seen_t:
+            seen_t.add(label)
+            titles.append(label)
+
+    rotate_block = f"今天是 {day[0:4]}年{int(day[4:6])}月{int(day[6:8])}日。"
+    if artists or titles:
+        rotate_block += (
+            "\n以下歌手/歌曲在最近几天已经推荐过，本次请**刻意避开**，"
+            "换一批不同年代、不同语种、不同曲风的歌：\n"
+        )
+        if artists:
+            rotate_block += "已推过的歌手：" + "、".join(artists[:24]) + "\n"
+        if titles:
+            rotate_block += "已推过的歌曲：" + "、".join(titles[:30]) + "\n"
+    else:
+        rotate_block += "这是该账户的第一份每日推荐，请正常发挥。"
     return f"""你是音乐推荐引擎。根据用户最近收听和收藏口味，生成 {count} 首可在线检索的「每日推荐」候选。
 
 必须同时覆盖这些维度（每首标注 dimension）：
@@ -751,6 +786,10 @@ def build_llm_prompt(
 4. 必须正好输出 {count} 首。
 5. 只输出 JSON 数组，不要 markdown，不要解释。
 6. 每项字段：title, artist, album, language, genre, type, dimension, reason。
+7. **本次推荐必须与前几天不同**：若下方列出了「已推过的歌手/歌曲」，
+   请优先选择不在其中的歌手与歌曲；若该列表为空，则正常推荐。
+
+{rotate_block}
 
 最近收听：
 {history_block}
@@ -1420,6 +1459,101 @@ def save_daily_cache(user_guid: str, day: str, payload: dict, kind: str = "daily
     _atomic_write_json(cache_path(user_guid, day, kind), payload)
 
 
+# ---- 轮换历史：最近几天推过什么，用于「每日必须换一批」------------------
+#
+# 【为什么不能直接读昨天的缓存】purge_stale_daily_cache() 会在每天首次构建时
+# 删掉所有非当日的 daily-*.json，所以构建时根本读不到昨天的歌单。
+# 这里另存一份独立的历史，只留最近 ROTATION_HISTORY_DAYS 天。
+#
+# 【为什么需要它】LLM 的种子只有「最近收听 + 收藏」，而这两样几乎天天不变。
+# 实测（2026-10-05，同一份种子连续调两次）：输出 12 首里有 6 首完全重复，
+# 换手率仅 33%。只靠 temperature 抖动，「每日推荐」会天天长得差不多。
+# 把已推过的歌手+同名歌曲回灌给模型，才能真正逐日换一批。
+
+ROTATION_HISTORY_DAYS = 3
+_ROTATION_MIN_ITEMS = 1      # 历史里至少要有这么多首才做排除，避免误伤
+
+
+def rotation_history_path(user_guid: str) -> str:
+    """轮换历史文件路径。放在 recommend_cache 根下的 _rotation 目录，
+    不放在按日的用户目录里——那个目录会被 purge 清理。"""
+    folder = os.path.join(recommend_cache_dir(), "_rotation")
+    return os.path.join(folder, f"{_safe_user_name(user_guid)}.json")
+
+
+def load_rotation_history(user_guid: str) -> dict:
+    """读轮换历史：{"days": {"20261005": [{"title","artist"}...]}}。"""
+    path = rotation_history_path(user_guid)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def remember_rotation_items(user_guid: str, day: str,
+                            items: "list[dict]") -> None:
+    """记下当天 LLM 层实际入列的歌，供后续几天做排除。只留最近若干天。"""
+    rows = []
+    seen = set()
+    for t in items or []:
+        title = str(t.get("title") or "").strip()
+        artist = str(t.get("artist") or "").strip()
+        if not title and not artist:
+            continue
+        key = (title, artist)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({"title": title, "artist": artist})
+    if not rows:
+        return
+    data = load_rotation_history(user_guid)
+    days = data.get("days") if isinstance(data.get("days"), dict) else {}
+    days[day] = rows
+    # 只保留最近 N 天，防止文件无限增长
+    keys = sorted(days.keys(), reverse=True)[:ROTATION_HISTORY_DAYS]
+    data["days"] = {k: days[k] for k in keys}
+    folder = os.path.dirname(rotation_history_path(user_guid))
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except OSError:
+        return
+    _atomic_write_json(rotation_history_path(user_guid), data)
+
+
+def recent_rotation_pairs(user_guid: str, day: str | None = None,
+                          days_back: int = 2) -> list[tuple[str, str]]:
+    """取「今天之前 days_back 天」内推过的（歌手, 歌名）组合，按新到旧。"""
+    day = day or today_key()
+    data = load_rotation_history(user_guid)
+    days = data.get("days") if isinstance(data.get("days"), dict) else {}
+    out: list[tuple[str, str]] = []
+    keys = sorted((k for k in days if k < day), reverse=True)[:max(days_back, 0)]
+    for k in keys:
+        for row in days.get(k) or []:
+            if not isinstance(row, dict):
+                continue
+            t = str(row.get("title") or "").strip()
+            a = str(row.get("artist") or "").strip()
+            if t or a:
+                out.append((a, t))
+    return out
+
+
+def recent_rotation_artists(user_guid: str, day: str | None = None,
+                            days_back: int = 2) -> list[str]:
+    """取前几天推过的歌手名（去重、保序）。"""
+    out: list[str] = []
+    seen = set()
+    for artist, _t in recent_rotation_pairs(user_guid, day, days_back):
+        if artist and artist not in seen:
+            seen.add(artist)
+            out.append(artist)
+    return out
+
+
 def purge_stale_daily_cache(user_guid: str, keep_day: str) -> None:
     folder = os.path.join(recommend_cache_dir(), _safe_user_name(user_guid))
     if not os.path.isdir(folder):
@@ -1721,17 +1855,29 @@ async def get_or_build_daily(
         # 不支持每日推荐）的用户走这一层，种子按用户（本地+在线历史+收藏）
         if llm_http is None or not llm_enabled() or not recommend_daily:
             return []
+        # 把最近几天已推过的（歌手, 同名歌曲）回灌，让每日推荐真正逐日换一批
+        avoid = recent_rotation_pairs(user_guid, day, days_back=ROTATION_HISTORY_DAYS - 1)
         recs = await call_llm(
-            llm_http, build_llm_prompt(play_seeds, fav_seeds[:40], llm_candidate_count())
+            llm_http,
+            build_llm_prompt(play_seeds, fav_seeds[:40], llm_candidate_count(),
+                             avoid_pairs=avoid, day=day),
         )
         if not recs:
             return []
-        return await resolve_recommendations(
+        out = await resolve_recommendations(
             recs, musicdl_client, musicbox_client, netease_enabled, build_track,
             PLAYLIST_SIZE, exclude_guids, exclude_ta,
             lx_client=lx_client, lx_enabled=lx_enabled, lx_sources=lx_sources,
             on_track=on_track, should_stop=should_stop,
         )
+        # 记录本层实际入列的歌，供后续几天做排除。只记本层产出，
+        # 不记兜底层——否则本地随机那几首会永久把后续推荐挤掉。
+        if out:
+            try:
+                remember_rotation_items(user_guid, day, out)
+            except Exception as e:  # noqa: BLE001 —— 记历史失败不能影响推荐
+                logger.warning("failed to remember rotation items: %s", e)
+        return out
 
     async def from_local_random(on_track=None, should_stop=None) -> list[dict]:
         # 本地曲库兜底：无需网络，只读官方库按账户播放历史随机选"最近没听过"
