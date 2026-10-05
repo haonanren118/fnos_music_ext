@@ -2975,6 +2975,21 @@ async def _lyric_orphan_sweeper() -> None:
 
 @asynccontextmanager
 async def lifespan(fastapi_app: FastAPI):
+    # 【必须先加载 .env 再打印配置】CONF 全部由 os.environ 求值，而 .env 的值
+    # 只有 apply_env_hot_reload() 才会写进 os.environ —— 它原先唯一的调用点在
+    # _env_watch_loop() 里，**且仅当 .env 文件发生变化时才调**。
+    # 后果：容器启动时若 .env 尚不存在（装应用时它才被创建），watch loop 会一直
+    # 等到文件出现才加载，于是整个进程生命周期内 os.environ 都是空的：
+    # 大模型三键拿不到 -> llm_enabled() 恒为 False -> 每日推荐跳过 LLM 层，
+    # 直接落到 local-random（表现为「配了大模型，歌还是前几天的」）。
+    # 启动时主动加载一次，三个症状一起消失。
+    try:
+        _loaded = apply_env_hot_reload()
+        if _loaded:
+            logger.info("启动时已加载 .env: %s", ",".join(sorted(_loaded)))
+    except Exception as exc:  # noqa: BLE001 —— 加载失败不能挡住启动
+        logger.warning("启动时加载 .env 失败（配置将用默认值）: %s", exc)
+
     logger.info("=== fnmusic-ext v%s configuration ===", get_version())
     for k, v in CONF.items():
         logger.info("  %s = %s", k, _conf_log_value(k, v))
