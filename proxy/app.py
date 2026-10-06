@@ -516,6 +516,19 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_RECOMMEND_VERIFY_TIMEOUT_S": ("", "str"),
     "FNMUSIC_REC_SEARCH_CONCURRENCY": ("", "str"),
     "FNMUSIC_REC_SEARCH_INTERVAL": ("", "str"),
+    # 【2026-10-06 补】把在线音源的搜索结果并入「搜索建议」。
+    # 必须在白名单里 —— 不在的话 apply_env_hot_reload() 会跳过它，
+    # .env 里写什么都没用（实测：.env 写了 true、解析也对，
+    # 但重启后 CONF['merge_suggest'] 仍是 False）。
+    # 背景：电脑端（浏览器）只调 search/suggest，从不调 search/track；
+    # 而 suggest 的合并逻辑整段包在 if not CONF["merge_suggest"] 里，
+    # 默认 false 时只转发上游、不补数据，于是电脑端永远「无搜索结果」。
+    "FNMUSIC_MERGE_SUGGEST": ("merge_suggest", "bool"),
+    # 洛雪源检索取多少条。默认 30 —— 实测原唱常排在第 6~48 位，
+    # 取 5 条会永远匹配到翻唱账号（用户看到一堆陌生歌手）。
+    "FNMUSIC_REC_LX_LIMIT": ("", "str"),
+    # 默认 false —— 不允许用本地曲库随机补齐每日推荐（用户要求「不要有兜底」）
+    "FNMUSIC_RECOMMEND_ALLOW_FALLBACK": ("", "str"),
 }
 _ENV_WATCH_INTERVAL_S = 2.0
 _ENV_WATCH_DEBOUNCE_S = 0.5
@@ -3394,9 +3407,20 @@ async def search_suggest(request: Request):
     headers = copy_incoming_headers(request)
 
     musicdl_task: asyncio.Task | None = None
+    lx_task: asyncio.Task | None = None
     suggest_scope = _FETCH_SCOPE.set(_credential_scope(request) + ":suggest")
     if keyword and CONF.get("musicdl_enabled"):
         musicdl_task = asyncio.create_task(fetch_musicdl_search(musicdl_client, keyword, 5))
+    # 【2026-10-06 新增】洛雪源也要接进 suggest。
+    # 实测用户搜「张学友」返回「无搜索结果」：客户端只调search/suggest
+    # 拿候选列表，**从没调过 search/track**（20 分钟日志里 suggest 19 次、
+    # track 0 次）。而原实现只在 musicdl_enabled 时补数据，而它是 false ——
+    # 于是建议列表恒为空，客户端就此判定「搜不到」，不会再去请求真正的搜索。
+    # 洛雪源实测能搜到（搜「张学友」返回 60 条），只是从来没被接进来。
+    if keyword and CONF.get("lx_enabled"):
+        lx_task = asyncio.create_task(
+            fetch_lx_search(get_lx_client(request.app), keyword,
+                             CONF["lx_search_limit"]))
     _FETCH_SCOPE.reset(suggest_scope)
 
     req = upstream_client.build_request("GET", url_path, headers=headers)
@@ -3406,6 +3430,8 @@ async def search_suggest(request: Request):
     if upstream_resp.status_code != 200:
         if musicdl_task:
             musicdl_task.cancel()
+        if lx_task:
+            lx_task.cancel()
         return Response(
             content=upstream_resp.content,
             status_code=upstream_resp.status_code,
@@ -3418,6 +3444,8 @@ async def search_suggest(request: Request):
     except Exception:
         if musicdl_task:
             musicdl_task.cancel()
+        if lx_task:
+            lx_task.cancel()
         return Response(
             content=upstream_resp.content,
             status_code=upstream_resp.status_code,
@@ -3428,6 +3456,8 @@ async def search_suggest(request: Request):
     if not isinstance(upstream_json, dict) or upstream_json.get("code") != 0:
         if musicdl_task:
             musicdl_task.cancel()
+        if lx_task:
+            lx_task.cancel()
         return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
 
     musicdl_data = None
@@ -3437,6 +3467,29 @@ async def search_suggest(request: Request):
         except Exception as e:
             logger.warning("Suggest musicdl error: %s", e)
             musicdl_task.cancel()
+
+    # 洛雪源结果取标题补进候选列表。**只放标题字符串**，与 musicdl 分支
+    # 保持一致 —— suggest 的 data 是「候选关键词」数组，不是曲目对象。
+    if lx_task:
+        try:
+            lx_rows = await asyncio.wait_for(asyncio.shield(lx_task), timeout=10.0)
+            data_field = upstream_json.get("data")
+            if isinstance(data_field, list):
+                for item in (lx_rows or [])[:8]:
+                    title = item.get("title") if isinstance(item, dict) else None
+                    if title and title not in data_field:
+                        data_field.append(title)
+                # 候选太窄时补歌手名 —— 用户搜「张学友」这类「按人搜」时，
+                # 洛雪源返回的多是「XX演唱会」这类专辑条目，补上歌手名
+                # 能让候选里有「张学友」本身，客户端才有东西可发。
+                if len(data_field) < 5:
+                    for item in (lx_rows or [])[:8]:
+                        art = item.get("artist") if isinstance(item, dict) else None
+                        if art and art not in data_field:
+                            data_field.append(art)
+        except Exception as e:
+            logger.warning("Suggest lx error: %s", e)
+            lx_task.cancel()
 
     data_field = upstream_json.get("data")
     if isinstance(data_field, list) and isinstance(musicdl_data, dict) and musicdl_data.get("items"):

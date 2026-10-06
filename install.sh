@@ -976,6 +976,29 @@ ENV_DESIRED="$(mktemp)"
         echo "FNMUSIC_LLM_MODEL=''"
     fi
     # 其余情况不输出 LLM 键：env_merge 将原样保留 .env 中已保存的密钥
+    # 默认false —— 不允许用本地曲库随机补齐每日推荐（用户要「不要有兜底」）
+    echo "FNMUSIC_RECOMMEND_ALLOW_FALLBACK='false'"
+
+    # ── 每日推荐的正确性配置（2.6.20 实测后固定）────────────────────
+    # 【检索并发必须为 1，改动需慎重】洛雪源 /api/v1/search 存在并发缺陷：
+    # 并发请求会**静默返回空列表**（HTTP 200、body 合法、items 就是 []），
+    # 应用侧完全看不出异常。在源健康状态下复测（排除进程卡死的干扰）：
+    #   串行逐个请求：11~15 条/次，0.33~0.54s
+    #   并发 2：      7/8 次返回 0 条（只有最后完成的成功）
+    #   8 个齐发：    7/8 次返回 0 条
+    # 表现为每日推荐只有 2~3 首来自大模型，其余靠本地随机兜底。
+    echo "FNMUSIC_REC_SEARCH_CONCURRENCY='1'"
+    # 把在线音源结果并入「搜索建议」—— 电脑端（浏览器）只调 search/suggest、
+    # 从不调 search/track，候选为空就会显示「无搜索结果」
+    echo "FNMUSIC_MERGE_SUGGEST='true'"
+    # 大模型生成 24 首候选在默认 20 秒超时内生成不完（httpx.ReadTimeout），
+    # 表现为 LLM 层产出为空、每日推荐静默降级到本地随机
+    echo "FNMUSIC_LLM_TIMEOUT_S='60'"
+    echo "FNMUSIC_RECOMMEND_CANDIDATES='20'"
+    # 整体构建预算（秒）。默认 40 是全局总预算（LLM 生成 + 逐首检索 +
+    # 逐首可播校验共用），而 LLM 生成就吃掉 20~30 秒，剩下的不够走完候选。
+    echo "FNMUSIC_RECOMMEND_BUDGET_S='150'"
+
     echo "FNMUSIC_VERSION='${FNMUSIC_VERSION}'"
 } > "${ENV_DESIRED}"
 

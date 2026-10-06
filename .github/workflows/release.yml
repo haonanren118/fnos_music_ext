@@ -85,12 +85,26 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           ver="${GITHUB_REF_NAME#v}"
           online_fpk="dist/fnmusic-ext-${ver}-online.fpk"
           title="fnmusic-ext ${ver}"
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release edit "${GITHUB_REF_NAME}" --draft=false --title "$title" --notes-file /tmp/release-notes-final.md
-            gh release upload "${GITHUB_REF_NAME}" "$online_fpk" "${online_fpk}.sha256" --clobber
+            # 同 tag 重跑 == 同一版本内重发。已发布的资产是用户**已经拿走**的文件，
+            # 原地顶掉会让「文件名下的内容」与用户手里的记录对不上，且无法回滚
+            # （旧版是唯一的退路）。所以这里只补传缺失的资产：已有的一律跳过，
+            # 绝不覆盖；发行说明也已发布，同样不改。
+            existing="$(gh release view "${GITHUB_REF_NAME}" --json assets --jq '.assets[].name')"
+            for f in "${online_fpk}" "${online_fpk}.sha256"; do
+              name="$(basename "${f}")"
+              if printf '%s\n' "${existing}" | grep -qxF "${name}"; then
+                echo "[github] ${name} 已存在，按纪律不覆盖，跳过"
+              else
+                echo "[github] ${name} 缺失，补传"
+                gh release upload "${GITHUB_REF_NAME}" "$f"
+              fi
+            done
+            echo "[github] 本次未覆盖任何已发布资产，发行说明亦未改动。"
           else
             gh release create "${GITHUB_REF_NAME}" \
               --title "$title" \
@@ -137,16 +151,14 @@ jobs:
             cat /tmp/gitee-release.json >&2 || true
             exit 1
           fi
+          release_created=0
           if [ -n "${release_id}" ]; then
-            # 重发时仅清理 CI 自己的「在线版」旧附件（不动离线版与 gitee 自动源码包）；
-            # by-tag 响应的 assets 不带附件 id，需走附件列表接口
-            curl -sSf -o /tmp/gitee-att-list.json \
-              "${api}/releases/${release_id}/attach_files?access_token=${GITEE_TOKEN}"
-            for attach_id in $(jq -r --arg fpk "fnmusic-ext-${ver}-online.fpk" --arg sum "fnmusic-ext-${ver}-online.fpk.sha256" \
-                '.[]? | select(.name == $fpk or .name == $sum) | .id' /tmp/gitee-att-list.json); do
-              curl -sS -o /dev/null -X DELETE \
-                "${api}/releases/${release_id}/attach_files/${attach_id}?access_token=${GITEE_TOKEN}" || true
-            done
+            # 同 tag 重跑 == 同一版本内重发。已发布的附件是用户**已经拿走**的文件，
+            # 删掉再传会让已下载的用户手里的链接失效，且删除不可逆、无法回滚。
+            # 改为只补传缺失的附件：已存在的一律跳过，绝不删除、绝不覆盖。
+            # 附件列表在下面统一查（by-tag 响应的 assets 不带附件 id，
+            # 需走附件列表接口拿名字），这里只标记「不是新建的」。
+            echo "[gitee] 发行版已存在（${release_id}），将只补传缺失的附件，不触碰已有附件"
           else
             # 创建：gitee 要求 target_commitish 必传（tag 已存在时仅作落点声明）
             create_http="$(curl -sS -o /tmp/gitee-create.json -w '%{http_code}' "${api}/releases" \
@@ -161,12 +173,46 @@ jobs:
               exit 1
             fi
             release_id="$(jq -r '.id' /tmp/gitee-create.json)"
+            release_created=1
           fi
 
-          # 上传「在线版」fpk + sha256，收集下载链接（实测返回单对象 browser_download_url，
+          # 上传「在线版」fpk + sha256，收集下载链接（实测返回单对象browser_download_url，
           # 保留数组/对象兼容解析以防变动）
+          #
+          # 【为什么要先查重名】同 tag 重跑时，若不管不顾地再传一遍，要么平台报错，
+          # 要么产生同名重复附件让用户下到不确定哪一份。而重传本身毫无意义：
+          # 已下载过的用户手里那份不会因此改变，新下载的人拿到的内容也一样。
+          # 正确做法是跳过已存在的，只补真正缺的。
+          #
+          # 【必须用显式标记，不能靠「文件是否存在」判断】同一 runner 上可能残留
+          # 上一次跑留下的 gitee-att-list.json。若用 `[ -f ... ]` 判断，新建发行版的
+          # 分支里会误读那份残留，把本次要传的附件全判成「已存在」而跳过 ——
+          # 发行版建好了却一个附件都没有。只有「本次真的查过列表」才允许跳过。
+          fetched_list=0
+          if [ -n "${release_id}" ] && [ "${release_created}" != 1 ]; then
+            curl -sSf -o /tmp/gitee-att-list.json \
+              "${api}/releases/${release_id}/attach_files?access_token=${GITEE_TOKEN}"
+            fetched_list=1
+          fi
+          if [ "${fetched_list}" = 1 ]; then
+            jq -r '.[].name' /tmp/gitee-att-list.json | sort -u > /tmp/gitee-existing.txt
+          else
+            : > /tmp/gitee-existing.txt          # 新建发行版：附件列表为空
+          fi
           attach_links=""
           for f in "${online_fpk}" "${online_fpk}.sha256"; do
+            name="$(basename "${f}")"
+            if grep -qxF "${name}" /tmp/gitee-existing.txt; then
+              echo "[gitee] ${name} 已存在，按纪律不覆盖，跳过"
+              # 跳过的也要在说明里给出链接，否则用户看不到已有附件的下载地址
+              old_url="$(jq -r --arg n "${name}" \
+                '(.[]? | select(.name == $n) | .browser_download_url) // empty' \
+                /tmp/gitee-att-list.json 2>/dev/null | head -n1)"
+              if [ -n "${old_url}" ]; then
+                attach_links="${attach_links}- [${name}](${old_url})"$'\n'
+              fi
+              continue
+            fi
             att_http="$(curl -sS -o /tmp/gitee-att-one.json -w '%{http_code}' \
               "${api}/releases/${release_id}/attach_files" \
               -F "access_token=${GITEE_TOKEN}" \
@@ -181,7 +227,8 @@ jobs:
               echo "ERROR: Gitee 附件上传后未解析到下载 URL（响应形态可能变了）" >&2
               exit 1
             fi
-            attach_links="${attach_links}- [$(basename "${f}")](${url})"$'\n'
+            echo "[gitee] ${name} 缺失，补传"
+            attach_links="${attach_links}- [${name}](${url})"$'\n'
           done
 
           # 更新说明 = changelog + 安装包说明 + 附件下载链接；PATCH 必须重传 tag_name 与 name

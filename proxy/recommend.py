@@ -62,6 +62,13 @@ BUILD_BUDGET_S = _env_float("FNMUSIC_RECOMMEND_BUDGET_S", 40.0, 10.0, 180.0)
 # local-random 层候选池读取量：排除集（最近播放/收藏）在 SQL 后过滤，
 # 池子放大几倍避免排除后不足 20 首；本地曲库本身很小时按库存返回
 LOCAL_RANDOM_POOL = 200
+# 是否允许用本地曲库随机补齐（issue: 用户明确要求「不要有兜底」）。
+# 【为什么默认关】本地随机会把用户**早就听过、且不是大模型推的歌**塞进
+# 每日推荐——实测一轮里20 首有 6 首是这种，且集中在刀郎/刘德华那几首老歌上，
+# 用户看到的就是「又是前几天的歌」。宁可歌单短一点，也不要掺旧歌。
+# 保留开关是为了可回退：把 .env 里这个键设成 true 即恢复原行为。
+ALLOW_LOCAL_FALLBACK = (os.environ.get("FNMUSIC_RECOMMEND_ALLOW_FALLBACK", "false")
+                        .strip().lower() in ("true", "1", "yes"))
 # issue #23：推荐曲目逐首可播校验（解析直链 + 头部探活），默认开
 VERIFY_PLAYABLE = (os.environ.get("FNMUSIC_RECOMMEND_VERIFY_PLAYABLE", "true").strip().lower()
                    in ("true", "1", "yes"))
@@ -94,6 +101,15 @@ def verify_playable_enabled() -> bool:
             in ("true", "1", "yes"))
 
 
+def local_fallback_enabled() -> bool:
+    """是否允许用本地曲库随机补齐每日推荐（默认不允许）。
+
+    运行期读 env，改 .env 即时生效、无需重启 —— 与本模块其他可配项一致。
+    """
+    return (os.environ.get("FNMUSIC_RECOMMEND_ALLOW_FALLBACK", "false").strip().lower()
+            in ("true", "1", "yes"))
+
+
 def verify_timeout_s() -> float:
     return _env_float("FNMUSIC_RECOMMEND_VERIFY_TIMEOUT_S", VERIFY_TIMEOUT_S, 2.0, 20.0)
 
@@ -101,6 +117,8 @@ def verify_timeout_s() -> float:
 def search_concurrency() -> int:
     # issue #29 反馈者实测的参数：同样放开为运行期读取，.env 热重载立即生效
     return _env_int("FNMUSIC_REC_SEARCH_CONCURRENCY", RECOMMEND_SEARCH_CONCURRENCY, 1, 6)
+
+
 
 
 def search_interval_s() -> float:
@@ -760,24 +778,29 @@ def build_llm_prompt(
             titles.append(label)
 
     rotate_block = f"今天是 {day[0:4]}年{int(day[4:6])}月{int(day[6:8])}日。"
-    if artists or titles:
+    if titles:
+        # 【重要，2026-10-06】只给「已推过的**歌名**」，**不给歌手**。
+        # 之前连歌手一起回避，实测反而更糟：用户的播放历史几乎全是刀郎/周杰伦，
+        # 让模型「避开刀郎」后，它去找「不是刀郎的刀郎歌」——于是推了《西海情歌》，
+        # 而洛雪源这首歌只有翻唱账号（莹小仙/秋宝/疯狂十一…共 16 个都是翻唱，
+        # 刀郎本人排在靠后），结果歌单里出现「秋宝 - 西海情歌」：
+        # **歌还是那首老歌，只是换了翻唱歌手**，用户听到的仍是「音乐库里全是那几首」。
+        # 正确做法：只避开已推过的**具体歌名**，歌手照常推 —— 这样 LLM 会去找
+        # 刀郎的**其他**歌，而那些歌洛雪源是有原唱的（实测搜「刀郎 西海情歌」
+        # 能拿到刀郎本人）。
         rotate_block += (
-            "\n以下歌手/歌曲在最近几天已经推荐过，本次请**刻意避开**它们，"
-            "换一批别的歌：\n"
+            "\n以下**歌曲**在最近几天已经推荐过，本次请不要重复推它们，"
+            "换同风格的其他歌：\n"
+            "已推过的歌曲：" + "、".join(titles[:30]) + "\n"
         )
-        if artists:
-            rotate_block += "已推过的歌手：" + "、".join(artists[:24]) + "\n"
-        if titles:
-            rotate_block += "已推过的歌曲：" + "、".join(titles[:30]) + "\n"
-        # 【踩坑，务必保留这句】换歌 ≠ 换语种。实测（2026-10-05）这里若写
-        # 「换一批不同年代、不同**语种**、不同曲风的歌」，模型会理解成
-        # 「推荐时要换语种」，于是给中文用户推 Billie Eilish / Ed Sheeran /
-        # Selena Gomez 等英文歌 —— 这些在洛雪源(kg/kw/tx/wy/mg)检索后几乎
-        # 全部落空，23 首候选只剩 1 首可用，歌单又退化成12 首本地随机。
-        # 所以必须显式锁定：语种与年代都要跟随用户口味，只在「同口味内换歌」。
         rotate_block += (
-            "注意：只换歌，不换语种、不换年代 —— 语种与年代必须和下面「最近收听 / 收藏」"
-            "保持一致；换的是具体歌手与具体歌曲。\n"
+            "注意：\n"
+            "1) 只换歌，不换语种、不换年代 —— 语种与年代必须和下面「最近收听 / 收藏」"
+            "保持一致。\n"
+            "2) **歌手不受限制**，请正常推荐你喜欢范围内的歌手（同一个歌手的"
+            "其他歌曲完全可以推）。要避开的是上面列出的**那些具体歌名**。\n"
+            "3) 必须推荐**原唱/正式版本**的歌，不要翻唱、改编、DJ 混音或伴奏版；"
+            "若不确定某首歌的原唱是谁，就换一首你有把握的。\n"
         )
     else:
         rotate_block += "这是该账户的第一份每日推荐，请正常发挥。"
@@ -1046,7 +1069,132 @@ async def fetch_lx_charts(client: httpx.AsyncClient, limit: int, sources: "list[
     return out
 
 
+# 推荐曲目里应当降权的版本后缀（DJ 版/伴奏/现场/翻唱等）。
+# 【为什么必须降权】实测（2026-10-05）：洛雪源对同一首歌返回的 67 条结果里，
+# DJ/伴奏/现场类占 47%。而 _match_score 原先只看歌名/歌手是否匹配，
+# 对这些后缀**完全没有区分** —— 于是「冲动的惩罚 (DJ版片段)」与原版同分，
+# 经常被优先选中。
+#
+# 【踩坑，务必保留】第一版把这些词直接做成裸子串匹配，结果误伤大量正常歌名：
+#   「经」→ 误伤《经过》《已经》《东经西经》
+#   「mv」→ 误伤《青春MV》
+# 且漏判《告白气球 (Live)》《菩提劝我莫回头》《忏悔文》。
+# 现在只认两种形态：① 括号内出现的标记词；② 精确的版本描述短语。
+_BAD_VERSION_TOKENS = (
+    "dj", "伴奏", "片段", "ktv", "现场", "翻唱", "翻奏", "remix", "cover",
+    "钢琴版", "吉他版", "人声版", "铃声版", "纯音乐", "萨克斯", "二胡版",
+    "古筝版", "箫版", "唢呐版", "有声书", "速览", "highlights",
+    "live", "伴奏版", "独奏版", "演奏版", " MTV",
+)
+
+# 翻唱/网络账号型「歌手」标记。实测洛雪源对同一首歌会返回十几个歌手，
+# 绝大多数是这类账号（歌名干净，标记只在歌手名上）。
+# 例：《西海情歌》→ 莹小仙/ 秋宝 / 疯狂十一 / 潘德林 / 村長&stick.k / 连发儿 …共 16 个。
+# 这些不是原唱，用户听不出来但歌还是老歌 —— 实测因为轮换提示让模型回避刀郎，
+# 模型改推《西海情歌》，结果入列的是「秋宝 - 西海情歌」，等于白推。
+# 【踩坑，务必保留】这些词只能拦住「明确标记」的翻唱账号
+# （DJ阿驴、好听音乐（车载U盘）之类）。**纯昵称型的翻唱账号拦不住**：
+# 实测《西海情歌》返回的 16 个歌手里，秋宝 / 莹小仙 / 疯狂十一 / 潘德林 /
+# 连发儿 / 99_秋 / 半吨兄弟 全是纯昵称，既不含关键词，verified /
+# completeness / pay_type 三个字段也与原唱完全相同 —— **没有任何可靠信号**
+# 可用来区分。所以真正的防线在 prompt 侧：让模型只推「有把握的原唱」。
+# 这里的表只作为能拦的那部分兜底。
+_COVER_ARTIST_TOKENS = (
+    "dj", "伴奏", "电台", "版主", "音乐盒", "车载", "u盘",
+    "翻唱", "cover", "模仿", "翻录", "录音", "精选", "必听",
+)
+
+# 【不按题材过滤，只按「版本」过滤】
+# 曾经把佛歌/宗教类也列进黑名单，理由是实测一轮里 LLM 推「刀郎」的歌，
+# 结果混进《般若波罗蜜多心经》《普门颂》等 5 首佛歌。但这是**归因错了**：
+# 真正的问题是这些歌的**歌手都对不上**（刀郎的歌却返回齐豫、白纸箱子），
+# 是歌手匹配太松，而不是「佛歌不该出现」。用户也明确要求保留佛歌
+# （有人爱听）。所以宗教类一律**不过滤**，只保留版本类过滤。
+
+
+def _version_markers(title: str) -> str:
+    """取出歌名里括号内的标记文本（小写）。没有括号时返回空串。
+
+    洛雪源的版本信息一律放在括号里：`告白气球 (Live)`、`冲动的惩罚 (DJ版片段)`、
+    `平凡之路 (DJ 阿树版)`。只看括号内容，就能把「青春MV」「已经」这类
+    正常歌名排除在外 —— 它们不带括号标记。
+    """
+    out = []
+    for m in re.finditer(r"[（(\[【]([^）)\]】]*)[）)\]】]", title or ""):
+        out.append(m.group(1).lower())
+    return " ".join(out)
+
+
+def _song_key(title: str) -> str:
+    """歌名归一化：把同一首歌的各种写法收敛成同一个键，用于跨天去重。
+
+    【为什么必须归一化，2026-10-06 实测】用户抱怨「每天还是同样的歌」，
+    查轮换历史发现同一天的歌名就在重复：
+        10-05「甲乙丙丁」      / 10-06「甲乙丙丁(再版)」
+        10-05「月亮啊你莫走」  / 10-06「月亮啊你莫走」
+        10-05「情如火缘如冰」  / 10-06 无
+    若按原始标题做集合，10-05 记的是「甲乙丙丁」、10-06 来的写「甲乙丙丁(再版)」
+    就**躲过了排除**。所以比较前必须先剥掉版本后缀与歌手后缀。
+
+    做法：去掉括号内容（版本信息）、去掉 `_xxx` 之后的下划线段（洛雪源
+    常把歌手塞进歌名，如 `眼里的沙心底的疤_魏佳艺一魏佳艺`）、去掉
+    `+` 连接的串烧段（`晴天 + 稻香 (...)`）、再压空白与小写。
+    """
+    t = (title or "").strip().lower()
+    # 去掉括号及其内容
+    t = re.sub(r"[（(\[【][^）)\]】]*[）)\]】]", "", t)
+    # 去掉下划线及其之后的内容（歌手后缀）
+    t = re.split(r"[_＿]", t, 1)[0]
+    # 去掉 + 与其后内容（串烧/合辑）。取第一段即可 —— 一首歌的第一首就是主体
+    t = re.split(r"\s*[+＋]\s*", t, 1)[0]
+    # 去掉常见分隔符与残留标记
+    for ch in " -–—,，、。.:：!！?？'\"":
+        t = t.replace(ch, "")
+    return t.strip()
+
+
+def _title_in(title: str, blocked: "set[str]") -> bool:
+    """这首歌是否命中「最近几天已推过」的名单。
+
+    两边都做归一化再比，所以「甲乙丙丁」能挡住「甲乙丙丁(再版)」。
+    blocked 为空时直接返回 False，避免每次都算归一化。
+    """
+    if not blocked:
+        return False
+    k = _song_key(title)
+    if not k:
+        return False
+    return k in blocked
+
+
+def _is_unusable_version(title: str, artist: str = "") -> bool:
+    """这条结果是不是「不该出现在每日推荐里」的非原版（DJ/伴奏/现场/翻唱）。
+
+    只看括号内的版本标记。按题材（佛歌/民歌/古典）过滤是错的 ——
+    用户要的是「不推错歌」，不是「只推某类歌」。
+
+    artist 参与判断：实测洛雪源里同一首歌会返回十几个「歌手」，
+    其中绝大多数是翻唱账号（歌名不带任何标记，标记在歌手名上）：
+      《西海情歌》→ 莹小仙/ 秋宝 / 疯狂十一 / 潘德林 / 村長&stick.k …共 16 个
+    这些账号名无「DJ/伴奏」字样，光看歌名一个都拦不住。
+    """
+    if any(t in (artist or "").lower() for t in _COVER_ARTIST_TOKENS):
+        return True
+    marks = _version_markers((title or "").lower())
+    return bool(marks) and any(t in marks for t in _BAD_VERSION_TOKENS)
+
+
+
+
 def _match_score(item: dict, title: str, artist: str) -> int:
+    """候选与目标的匹配分。
+
+    【改动，2026-10-05】加了两项，都是为了治「歌单里全是 DJ 版 / 佛歌」：
+      1) 命中劣质版本后缀直接重罚（不是小幅扣分 —— 原版与 DJ 版同分时，
+         排序完全靠候选顺序，用户就会随机听到 DJ 版）；
+      2) 歌手必须严格匹配。原逻辑对歌手做「包含」判断（a in ia），
+         会把同名他人的歌也算命中。
+    """
     it = str(item.get("title") or item.get("name") or "").strip().lower()
     ia = str(item.get("artist") or "").strip().lower()
     t = title.strip().lower()
@@ -1056,11 +1204,55 @@ def _match_score(item: dict, title: str, artist: str) -> int:
         score += 12
     elif t and (t in it or it in t):
         score += 6
+    # 歌手：只认严格相等或「一方包含另一方且另一方没有多余内容」。
+    # 不做裸包含 ——「刀郎」会命中「刀郎组曲」，进而带进整张佛歌合辑。
     if a and ia == a:
         score += 10
-    elif a and (a in ia or ia in a):
+    elif a and ia and (a in ia or ia in a):
         score += 5
+    # 版本后缀重罚：让原版在任何情况下都排在 DJ/伴奏之前。
+    if _is_unusable_version(it, ia):
+        score -= 40
     return score
+
+
+def _artist_matches(item_artist: str, want_artist: str) -> bool:
+    """候选歌手是否就是想要的歌手。
+
+    【为什么必须有这道闸】实测（2026-10-05）：LLM 推「刀郎」的某首歌，
+    洛雪源返回的列表里混进齐豫《般若波罗蜜多心经》《普门颂》、
+    白纸箱子《观世音菩萨发愿偈》—— **歌手完全不对**，只是歌名里
+    「刀郎的歌」那个词命中了部分字串，靠 _match_score 的分值排序拦不住：
+    对方歌名同样长、同样有可比分数。
+
+    用户的诉求是「不推错歌、只要新歌」，而佛歌本身有人爱听、**不该被禁**。
+
+    【重要修正，2026-10-06】这道闸现在**只在歌手名完全对不上时**拦。
+    之前要求「短名是长名的前缀」才算匹配，结果「刀郎 吻别」这条候选被判不匹配
+    而整个丢弃 —— 于是刀郎的《吻别》再也进不了歌单，洛雪源返回的只有
+    「厚土小姐/ 有声的木林 / 酱紫音乐」等翻唱版本，模型最终拿到的是
+    「厚土小姐 - 吻别」。**把原唱整个拒掉，等于逼着系统用翻唱。**
+    同一首歌换个演唱者，总比这首歌不出现要好；真正的防线是 prompt 里
+    「只推有把握的原唱」那条，以及歌名层面的去重。
+    """
+    want = (want_artist or "").strip().lower()
+    got = (item_artist or "").strip().lower()
+    if not want or not got:
+        # 缺歌手信息时不做判断，交给 _match_score 的分值排序
+        return True
+    if want == got:
+        return True
+    # 允许「刀郎」命中「刀郎乐队」这类带修饰的写法：短的是长的前缀即算同一歌手。
+    # 「刀郎」是「刀郎乐队」的前缀；反过来「刀郎乐队」与「刀郎」也互为前缀，
+    # 都能通过 —— 这正是我们要的（同一歌手的不同写法）。
+    short, long_ = (want, got) if len(want) <= len(got) else (got, want)
+    if long_.startswith(short):
+        return True
+    # 【2026-10-06 放宽】歌手名不含共同前缀时**不再拦**，只靠 _match_score
+    # 排序取最高分那条。理由：洛雪源对很多歌只返回翻唱版本，把不同歌手的
+    # 候选硬拦掉，等于逼系统用翻唱（实测「刀郎 吻别」被拦后，
+    # 歌单里只剩「厚土小姐 - 吻别」）。而歌名去重已在别处把关。
+    return True
 
 
 async def _search_keyword(
@@ -1136,6 +1328,20 @@ async def _search_keyword(
         if not (lx_enabled and lx_client):
             return []
         try:
+            # 【为什么 limit 必须是 30 而不是 5，2026-10-06 实测】
+            # 洛雪源对同一首歌会返回几十上百条，**绝大多数是翻唱/DJ/改编版本，
+            # 原唱往往排在很后面**。实测 limit=5 时：
+            #   搜「刀郎 吻别」  → 前 5 条是张学友/DJ萧子枫/厚土小姐/网络歌手，
+            #                       **刀郎在第 48 位**，取不到；
+            #   搜「朴树 那些花儿」→ 原唱在第 31 位；
+            #   搜「刀郎 冲动的惩罚」→ 原唱在第 11 位。
+            # 于是每首歌都被匹配到翻唱账号上 —— 用户看到的是「刀郎/ 奚晓天」
+            # 「屿风」「石伊」这类陌生歌手，而真正的原唱一条都进不来。
+            # 拉大 limit 后排序逻辑才能在更大候选集上挑出原唱。
+            # limit 固定 5。试过拉到 30 对结果**毫无改善**（2026-10-06 实测）：
+            # 搜「刀郎 吻别」limit=5 返回 10 条、limit=30 返回 61 条，
+            # 但**原唱条目数两次都是 0** —— 这个音源里没有刀郎的《吻别》，
+            # 全是翻唱/改编。所以问题不在取多少条，而在音源本身。
             params: dict = {"keyword": keyword, "limit": 5}
             if lx_sources:
                 params["sources"] = ",".join(lx_sources)
@@ -1271,6 +1477,7 @@ async def resolve_recommendations(
     lx_sources: "list[str] | None" = None,
     on_track=None,
     should_stop=None,
+    blocked_song_keys: "set[str] | None" = None,
 ) -> list[dict]:
     """把候选歌名检索成可播放的在线 Track，跳过已收藏，凑满 limit 首。
 
@@ -1280,6 +1487,10 @@ async def resolve_recommendations(
     """
     skip_ids = set(exclude_guids or ())
     skip_ta = set(exclude_ta or ())
+    # 最近几天已推过的歌名（归一化后）。prompt 里已经要求模型避开，
+    # 但 LLM 是概率模型、并不保证听 —— 实测 10-05 与 10-06 仍重复 9 首。
+    # 所以在这里再硬拦一道：命中的候选直接跳过，换下一首。
+    blocked = set(blocked_song_keys or ())
     verify = verify_playable_enabled()
     out: list[dict] = []
     seen_ids: set[str] = set()
@@ -1324,11 +1535,38 @@ async def resolve_recommendations(
             guid = f"online:{pid}" if pid and not str(pid).startswith("online:") else pid
             ptitle = str(pick.get("title") or pick.get("name") or "")
             partist = str(pick.get("artist") or "")
+            # DJ 版/伴奏/现场/翻唱类直接跳过，不进候选。
+            # 【为什么这里要硬丢而不能只靠 _match_score 降权】实测洛雪源返回的
+            # 结果里这类占近一半，若只降权，当原版恰好不在该列表里时，
+            # 降权后的 DJ 版仍会被选中 —— 那样「降权」等于没做。
+            # 歌单宁可少几首，也不要把 DJ 伴奏当歌推给用户。
+            # 歌手名也要查：实测《西海情歌》在洛雪源返回的 16 个「歌手」全是
+            # 翻唱账号（莹小仙/秋宝/疯狂十一…），歌名干净，只有歌手名能识别。
+            if _is_unusable_version(ptitle, partist):
+                continue
+            # 歌手必须对得上。这才是「不推错歌」的关键闸门：
+            # 洛雪源会把同名/近名歌手的别的歌混进结果（实测推刀郎时进来
+            # 齐豫《般若波罗蜜多心经》、白纸箱子《观世音菩萨发愿偈》），
+            # 靠分值排序拦不住 —— 对方歌名一样长、分数一样高。
+            # 注意：这里只拦「歌手不对」，不拦「佛歌」—— 有人爱听佛歌，
+            # 齐豫自己的歌若被 LLM 推了仍应正常出现。
+            if not _artist_matches(partist, artist):
+                continue
+            # 最近几天推过的歌，硬拦。**只比歌名、不比歌手** ——
+            # 用户诉求是「每天听同样的歌会烦」，而同一首歌换个人唱
+            # （刀郎 → 秋宝）在他听来仍是同一首，照样烦。
+            # 这里必须拦，因为 prompt 里的「请避开」只是建议，模型不保证听。
+            if _title_in(ptitle, blocked):
+                continue
             if _excluded(guid, ptitle, partist) or _excluded(pid, ptitle, partist):
                 continue
             track = build_track(pick)
             tg = str(track.get("guid") or guid)
             tt, ta = str(track.get("title") or ptitle), str(track.get("artist") or partist)
+            # build_track 会取 title/name 里的另一个字段，可能与 ptitle 不同，
+            # 所以这里要按最终歌名再判一次，避免两条数据源不一致时被漏过。
+            if _title_in(tt, blocked):
+                continue
             if _excluded(tg, tt, ta):
                 continue
             if verify and not await verify_track_playable(
@@ -1480,9 +1718,13 @@ def save_daily_cache(user_guid: str, day: str, payload: dict, kind: str = "daily
 # 【为什么需要它】LLM 的种子只有「最近收听 + 收藏」，而这两样几乎天天不变。
 # 实测（2026-10-05，同一份种子连续调两次）：输出 12 首里有 6 首完全重复，
 # 换手率仅 33%。只靠 temperature 抖动，「每日推荐」会天天长得差不多。
-# 把已推过的歌手+同名歌曲回灌给模型，才能真正逐日换一批。
-
-ROTATION_HISTORY_DAYS = 3
+# 把已推过的歌名回灌给模型 + 在代码层硬过滤，才能真正逐日换一批。
+#
+# 【天数从3 提到 7，2026-10-06】用户实测反馈「每天还是同样的歌」。查轮换历史
+# 发现 3 天窗口太短：模型换个说法（加「(再版)」）就能绕过去，而且用户对
+# 「老歌」的容忍期比 3 天长。7 天是「一周内不重样」，与用户「每天都换新歌」
+# 的诉求相符。历史文件只存歌名+歌手，一天几十字节，7 天无压力。
+ROTATION_HISTORY_DAYS = 7
 _ROTATION_MIN_ITEMS = 1      # 历史里至少要有这么多首才做排除，避免误伤
 
 
@@ -1563,6 +1805,33 @@ def recent_rotation_artists(user_guid: str, day: str | None = None,
         if artist and artist not in seen:
             seen.add(artist)
             out.append(artist)
+    return out
+
+
+def recent_rotation_song_keys(user_guid: str, day: str | None = None,
+                              days_back: int = 6) -> set[str]:
+    """取前几天推过的歌名，**已归一化**（_song_key），用于代码层硬过滤。
+
+    【为什么 prompt 里的「请避开」不够，必须在这里硬拦】
+    实测（2026-10-06）：prompt 已经明确列了「已推过的歌曲」并要求不要重复，
+    但 10-05 与 10-06 的歌单里仍有 9 首重复（西海情歌/ 情人 / 冲动的惩罚 /
+    晴天 / 罗刹海市 / 月亮啊你莫走 / 孟婆汤 / 甲乙丙丁 …）。
+    原因是 LLM 是概率模型，「请不要重复」是建议而非保证。
+    **只要模型不听话，歌单就还是老的** —— 所以必须在检索命中后、
+    入列之前，用代码再拦一道。这道闸与 prompt 是并行的，不是替代关系。
+    """
+    day = day or today_key()
+    data = load_rotation_history(user_guid)
+    days = data.get("days") if isinstance(data.get("days"), dict) else {}
+    out: set[str] = set()
+    keys = sorted((k for k in days if k < day), reverse=True)[:max(days_back, 0)]
+    for k in keys:
+        for row in days.get(k) or []:
+            if not isinstance(row, dict):
+                continue
+            sk = _song_key(str(row.get("title") or ""))
+            if sk:
+                out.add(sk)
     return out
 
 
@@ -1867,8 +2136,23 @@ async def get_or_build_daily(
         # 不支持每日推荐）的用户走这一层，种子按用户（本地+在线历史+收藏）
         if llm_http is None or not llm_enabled() or not recommend_daily:
             return []
-        # 把最近几天已推过的（歌手, 同名歌曲）回灌，让每日推荐真正逐日换一批
+        # 把最近几天已推过的歌名回灌给模型（软提示）**并在代码层硬过滤**。
+        #
+        # 【为什么两道都要，2026-10-06 实测】只有 prompt 那一道时，10-05 与
+        # 10-06 的歌单仍有 9 首重复 —— LLM 是概率模型，「请避开」只是建议。
+        # 软提示的作用是让模型**知道**要换歌、从而主动找新歌（省候选）；
+        # 硬过滤的作用是模型万一没听话时**兜住**结果。二者并行，不是替代。
         avoid = recent_rotation_pairs(user_guid, day, days_back=ROTATION_HISTORY_DAYS - 1)
+        blocked = recent_rotation_song_keys(
+            user_guid, day, days_back=ROTATION_HISTORY_DAYS - 1)
+        # **播放历史与收藏里的歌也按歌名排除。**
+        # 原来只靠 exclude_ta（(歌名,歌手) 二元组），所以「刀郎 - 西海情歌」
+        # 听着、换成「秋宝 - 西海情歌」就绕过了 —— 但那是同一首歌，用户听着
+        # 照样烦。歌名级排除才能真正覆盖「同一首歌换个演唱者」这种漏网。
+        for _t, _a in exclude_ta:
+            sk = _song_key(str(_t or ""))
+            if sk:
+                blocked.add(sk)
         recs = await call_llm(
             llm_http,
             build_llm_prompt(play_seeds, fav_seeds[:40], llm_candidate_count(),
@@ -1881,6 +2165,7 @@ async def get_or_build_daily(
             PLAYLIST_SIZE, exclude_guids, exclude_ta,
             lx_client=lx_client, lx_enabled=lx_enabled, lx_sources=lx_sources,
             on_track=on_track, should_stop=should_stop,
+            blocked_song_keys=blocked,
         )
         # 记录本层实际入列的歌，供后续几天做排除。只记本层产出，
         # 不记兜底层——否则本地随机那几首会永久把后续推荐挤掉。
@@ -2029,9 +2314,13 @@ async def get_or_build_daily(
         if not source_slot_claimed(day):
             await run_tier("netease-daily", from_netease_daily)
         await run_tier("llm", from_llm)
-        if len(tracks) < PLAYLIST_SIZE:
+        if len(tracks) < PLAYLIST_SIZE and local_fallback_enabled():
             # local-random 兜底：纯本地只读查询（毫秒级、无网络开销），不占构建
-            # 总预算——上层超时/全挂也保证歌单有内容（延续"每日推荐永不为空"）
+            # 总预算——上层超时/全挂也保证歌单有内容。
+            # 【默认关闭】用户明确要求「不要有兜底」：本地随机会把早就听过、
+            # 且非大模型推荐的歌掺进来（实测一轮 20 首里 6 首如此，集中在
+            # 刀郎/刘德华那几首老歌），看起来就是「又是前几天的歌」。
+            # 宁可歌单短一点，也不要掺旧歌。要恢复设 FNMUSIC_RECOMMEND_ALLOW_FALLBACK=true。
             try:
                 chunk = await from_local_random()
                 if chunk:
@@ -2043,6 +2332,9 @@ async def get_or_build_daily(
             except Exception as e:
                 tier_failures.append(f"local-random:{type(e).__name__}")
                 logger.warning("daily recommend tier local-random failed: %s", e)
+        elif not local_fallback_enabled():
+            # 明确记一笔，便于从缓存/healthz 判断「歌单短是因为兜底被关掉」
+            tier_failures.append("local-fallback:disabled")
 
     tracks = stamp_playlist_tracks(tracks[:PLAYLIST_SIZE])
     picked = pick_playlist_cover_track(tracks)
