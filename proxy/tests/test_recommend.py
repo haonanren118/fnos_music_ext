@@ -1314,10 +1314,19 @@ async def test_resolve_recommendations_emits_progressively(monkeypatch):
 @pytest.mark.anyio
 async def test_llm_timeout_falls_back_to_local_random(tmp_path, monkeypatch):
     """issue #29 延续：LLM 层超时不再静默——失败原因落盘 tierFailures，
-    local-random 层兜底保证歌单不再为空（本地曲库随机补齐）。"""
+    local-random 层兜底保证歌单不再为空（本地曲库随机补齐）。
+
+    【为什么这里要显式打开兜底】2.6.20 起兜底**默认关闭**
+    （FNMUSIC_RECOMMEND_ALLOW_FALLBACK 默认 false）：用户要求「宁短勿杂」，
+    凑不满时宁可用本地随机补齐的旧歌也不掺进来。
+    但兜底逻辑本身仍在（设该键为 true 即可恢复），本用例验的就是它没坏，
+    所以必须显式打开——否则测的是「默认关着」而非「兜底可用」。
+    """
     db = tmp_path / "music.db"
     _make_local_db(db, n_tracks=25)
     monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(db))
+    # 兜底默认已关，本用例验证兜底本身可用，故显式打开
+    monkeypatch.setenv("FNMUSIC_RECOMMEND_ALLOW_FALLBACK", "true")
     monkeypatch.setenv("FNMUSIC_LLM_BASE_URL", "http://127.0.0.1:9")
     monkeypatch.setenv("FNMUSIC_LLM_API_KEY", "sk-test")
     monkeypatch.setattr(dailyrec, "build_budget_s", lambda: 3.0)
@@ -1349,7 +1358,11 @@ async def test_llm_timeout_falls_back_to_local_random(tmp_path, monkeypatch):
 
 @pytest.mark.anyio
 async def test_daily_case1_no_source_no_llm_local_random(tmp_path, monkeypatch):
-    """情况1：音源不支持每日推荐且未配置 LLM -> 本地曲库随机，各账户内容不同。"""
+    """情况1：音源不支持每日推荐且未配置 LLM -> 本地曲库随机，各账户内容不同。
+
+    兜底默认已关（2.6.20 起），本用例验的是「兜底开启时各账户内容不同」，
+    故显式打开——见 test_llm_timeout_falls_back_to_local_random 的说明。
+    """
     db = tmp_path / "music.db"
     _make_local_db(
         db, n_tracks=30,
@@ -1359,6 +1372,7 @@ async def test_daily_case1_no_source_no_llm_local_random(tmp_path, monkeypatch):
         },
     )
     monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(db))
+    monkeypatch.setenv("FNMUSIC_RECOMMEND_ALLOW_FALLBACK", "true")
     monkeypatch.delenv("FNMUSIC_LLM_BASE_URL", raising=False)
     monkeypatch.delenv("FNMUSIC_LLM_API_KEY", raising=False)
     from proxy.app import build_online_track
@@ -1390,10 +1404,14 @@ async def test_daily_case1_no_source_no_llm_local_random(tmp_path, monkeypatch):
 @pytest.mark.anyio
 async def test_daily_case2_source_slot_first_netease_others_local(tmp_path, monkeypatch):
     """情况2：网易可用但无 LLM -> 第一个用户用网易日推并占名额，
-    第二个用户不再调网易、改走本地曲库随机，两份歌单不同。"""
+    第二个用户不再调网易、改走本地曲库随机，两份歌单不同。
+
+    兜底默认已关（2.6.20 起），第二个用户要落到本地随机就必须显式打开。
+    """
     db = tmp_path / "music.db"
     _make_local_db(db, n_tracks=30)
     monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(db))
+    monkeypatch.setenv("FNMUSIC_RECOMMEND_ALLOW_FALLBACK", "true")
     mb_calls = {"n": 0}
 
     def mb_handler(request: httpx.Request) -> httpx.Response:
@@ -1491,10 +1509,14 @@ async def test_daily_case3_source_slot_first_netease_others_llm(tmp_path, monkey
 
 def test_playlist_serves_local_random_tracks_and_cover_passthrough(tmp_path, monkeypatch):
     """本地随机歌单下发兼容：真实官方 guid 原样穿透（不做 online 伪装），
-    歌单封面取本地曲目官方 coverId 并透传官方静态封面端点。"""
+    歌单封面取本地曲目官方 coverId 并透传官方静态封面端点。
+
+    兜底默认已关（2.6.20 起），本用例要拿到本地随机歌单故显式打开。
+    """
     db = tmp_path / "music.db"
     _make_local_db(db, n_tracks=25)
     monkeypatch.setenv("FNMUSIC_MUSIC_DB", str(db))
+    monkeypatch.setenv("FNMUSIC_RECOMMEND_ALLOW_FALLBACK", "true")
     monkeypatch.setitem(CONF, "recommend_hot", False)
     monkeypatch.setitem(CONF, "netease_enabled", False)
 
