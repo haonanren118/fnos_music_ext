@@ -3,11 +3,6 @@
 ARG BASE_IMAGE=python:3.13-slim
 FROM ${BASE_IMAGE}
 
-# 复位为 root：base 可能是上一版自己的镜像（ensure_base_image.sh 的增量构建设计），
-# 而那种镜像末尾带 `USER appuser`，会继承进本阶段，导致下面所有 RUN 以 appuser 跑
-# （写 /tmp、/etc 全部 Permission denied）。末尾 L126 的 `USER appuser` 会再切回去。
-USER root
-
 ARG PIP_INDEX_URL=https://mirrors.tencent.com/pypi/simple/
 ARG APT_MIRROR="https://mirrors.tencent.com"
 
@@ -89,43 +84,27 @@ RUN set -eu; \
             -r /srv/req.musicdl -r /srv/req.musicbox -r /srv/req.lxmusic -r /srv/req.webui; } \
     && rm -f /srv/req.*
 
-# base 可能是上一版自己的镜像，其中 appuser 已存在；useradd 幂等化：
-# 已存在则跳过创建，只补目录与属主（两者本身幂等）。
-RUN id -u appuser >/dev/null 2>&1 \
-    || useradd -m -u 1000 appuser; \
-    mkdir -p /data/cache /data/config /data/lxmusic \
+RUN useradd -m -u 1000 appuser \
+    && mkdir -p /data/cache /data/config /data/lxmusic \
     && chown -R appuser:appuser /data
 
-# 代码目录不 COPY 进镜像，而是建指向 /repo 的符号链接。
-#
-# 背景：compose 已把宿主 repo 目录整体挂到 /repo（`.:/repo`），是 bind mount，
-# 容器内 /repo 始终等于宿主 repo 的实时内容。但 supervisord.conf 里四个程序的
-# directory 是 /srv/*，而 /srv 属镜像层 —— 所以改宿主代码不生效，必须重建镜像。
-# 改成软链后：容器内 /srv/<svc> -> /repo/<svc>，直接读宿主实时文件。
-#
-# 生效方式（无需 rebuild）：
-#   - *.py 改动    → docker exec fnmusic-sources supervisorctl restart <prog>  （1~2s）
-#   - static/ 改动 → 浏览器刷新即可（app.py 用 Path(__file__).resolve() 解析软链，
-#                    且 NoCacheStatic 每次请求读盘，连进程都不用重启）
-#
-# build 期 /repo 尚为空目录（挂载发生在 run 期），此时 ln -sfn 会创建「悬空软链」，
-# 容器启动挂载后自动接上 —— 这是期望行为。
-# 注意：本层所有 RUN 命令都不得跟随软链读取内容（build 期会失败）。
-#
-# ⚠ 必须先 rm -rf 再 ln：base 可能是上一版自己的镜像，其中 /srv/<svc> 是真实目录
-#（含旧 COPY 进去的代码）。此时 `ln -sfn TARGET DIR` 不会替换 DIR，而是在 DIR 内部
-#   创建一个同名软链（rc=0，静默「成功」，实际毫无效果）。必须显式删除旧目录。
-RUN set -eu; \
-    mkdir -p /repo; \
-    for d in musicdl-service musicbox-service lxmusic-service webui-service proxy; do \
-        rm -rf "/srv/$d"; \
-        ln -sfn "/repo/$d" "/srv/$d"; \
-    done; \
-    chmod 0755 /repo /data
-
-# 注意：此处刻意不使用 `find /srv -name "*.py" -exec chmod` —— 软链后 find 会
-# 跟随进入 /repo，把宿主 repo 里的文件权限一并改掉（UMask=0077 下会让 appuser 读不了）。
-# 镜像权限由构建上下文保证，运行期代码权限由宿主 repo 自身权限（root:root 664/775）保证。
+# --chown+chmod：镜像权限不依赖构建上下文的 umask/属主
+COPY --chown=appuser:appuser musicdl-service/app.py musicdl-service/hardening.py /srv/musicdl-service/
+COPY --chown=appuser:appuser musicbox-service/app.py musicbox-service/runner.py musicbox-service/netease_ext.py /srv/musicbox-service/
+COPY --chown=appuser:appuser lxmusic-service/app.py lxmusic-service/source_runtime.py lxmusic-service/verify_source.py /srv/lxmusic-service/
+COPY --chown=appuser:appuser lxmusic-service/js/bridge.js /srv/lxmusic-service/js/bridge.js
+COPY --chown=appuser:appuser webui-service/app.py /srv/webui-service/
+# upgrade.py 必须随镜像分发：app.py 第 36 行 `import upgrade`，
+# 且 /api/upgrade/state、一键升级全靠它（start_upgrade / read_state / disk_free_mb）。
+# 漏掉它服务会在 import 阶段直接崩 —— 镜像里只放 app.py 是不够的。
+COPY --chown=appuser:appuser webui-service/upgrade.py /srv/webui-service/
+COPY --chown=appuser:appuser webui-service/static/ /srv/webui-service/static/
+# webui 复用 .env 安全合并（sys.path 上加 /srv 后 import proxy.env_merge），必须随镜像分发
+COPY --chown=appuser:appuser proxy/__init__.py proxy/env_merge.py /srv/proxy/
+RUN find /srv -name "*.py" -exec chmod 0644 {} + \
+    && chmod 0755 /srv/lxmusic-service/js/bridge.js \
+    && mkdir -p /repo \
+    && chmod 0755 /repo /data
 
 COPY container/supervisord.conf /etc/supervisor/supervisord.conf
 COPY container/env_flag.sh container/entrypoint.sh container/healthcheck.sh /usr/local/bin/

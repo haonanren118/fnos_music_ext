@@ -31,6 +31,21 @@ services:
     volumes:
       - ./sources-data:/data
       - .:/repo
+      # 代码热更新挂载：宿主仓库目录覆盖镜像内 /srv/<服务> 的同名代码。
+      # 镜像本身仍是自包含的（Dockerfile 里 COPY 进 /srv，不做软链），
+      # 单独 docker run 这个镜像也能正常起四个服务；
+      # 生产环境由这五条挂载决定容器实际读到的代码 ——
+      # tools/apply_hotfix.sh 把补丁写进宿主 /repo 后，容器侧即刻读到新代码，
+      # 再 supervisorctl restart 对应服务即可生效，无需重建镜像/重装 fpk。
+      # 注意：挂载后镜像内的同名代码被遮蔽，所以 fpk 升级必须能更新宿主 repo 目录。
+      # 实测：fpk 内 app/repo 是完整仓库（packaging/fpk/build.sh 用 rsync 组装），
+      # 应用中心安装/升级时把整个 app/ 解压覆盖到部署目录，宿主代码随之更新 ——
+      # 因此不存在「装了新 fpk 但跑的还是旧代码」。
+      - ./musicdl-service:/srv/musicdl-service
+      - ./musicbox-service:/srv/musicbox-service
+      - ./lxmusic-service:/srv/lxmusic-service
+      - ./webui-service:/srv/webui-service
+      - ./proxy:/srv/proxy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "/usr/local/bin/healthcheck.sh"]
