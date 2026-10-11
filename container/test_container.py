@@ -250,7 +250,18 @@ def test_dockerfile_assembly():
     for req in ("musicdl-service/requirements.txt", "musicbox-service/requirements.txt",
                 "lxmusic-service/requirements.txt", "webui-service/requirements.txt"):
         assert req in text
-    assert "lxmusic-service/js/bridge.js" in text
+    # 代码不再 COPY 进镜像：/srv/<svc> 软链到 bind mount 的 /repo/<svc>，
+    # 容器内直接读宿主实时文件（bridge.js 等在 /repo 下，随软链可见）
+    symlink_block = text.split("# 代码目录不 COPY 进镜像")[1].split(
+        "COPY container/supervisord.conf")[0]
+    assert 'ln -sfn "/repo/$d" "/srv/$d"' in symlink_block
+    for svc in ("musicdl-service", "musicbox-service", "lxmusic-service",
+                "webui-service", "proxy"):
+        assert svc in symlink_block, f"{svc} 需软链到 /repo/{svc}"
+    # ⚠ 必须先 rm -rf 再 ln：ln -sfn 对已存在的真实目录不会替换，只在它内部
+    # 再建一个同名软链且 rc=0（静默「成功」）。顺序反了镜像里就还是旧代码。
+    assert symlink_block.index('rm -rf "/srv/$d"') < symlink_block.index(
+        'ln -sfn "/repo/$d"')
     assert text.count("HEALTHCHECK") >= 1
     assert 'ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]' in text
     assert "EXPOSE 8001 8002 8003 8004" in text
@@ -302,18 +313,24 @@ def test_dockerignore_whitelist_build_context():
         assert keep in code_lines
 
 
-def test_dockerfile_copies_proxy_modules_imported_by_services():
-    """镜像内服务允许 import proxy.*（webui 复用 .env 安全合并）。
+def test_container_services_can_import_proxy_modules():
+    """容器内服务允许 import proxy.*（webui 复用 .env 安全合并）。
 
     回归：v2.0.0 首次安装时 webui 进程在容器内 ModuleNotFoundError 崩溃——
-    Dockerfile 没有 COPY proxy/，.dockerignore 白名单也没放行。
+    当时镜像里根本没有 proxy/。
+
+    2.6.21 起改为软链方案：/srv/<svc> -> /repo/<svc>，proxy 同样软链到 /repo/proxy；
+    /repo 由 compose 以 `.:/repo` bind mount 挂载，宿主 repo 实时可见。
+    因此不再要求 Dockerfile COPY，改为断言「proxy 已软链」+「/repo 确实被挂载」。
     """
     text = (CONTAINER_DIR / "Dockerfile").read_text(encoding="utf-8")
-    copied = " ".join(ln for ln in text.splitlines() if ln.startswith("COPY"))
-    ignore = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
-    for service_dir in ("musicdl-service", "musicbox-service", "lxmusic-service", "webui-service"):
-        for py in sorted((REPO_ROOT / service_dir).glob("*.py")):
-            for m in re.finditer(r"^\s*from proxy\.([A-Za-z_][\w]*)", py.read_text(encoding="utf-8"), re.M):
-                mod = f"proxy/{m.group(1)}.py"
-                assert mod in copied, f"{service_dir}/{py.name} import {mod}，Dockerfile 需 COPY 进镜像"
-                assert f"!{mod}" in ignore, f"{mod} 被 .dockerignore 排除，构建上下文拿不到"
+    symlink_block = text.split("# 代码目录不 COPY 进镜像")[1].split(
+        "COPY container/supervisord.conf")[0]
+    # proxy 必须一并软链，否则服务里 import proxy.* 仍然 ModuleNotFoundError
+    assert "proxy" in symlink_block, \
+        "proxy 需软链到 /repo/proxy，否则服务 import proxy.* 会失败"
+    # 软链指向的 /repo 必须真的被挂载，否则 /repo/proxy 为空、软链悬空
+    compose = yaml.safe_load((REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
+    svc = compose["services"]["fnmusic-sources"]
+    assert any(v.startswith(".:/repo") for v in svc["volumes"]), \
+        "compose 需把宿主 repo 挂到 /repo，否则 /srv/* 软链悬空"
