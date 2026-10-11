@@ -252,4 +252,3 @@ docker save fnmusic-sources:latest -o images/fnmusic-sources.tar
 cd packaging/fpk && bash build.sh
 ```
 
-> images/ 已被 .gitignore 排除，请勿把 1.2GB 镜像包提交进 Git。
