@@ -24,6 +24,8 @@ check() {
 
 check musicdl FNMUSIC_MUSICDL_ENABLED
 check musicbox FNMUSIC_NETEASE_ENABLED
+# lxserver（#55 公共歌单发现层）随洛雪音源一起运行
+check lxserver FNMUSIC_LX_ENABLED
 check lxmusic FNMUSIC_LX_ENABLED
 check webui FNMUSIC_WEBUI_ENABLED
 

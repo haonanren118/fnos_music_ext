@@ -717,3 +717,196 @@ def test_api_requires_admin(env_file):
         saved = client.put("/api/config", json={"values": {"FNMUSIC_QUALITY_MODE": "smooth"}})
         assert saved.status_code == 200
     assert "FNMUSIC_QUALITY_MODE='smooth'" in env_file.read_text(encoding="utf-8")
+
+
+# ------------------------------------------------------------------ 公共歌单（#55） ---
+
+def test_public_playlists_schema_defaults(env_file):
+    with authed_client() as client:
+        view = client.get("/api/config")
+        assert view.status_code == 200
+        rj = view.json()
+        assert rj["values"]["FNMUSIC_PUBLIC_PLAYLISTS_ENABLED"] == "false"
+        assert rj["values"]["FNMUSIC_PUBLIC_PLAYLISTS_SELECTION"] == "[]"
+        en = rj["schema"]["FNMUSIC_PUBLIC_PLAYLISTS_ENABLED"]
+        assert en["kind"] == "bool" and en["reload"] == "hot" and en["group"] == "recommend"
+        sel = rj["schema"]["FNMUSIC_PUBLIC_PLAYLISTS_SELECTION"]
+        assert sel["kind"] == "str" and sel["default"] == "[]"
+
+
+def test_public_selection_rows_fallback_and_guards():
+    # 键缺失（老 .env 未写入）：回落默认榜单，保证常驻判定不因缺键失效
+    rows = webui._public_selection_rows({})
+    assert rows == [{"provider": "musicbox", "source": "netease", "kind": "chart", "id": "3778678"}]
+    # 坏 JSON / 非数组：安全回落空表
+    assert webui._public_selection_rows({"FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": "not-json"}) == []
+    assert webui._public_selection_rows({"FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": '{"a":1}'}) == []
+    ok = '[{"provider": "musicbox", "source": "netease", "kind": "chart", "id": "1"}]'
+    assert webui._public_selection_rows({"FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": ok})[0]["id"] == "1"
+
+
+def test_resident_active_includes_public_selection():
+    flag = {"FNMUSIC_NETEASE_PLAYLIST_RESIDENT": "true"}
+    lx_sel = '[{"provider": "lx", "source": "mg", "kind": "playlist", "id": "9"}]'
+    mb_sel = '[{"provider": "musicbox", "source": "netease", "kind": "chart", "id": "3778678"}]'
+    pub_on = {"FNMUSIC_PUBLIC_PLAYLISTS_ENABLED": "true"}
+    # 账号歌单在：直接生效（不依赖公共选择）
+    assert webui._resident_active({**flag, "FNMUSIC_NETEASE_MY_PLAYLISTS": "true"}) is True
+    # 只有公共歌单：选中网易份才生效
+    assert webui._resident_active({**flag, **pub_on, "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": mb_sel}) is True
+    assert webui._resident_active({**flag, **pub_on, "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": lx_sel}) is False
+    # 公共开关关闭：不生效
+    assert webui._resident_active({**flag, "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": mb_sel}) is False
+    # 常驻总开关关闭：一律不生效
+    assert webui._resident_active({"FNMUSIC_NETEASE_MY_PLAYLISTS": "true"}) is False
+    # 空 id 的 musicbox 条目不算数
+    empty_sel = '[{"provider": "musicbox", "source": "netease", "kind": "chart", "id": ""}]'
+    assert webui._resident_active({**flag, **pub_on, "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": empty_sel}) is False
+
+
+def test_public_musicbox_needed_helper():
+    pub_on = {"FNMUSIC_PUBLIC_PLAYLISTS_ENABLED": "true"}
+    mb_sel = '[{"provider": "musicbox", "source": "netease", "kind": "chart", "id": "1"}]'
+    assert webui._public_musicbox_needed({**pub_on, "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": mb_sel}) is True
+    assert webui._public_musicbox_needed({"FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": mb_sel}) is False
+    assert webui._public_musicbox_needed({**pub_on}) is True  # 键缺失回落默认网易榜单
+
+
+def test_provider_programs_mapping():
+    assert webui.PROVIDER_PROGRAMS["lxmusic"] == ["lxserver", "lxmusic"]
+    assert webui.PROVIDER_PROGRAMS["musicbox"] == ["musicbox"]
+    assert webui.PROVIDER_PROGRAMS["musicdl"] == ["musicdl"]
+
+
+def test_switch_provider_process_multi_program(env_file, svctl):
+    # musicbox -> lxmusic：停 musicbox，按序起 lxserver 再起 lxmusic
+    actions = webui.switch_provider_process("musicbox", "lxmusic")
+    assert [(a["op"], a["program"]) for a in actions] == [
+        ("stop", "musicbox"), ("start", "lxserver"), ("start", "lxmusic"),
+    ]
+    # lxmusic -> musicbox：逆序停（先 lxmusic 再 lxserver）
+    actions = webui.switch_provider_process("lxmusic", "musicbox")
+    assert [(a["op"], a["program"]) for a in actions] == [
+        ("stop", "lxmusic"), ("stop", "lxserver"), ("start", "musicbox"),
+    ]
+    # 常驻保活：切离 musicbox 不停其进程
+    actions = webui.switch_provider_process("musicbox", "lxmusic", keep_musicbox=True)
+    assert [(a["op"], a["program"]) for a in actions] == [
+        ("start", "lxserver"), ("start", "lxmusic"),
+    ]
+
+
+def test_validate_updates_rejects_bad_selection(env_file):
+    with authed_client() as client:
+        bad_cases = [
+            "not-json",                       # 非法 JSON
+            '{"provider": "musicbox"}',       # 非数组
+            "[" + ",".join(['{"provider":"musicbox","source":"netease","kind":"chart","id":"1"}'] * 51) + "]",  # 超 50
+            '[{"provider": "qq", "source": "x", "kind": "chart", "id": "1"}]',   #  provider 不在白名单
+            '[{"provider": "musicbox", "source": "netease", "kind": "album", "id": "1"}]',  # kind 无效
+            '[{"provider": "musicbox", "source": "", "kind": "chart", "id": "1"}]',  # 缺 source
+            '[{"provider": "musicbox", "source": "netease", "kind": "chart", "id": ""}]',  # 缺 id
+        ]
+        for raw in bad_cases:
+            r = client.put("/api/config", json={"values": {"FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": raw}})
+            assert r.status_code == 400, raw
+            assert "公共歌单" in r.json()["error"]
+        good = '[{"provider": "musicbox", "source": "netease", "kind": "chart", "id": "3778678"}]'
+        r = client.put("/api/config", json={"values": {"FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": good}})
+        assert r.status_code == 200
+        assert "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION" in r.json()["changed"]
+    assert "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION=" in env_file.read_text(encoding="utf-8")
+
+
+def test_public_playlists_proxy_musicbox(env_file, monkeypatch):
+    monkeypatch.setitem(webui.CONF, "musicbox_url", "http://mb.test")
+    monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
+    hits = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        hits.append((request.url.host, request.url.path, dict(request.url.params)))
+        return httpx.Response(200, json={"ok": True, "items": [{"id": "1"}], "total": 1})
+
+    _mock_http(handler)
+    with authed_client() as client:
+        r = client.get("/api/public-playlists", params={"provider": "musicbox", "channel": "charts"})
+        assert r.status_code == 200
+        assert r.json()["items"][0]["id"] == "1"
+        # 落到了 musicbox，provider 参数不透传
+        assert hits[-1][0] == "mb.test"
+        assert hits[-1][1] == "/api/v1/public-playlists"
+        assert "provider" not in hits[-1][2] and hits[-1][2]["channel"] == "charts"
+        # 二级路径（歌单详情/曲目）
+        r2 = client.get("/api/public-playlists/3778678/tracks", params={"provider": "musicbox"})
+        assert r2.status_code == 200
+        assert hits[-1][1] == "/api/v1/public-playlists/3778678/tracks"
+        # lxmusic provider 路由到 lx 服务
+        r3 = client.get("/api/public-playlists/capabilities", params={"provider": "lxmusic"})
+        assert r3.status_code == 200
+        assert hits[-1][0] == "lx.test"
+
+
+def test_public_playlists_proxy_rejects(env_file, monkeypatch):
+    _mock_http(lambda r: httpx.Response(200, json={"ok": True}))
+    with authed_client() as client:
+        assert client.get("/api/public-playlists").status_code == 400            # 缺 provider
+        assert client.get("/api/public-playlists", params={"provider": "musicdl"}).status_code == 400
+        assert client.get("/api/public-playlists/a/b", params={"provider": "musicbox"}).status_code == 404
+        # 字面 ".." 会被 HTTP 客户端按 RFC3986 归一化（走不到处理函数）；
+        # 百分号编码形态才会抵达 target——守卫按 400 拒（裸套接字攻击的纵深防御）
+        assert client.get("/api/public-playlists/%2E%2E", params={"provider": "musicbox"}).status_code == 400
+        # 静态白名单端点不按 ID 解析
+        r = client.get("/api/public-playlists/capabilities", params={"provider": "musicbox"})
+        assert r.status_code == 200
+
+
+def test_public_playlists_proxy_cache(env_file, monkeypatch):
+    monkeypatch.setitem(webui.CONF, "musicbox_url", "http://mb.test")
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(200, json={"ok": True, "items": [], "total": 0})
+
+    _mock_http(handler)
+    webui._public_discovery_cache.clear()
+    with authed_client() as client:
+        params = {"provider": "musicbox", "channel": "charts"}
+        assert client.get("/api/public-playlists", params=params).status_code == 200
+        assert client.get("/api/public-playlists", params=params).status_code == 200
+        assert len(calls) == 1  # 第二次命中缓存，不再打上游
+        # capabilities 不缓存
+        assert client.get("/api/public-playlists/capabilities", params={"provider": "musicbox"}).status_code == 200
+        assert client.get("/api/public-playlists/capabilities", params={"provider": "musicbox"}).status_code == 200
+        assert len(calls) == 3
+
+
+def test_public_playlists_proxy_unreachable_503(env_file, monkeypatch):
+    monkeypatch.setitem(webui.CONF, "musicbox_url", "http://mb.test")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    _mock_http(handler)
+    with authed_client() as client:
+        r = client.get("/api/public-playlists", params={"provider": "musicbox"})
+        assert r.status_code == 503
+        assert "hint" in r.json()
+
+
+def test_netease_login_803_clears_public_cache(env_file, monkeypatch):
+    monkeypatch.setitem(webui.CONF, "musicbox_url", "http://mb.test")
+    webui._public_discovery_cache[("musicbox", "", (("channel", "charts"),))] = (
+        time.monotonic() + 60, b'{"ok":true}', "application/json")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/auth/login/check":
+            return httpx.Response(200, json={"ok": True, "data": {"code": 803, "message": "登录成功"}})
+        return httpx.Response(404)
+
+    _mock_http(handler)
+    with authed_client() as client:
+        r = client.get("/api/netease/auth/login/check", params={"unikey": "KEY1"})
+        assert r.status_code == 200
+        assert r.json()["data"]["code"] == 803
+    assert webui._public_discovery_cache == {}  # 803 清空公共发现缓存

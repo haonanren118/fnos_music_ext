@@ -3,6 +3,11 @@
 ARG BASE_IMAGE=python:3.13-slim
 FROM ${BASE_IMAGE}
 
+# 复位为 root：base 可能是上一版自己的镜像（ensure_base_image.sh 的增量构建设计），
+# 而那种镜像末尾带 `USER appuser`，会继承进本阶段，导致下面所有 RUN 以 appuser 跑
+# （写 /tmp、/etc 全部 Permission denied）。末尾 L126 的 `USER appuser` 会再切回去。
+USER root
+
 ARG PIP_INDEX_URL=https://mirrors.tencent.com/pypi/simple/
 ARG APT_MIRROR="https://mirrors.tencent.com"
 
@@ -19,7 +24,8 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /srv
 
-# nodejs（洛雪自定义源 Node 沙箱，trixie 自带 20.x）/ ffmpeg（musicdl 转封装）/ supervisor
+# nodejs（lxserver 运行时 + 洛雪自定义源 Node 沙箱，trixie 自带 20.x）/ ffmpeg（musicdl 转封装）/
+# supervisor / unzip+curl（lxserver 预编译包解包与镜像链回退下载）
 # apt 源默认国内镜像（与 pip 同策略，APT_MIRROR 可覆盖），仅在本构建层内临时替换。
 # 构建容器无法复用"指向本机"的宿主 DNS（Docker 会剔除 127.x 并回退 8.8.8.8，国内不可达），
 # 因此不探测、始终把国内可达的公共 DNS 写到最前（写入失败不中断）；apt-get update
@@ -58,7 +64,7 @@ RUN set -eu; \
         echo "ERROR: 可在 Docker daemon.json 配置 \"dns\": [\"223.5.5.5\"] 并重启 Docker 后重试。" >&2; \
         exit 1; \
     fi; \
-    apt-get install -y --no-install-recommends nodejs ffmpeg supervisor ca-certificates; \
+    apt-get install -y --no-install-recommends nodejs ffmpeg supervisor ca-certificates unzip curl; \
     if [ -n "${APT_MIRROR}" ]; then swap_apt_host "${APT_MIRROR}" 'http://deb.debian.org'; fi; \
     rm -rf /var/lib/apt/lists/*
 
@@ -84,27 +90,128 @@ RUN set -eu; \
             -r /srv/req.musicdl -r /srv/req.musicbox -r /srv/req.lxmusic -r /srv/req.webui; } \
     && rm -f /srv/req.*
 
-RUN useradd -m -u 1000 appuser \
-    && mkdir -p /data/cache /data/config /data/lxmusic \
+# base 可能是上一版自己的镜像，其中 appuser 已存在；useradd 幂等化：
+# 已存在则跳过创建，只补目录与属主（两者本身幂等）。
+# /data/lxserver：#55 公共歌单发现层（lxserver）的数据目录。
+RUN id -u appuser >/dev/null 2>&1 \
+    || useradd -m -u 1000 appuser; \
+    mkdir -p /data/cache /data/config /data/lxmusic /data/lxserver \
     && chown -R appuser:appuser /data
 
-# --chown+chmod：镜像权限不依赖构建上下文的 umask/属主
-COPY --chown=appuser:appuser musicdl-service/app.py musicdl-service/hardening.py /srv/musicdl-service/
-COPY --chown=appuser:appuser musicbox-service/app.py musicbox-service/runner.py musicbox-service/netease_ext.py /srv/musicbox-service/
-COPY --chown=appuser:appuser lxmusic-service/app.py lxmusic-service/source_runtime.py lxmusic-service/verify_source.py /srv/lxmusic-service/
-COPY --chown=appuser:appuser lxmusic-service/js/bridge.js /srv/lxmusic-service/js/bridge.js
-COPY --chown=appuser:appuser webui-service/app.py /srv/webui-service/
-# upgrade.py 必须随镜像分发：app.py 第 36 行 `import upgrade`，
-# 且 /api/upgrade/state、一键升级全靠它（start_upgrade / read_state / disk_free_mb）。
-# 漏掉它服务会在 import 阶段直接崩 —— 镜像里只放 app.py 是不够的。
-COPY --chown=appuser:appuser webui-service/upgrade.py /srv/webui-service/
-COPY --chown=appuser:appuser webui-service/static/ /srv/webui-service/static/
-# webui 复用 .env 安全合并（sys.path 上加 /srv 后 import proxy.env_merge），必须随镜像分发
-COPY --chown=appuser:appuser proxy/__init__.py proxy/env_merge.py /srv/proxy/
-RUN find /srv -name "*.py" -exec chmod 0644 {} + \
-    && chmod 0755 /srv/lxmusic-service/js/bridge.js \
-    && mkdir -p /repo \
-    && chmod 0755 /repo /data
+# 代码目录不 COPY 进镜像，而是建指向 /repo 的符号链接。
+#
+# 背景：compose 已把宿主 repo 目录整体挂到 /repo（`.:/repo`），是 bind mount，
+# 容器内 /repo 始终等于宿主 repo 的实时内容。但 supervisord.conf 里四个程序的
+# directory 是 /srv/*，而 /srv 属镜像层 —— 所以改宿主代码不生效，必须重建镜像。
+# 改成软链后：容器内 /srv/<svc> -> /repo/<svc>，直接读宿主实时文件。
+#
+# 生效方式（无需 rebuild）：
+#   - *.py 改动    → docker exec fnmusic-sources supervisorctl restart <prog>  （1~2s）
+#   - static/ 改动 → 浏览器刷新即可（app.py 用 Path(__file__).resolve() 解析软链，
+#                    且 NoCacheStatic 每次请求读盘，连进程都不用重启）
+#
+# build 期 /repo 尚为空目录（挂载发生在 run 期），此时 ln -sfn 会创建「悬空软链」，
+# 容器启动挂载后自动接上 —— 这是期望行为。
+# 注意：本层所有 RUN 命令都不得跟随软链读取内容（build 期会失败）。
+#
+# ⚠ 必须先 rm -rf 再 ln：base 可能是上一版自己的镜像，其中 /srv/<svc> 是真实目录
+#（含旧 COPY 进去的代码）。此时 `ln -sfn TARGET DIR` 不会替换 DIR，而是在 DIR 内部
+#   创建一个同名软链（rc=0，静默「成功」，实际毫无效果）。必须显式删除旧目录。
+RUN set -eu; \
+    mkdir -p /repo; \
+    for d in musicdl-service musicbox-service lxmusic-service webui-service proxy; do \
+        rm -rf "/srv/$d"; \
+        ln -sfn "/repo/$d" "/srv/$d"; \
+    done; \
+    chmod 0755 /repo /data
+
+# lxserver（#55 公共歌单发现层）：预编译包随仓库分发（container/lxserver-vendor/），
+# 缺失才回退镜像链下载 —— 与 proxy/wheels 同策略，保证 ARM/x86 构建可复现、可离线。
+# 架构说明：我方 lxserver 仅提供歌单/榜单发现（/api/music/songList|leaderboard），
+# 不参与播放、不使用自定义源沙箱，故不需要上游的 lyric / compat 两个补丁。
+# zip 内 node_modules 只带 x64 预编译 music-tag-native，ARM 构建需装入 vendored
+# arm64 原生模块（server.js 顶层 require music-tag-native，缺了起不来）。
+ARG LXSERVER_MIRROR="https://ghfast.top"
+COPY container/lxserver.version /srv/lxserver.version
+COPY container/lxserver-vendor/ /srv/lxserver-vendor/
+# resolv.conf 的改写不跨 RUN 层持久（Docker 每个 RUN 独立挂载），也不会写进最终
+# 镜像，无需事后复位；fix_dns 与 apt/pip 两步同款，仅为本步可能的回退下载服务。
+RUN set -eu; \
+    fix_dns() { \
+        { \
+            printf 'nameserver 223.5.5.5\nnameserver 119.29.29.29\n'; \
+            grep -vE '^[[:space:]]*nameserver[[:space:]]+(127\.|::1|localhost)' /etc/resolv.conf 2>/dev/null || true; \
+        } > /tmp/resolv.fnmusic 2>/dev/null || true; \
+        cat /tmp/resolv.fnmusic > /etc/resolv.conf 2>/dev/null || true; \
+    }; \
+    fix_dns; \
+    . /srv/lxserver.version; \
+    VENDOR_DIR=/srv/lxserver-vendor; \
+    TARGET_ZIP="${VENDOR_DIR}/${LXSERVER_ZIP_NAME}"; \
+    if [ ! -s "${TARGET_ZIP}" ]; then \
+        echo "[INFO] vendor 预置包缺失，通过镜像链下载 ${LXSERVER_ZIP_NAME}..."; \
+        DOWNLOAD_OK=0; \
+        if [ -z "${APT_MIRROR:-}" ]; then \
+            _chain="\"\" ${LXSERVER_MIRROR} https://gh-proxy.com"; \
+        else \
+            _chain="${LXSERVER_MIRROR} https://gh-proxy.com https://github.moeyy.xyz \"\""; \
+        fi; \
+        for mirror in ${_chain}; do \
+            if [ "${mirror}" = "\"\"" ] || [ -z "${mirror}" ]; then \
+                URL="https://github.com/XCQ0607/lxserver/releases/download/${LXSERVER_TAG}/${LXSERVER_ZIP_NAME}"; \
+            else \
+                URL="${mirror}/https://github.com/XCQ0607/lxserver/releases/download/${LXSERVER_TAG}/${LXSERVER_ZIP_NAME}"; \
+            fi; \
+            echo "[INFO] 尝试从 ${URL} 下载..."; \
+            if curl -fSL --connect-timeout 10 --max-time 300 "${URL}" -o "${TARGET_ZIP}"; then \
+                if [ -s "${TARGET_ZIP}" ]; then DOWNLOAD_OK=1; break; fi; \
+            fi; \
+        done; \
+        if [ "${DOWNLOAD_OK}" -ne 1 ]; then \
+            echo "ERROR: lxserver zip 下载失败，请预先放置于 container/lxserver-vendor/" >&2; \
+            exit 1; \
+        fi; \
+    fi; \
+    ACTUAL_SHA="$(sha256sum "${TARGET_ZIP}" | awk '{print $1}')"; \
+    if [ "${ACTUAL_SHA}" != "${LXSERVER_SHA256}" ]; then \
+        echo "ERROR: lxserver zip 校验和不符 (${ACTUAL_SHA} != ${LXSERVER_SHA256})" >&2; \
+        exit 1; \
+    fi; \
+    mkdir -p /srv/lxserver; \
+    rm -rf /srv/lxserver-tmp; \
+    unzip -q -o "${TARGET_ZIP}" -d /srv/lxserver-tmp; \
+    if [ -d "/srv/lxserver-tmp/lx-music-sync-server" ]; then \
+        cp -a /srv/lxserver-tmp/lx-music-sync-server/. /srv/lxserver/; \
+    else \
+        cp -a /srv/lxserver-tmp/. /srv/lxserver/; \
+    fi; \
+    if [ ! -f /srv/lxserver/server/server/server.js ]; then \
+        echo "ERROR: lxserver 解包后缺少 server/server/server.js（zip 结构与预期不符）" >&2; \
+        exit 1; \
+    fi; \
+    if [ "$(dpkg --print-architecture)" = "arm64" ]; then \
+        if [ ! -s "${VENDOR_DIR}/music-tag-native-linux-arm64-gnu/music-tag-native.linux-arm64-gnu.node" ]; then \
+            echo "ERROR: ARM 构建缺少 vendored music-tag-native-linux-arm64-gnu 原生模块" >&2; \
+            exit 1; \
+        fi; \
+        rm -rf /srv/lxserver/node_modules/music-tag-native-linux-arm64-gnu; \
+        cp -a "${VENDOR_DIR}/music-tag-native-linux-arm64-gnu" /srv/lxserver/node_modules/; \
+    fi; \
+    printf '%s\n' \
+        'module.exports = {' \
+        '  serverName: "fnmusic-lxserver",' \
+        '  bindIP: "127.0.0.1",' \
+        '  port: 8005,' \
+        '  "player.enableAuth": false,' \
+        '  "subsonic.enable": false,' \
+        '  "webdav.enable": false' \
+        '};' > /srv/lxserver/config.js; \
+    rm -rf /srv/lxserver-tmp "${VENDOR_DIR}" /srv/lxserver.version; \
+    chown -R appuser:appuser /srv/lxserver
+
+# 注意：此处刻意不使用 `find /srv -name "*.py" -exec chmod` —— 软链后 find 会
+# 跟随进入 /repo，把宿主 repo 里的文件权限一并改掉（UMask=0077 下会让 appuser 读不了）。
+# 镜像权限由构建上下文保证，运行期代码权限由宿主 repo 自身权限（root:root 664/775）保证。
 
 COPY container/supervisord.conf /etc/supervisor/supervisord.conf
 COPY container/env_flag.sh container/entrypoint.sh container/healthcheck.sh /usr/local/bin/

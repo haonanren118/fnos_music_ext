@@ -11,11 +11,17 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from netease_ext import (
+    account_detail,
     batch_song_details,
     check_is_logged_in,
     filter_playable_song_ids,
     get_song_url,
     playlist_track_ids,
+    public_chart_categories,
+    public_playlist,
+    public_playlist_categories,
+    public_playlist_tracks,
+    public_playlists,
     reset_api,
     search_web_fallback,
     song_lyric_pair,
@@ -297,9 +303,137 @@ def toplist(index: int = Query(-1), limit: int = Query(60, ge=1, le=100)):
     return {"ok": True, "data": rows, "index": index}
 
 
+# ---------------------------------------------------------------------------
+# 公共歌单端点（#55，上游 javycoder/fnos_music_ext v2.9.0 移植）
+# 与我方版本的差异：tracks 不过 _mark_needs_vip——[VIP] 展示统一在 proxy 层
+# （_vip_tag_prefix，fee 判定），musicbox 侧不重复造权益探测。
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/public-playlists/capabilities")
+def public_playlist_capabilities():
+    logged_in = False
+    try:
+        logged_in = check_is_logged_in()
+    except Exception:
+        logged_in = False
+    return {
+        "ok": True,
+        "provider": "musicbox",
+        "sources": [{
+            "id": "netease",
+            "name": "网易云音乐",
+            "playback_available": True,
+            "channels": [
+                {"id": "recommend", "name": "推荐歌单", "login_required": False},
+                {"id": "top", "name": "热门与分类", "login_required": False},
+                {"id": "highquality", "name": "精品歌单", "login_required": False},
+                {"id": "charts", "name": "排行榜", "login_required": False},
+                {"id": "account_recommend", "name": "账号推荐歌单", "login_required": True},
+            ],
+            "logged_in": logged_in,
+        }],
+    }
+
+
+@app.get("/api/v1/public-playlists/categories")
+def public_playlist_categories_api(
+    source: str = Query("netease"),
+    kind: str = Query("playlist", pattern="^(playlist|chart)$"),
+):
+    if source not in ("netease", "wy", "163"):
+        raise HTTPException(status_code=400, detail="unsupported source")
+    try:
+        if kind == "chart":
+            # 真实排行榜分类：官方榜 + 按榜单 tags 归类的特色榜（原上游只给「全部」）
+            return {
+                "ok": True,
+                "categories": public_chart_categories(),
+                "tags": [],
+                "sorts": [],
+            }
+        data = public_playlist_categories("playlist")
+        grouped = data.get("tags") if isinstance(data.get("tags"), dict) else {}
+        data["categories"] = [{"id": "", "name": "全部"}] + [
+            {"id": name, "name": name, "list": rows}
+            for name, rows in grouped.items()
+            if isinstance(rows, list)
+        ]
+        return data
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"netease categories failed: {exc}") from exc
+
+
+@app.get("/api/v1/public-playlists")
+def public_playlists_api(
+    source: str = Query("netease"),
+    channel: str = Query("top"),
+    category: str = Query(""),
+    sort: str = Query("hot"),
+    page: int = Query(1, ge=1, le=100),
+    limit: int = Query(30, ge=1, le=50),
+    cursor: str = Query(""),
+):
+    if source not in ("netease", "wy", "163"):
+        raise HTTPException(status_code=400, detail="unsupported source")
+    channels = {"recommend", "top", "highquality", "charts", "account_recommend"}
+    if channel not in channels:
+        raise HTTPException(status_code=400, detail=f"unsupported channel {channel}")
+    try:
+        return public_playlists(channel, category, sort, page, limit, cursor)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"netease playlists failed: {exc}") from exc
+
+
+@app.get("/api/v1/public-playlists/{playlist_id}")
+def public_playlist_api(
+    playlist_id: int = Path(..., ge=1),
+    source: str = Query("netease"),
+    kind: str = Query("playlist", pattern="^(playlist|chart)$"),
+):
+    if source not in ("netease", "wy", "163"):
+        raise HTTPException(status_code=400, detail="unsupported source")
+    try:
+        return public_playlist(playlist_id, kind)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"netease playlist failed: {exc}") from exc
+
+
+@app.get("/api/v1/public-playlists/{playlist_id}/tracks")
+def public_playlist_tracks_api(
+    playlist_id: int = Path(..., ge=1),
+    source: str = Query("netease"),
+    kind: str = Query("playlist", pattern="^(playlist|chart)$"),
+):
+    if source not in ("netease", "wy", "163"):
+        raise HTTPException(status_code=400, detail="unsupported source")
+    try:
+        result = public_playlist_tracks(playlist_id, kind)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"netease playlist tracks failed: {exc}") from exc
+    return result
+
+
 @app.get("/api/v1/auth/status")
 def auth_status():
-    return exec_musicbox(["auth", "status", "--json"])
+    # CLI 的 `auth status` 只给 logged_in/user_id/nickname；已登录时补上账号详情
+    # （vip_type/vip_label），WebUI 据此在昵称后显示 VIP 标识。
+    data = exec_musicbox(["auth", "status", "--json"])
+    payload = _extract_payload(data)
+    if isinstance(payload, dict) and payload.get("logged_in"):
+        detail = account_detail()
+        if detail:
+            merged = {**payload}
+            for key, value in detail.items():
+                # 昵称/uid 以 CLI 为准（CLI 是登录态权威来源），VIP 字段从详情补
+                if key in ("nickname", "user_id") and merged.get(key):
+                    continue
+                if value not in (None, ""):
+                    merged[key] = value
+            if isinstance(data, dict) and isinstance(data.get("data"), dict):
+                data["data"] = merged
+            elif isinstance(data, dict):
+                data["data"] = merged
+    return data
 
 
 @app.post("/api/v1/auth/login")

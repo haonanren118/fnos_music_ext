@@ -1,0 +1,46 @@
+{
+  "name": "music-tag-native-linux-arm64-gnu",
+  "version": "0.2.5",
+  "cpu": [
+    "arm64"
+  ],
+  "main": "music-tag-native.linux-arm64-gnu.node",
+  "files": [
+    "music-tag-native.linux-arm64-gnu.node"
+  ],
+  "description": "Music tag reader / writter in Node.js / Browser, powered by napi-rs and lofty",
+  "keywords": [
+    "napi-rs",
+    "NAPI",
+    "N-API",
+    "Rust",
+    "node-addon",
+    "node-addon-api",
+    "music",
+    "tags",
+    "MP3",
+    "M4A",
+    "FLAC",
+    "WAV",
+    "ID3",
+    "Vorbis"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">= 10"
+  },
+  "repository": {
+    "url": "git+ssh://git@github.com/subframe7536/music-tag-native.git",
+    "type": "git"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "os": [
+    "linux"
+  ],
+  "libc": [
+    "glibc"
+  ]
+}

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import os
 import re
@@ -73,6 +74,8 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_QUALITY_MODE": {"kind": "enum", "values": ["high", "balanced", "smooth"], "default": "high", "group": "quality", "reload": "hot", "label": "音质偏好"},
     "FNMUSIC_RECOMMEND_HOT": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "热门榜单推荐"},
     "FNMUSIC_RECOMMEND_DAILY": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "每日推荐"},
+    "FNMUSIC_PUBLIC_PLAYLISTS_ENABLED": {"kind": "bool", "default": "false", "group": "recommend", "reload": "hot", "label": "公共歌单"},
+    "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": {"kind": "str", "default": "[]", "group": "recommend", "reload": "hot", "label": "公共歌单选择"},
     "FNMUSIC_TEE_SAVE_ENABLED": {"kind": "bool", "default": "true", "group": "tee", "reload": "hot", "label": "边听边存"},
     "FNMUSIC_TEE_SAVE_DIR": {"kind": "str", "default": "", "group": "tee", "reload": "hot", "label": "保存路径（留空自动探测）"},
     "FNMUSIC_TEE_CACHE_MAX": {"kind": "int", "default": "2", "min": 1, "max": 100, "group": "tee", "reload": "hot", "label": "关闭时滚动缓存数"},
@@ -88,6 +91,7 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_SEARCH_TIMEOUT": {"kind": "int", "default": "15", "min": 1, "max": 60, "group": "search", "reload": "hot", "label": "搜索超时时间"},
     "FNMUSIC_SEARCH_PROBE": {"kind": "bool", "default": "false", "group": "search", "reload": "hot", "label": "逐曲探活(beta)"},
     "FNMUSIC_NETEASE_MY_PLAYLISTS": {"kind": "bool", "default": "false", "group": "source", "reload": "hot", "label": "网易账号歌单"},
+    "FNMUSIC_NETEASE_PLAYLIST_RESIDENT": {"kind": "bool", "default": "false", "group": "source", "reload": "process", "label": "网易云歌单常驻"},
 }
 
 _PROVIDER_KEYS = set(PROVIDERS.values())
@@ -170,17 +174,29 @@ def supervisor_status() -> dict[str, dict]:
     return result
 
 
-def switch_provider_process(old: str, new: str) -> list[dict]:
-    """切源进程：先停旧再起新；失败逐项记录，不抛出。"""
+def switch_provider_process(old: str, new: str, keep_musicbox: bool = False) -> list[dict]:
+    """切源进程：先停旧再起新；失败逐项记录，不抛出。
+
+    keep_musicbox=True（网易云歌单常驻生效）时切离 musicbox 不停其进程，
+    由常驻对账负责后续保活/回收。
+    """
     actions: list[dict] = []
     if old and old != new:
-        code, out = supervisorctl("stop", old)
-        actions.append({"kind": "process", "program": old, "op": "stop",
-                        "ok": code == 0, "error": "" if code == 0 else out})
+        # 停旧：按逆序停止（例如先停 lxmusic 再停 lxserver）
+        old_progs = reversed(PROVIDER_PROGRAMS.get(old, [old]))
+        for prog in old_progs:
+            if keep_musicbox and old == "musicbox" and prog == "musicbox":
+                continue
+            code, out = supervisorctl("stop", prog)
+            actions.append({"kind": "process", "program": prog, "op": "stop",
+                            "ok": code == 0, "error": "" if code == 0 else out})
     if new:
-        code, out = supervisorctl("start", new)
-        actions.append({"kind": "process", "program": new, "op": "start",
-                        "ok": code == 0, "error": "" if code == 0 else out})
+        # 起新：按顺序启动（例如先起 lxserver 再起 lxmusic）
+        new_progs = PROVIDER_PROGRAMS.get(new, [new])
+        for prog in new_progs:
+            code, out = supervisorctl("start", prog)
+            actions.append({"kind": "process", "program": prog, "op": "start",
+                            "ok": code == 0, "error": "" if code == 0 else out})
     return actions
 
 
@@ -192,7 +208,13 @@ def switch_provider_process(old: str, new: str) -> list[dict]:
 PREVIEW_TTL = 300.0
 _preview_until: dict[str, float] = {}
 
-PROVIDER_PROGRAM = {"musicdl": "musicdl", "musicbox": "musicbox", "lxmusic": "lxmusic"}
+# 音源 -> supervisor 进程组（#55：lxmusic 依赖 lxserver 发现层，须先起后停）
+PROVIDER_PROGRAMS = {
+    "musicdl": ["musicdl"],
+    "musicbox": ["musicbox"],
+    "lxmusic": ["lxserver", "lxmusic"],
+}
+PROVIDER_PROGRAM = {"musicdl": "musicdl", "musicbox": "musicbox", "lxmusic": "lxmusic"}  # 兼容单名引用
 PROVIDER_HEALTH = {"musicdl": CONF["musicdl_url"], "musicbox": CONF["musicbox_url"], "lxmusic": CONF["lx_url"]}
 
 
@@ -217,30 +239,206 @@ def preview_reap() -> list[str]:
     for provider, deadline in list(_preview_until.items()):
         if provider == enabled:
             _preview_until.pop(provider, None)
+        elif provider == "musicbox" and _resident_state["active"]:
+            # 网易云歌单常驻：musicbox 进程转常驻保活，仅移出预览表不停进程
+            _preview_until.pop(provider, None)
         elif deadline <= time.monotonic():
-            code, out = supervisorctl("stop", PROVIDER_PROGRAM[provider])
-            if code == 0:
+            all_ok = True
+            for prog in reversed(PROVIDER_PROGRAMS.get(provider, [provider])):
+                code, out = supervisorctl("stop", prog)
+                if code != 0:
+                    all_ok = False
+                    logger.warning("预览到期但停止失败（下轮重试）%s(%s): %s", provider, prog, out)
+            if all_ok:
                 _preview_until.pop(provider, None)
                 logger.info("预览到期，停止音源进程 %s", provider)
                 stopped.append(provider)
-            else:
-                logger.warning("预览到期但停止失败（下轮重试）%s: %s", provider, out)
     return stopped
 
 
-def preview_reconcile_after_save() -> list[dict]:
-    """保存成功后的收尾：预览转正的进程保留，其余预览进程立即停止。"""
+def preview_reconcile_after_save(keep_musicbox: bool = False) -> list[dict]:
+    """保存成功后的收尾：预览转正的进程保留，其余预览进程立即停止。
+
+    keep_musicbox=True（网易云歌单常驻生效）时 musicbox 移出预览表但保留进程。
+    """
     enabled = current_provider(read_env())
     actions: list[dict] = []
     for provider in list(_preview_until):
         if provider == enabled:
             _preview_until.pop(provider, None)
             continue
+        if provider == "musicbox" and keep_musicbox:
+            _preview_until.pop(provider, None)
+            continue
         _preview_until.pop(provider, None)
-        code, out = supervisorctl("stop", PROVIDER_PROGRAM[provider])
-        actions.append({"kind": "process", "program": PROVIDER_PROGRAM[provider], "op": "stop",
-                        "ok": code == 0, "error": "" if code == 0 else out, "preview": True})
+        for prog in reversed(PROVIDER_PROGRAMS.get(provider, [provider])):
+            code, out = supervisorctl("stop", prog)
+            actions.append({"kind": "process", "program": prog, "op": "stop",
+                            "ok": code == 0, "error": "" if code == 0 else out, "preview": True})
     return actions
+
+
+# ------------------------------------------------------------------ 网易云歌单常驻 --
+# 勾选后即使当前音源不是 musicbox，musicbox 进程也保持常驻，为音乐页的网易账号
+# 歌单（注入/取曲目/播放/歌词）与 #55 公共歌单（网易侧发现）供数；账号歌单的
+# 生效前提是已扫码登录，公共歌单可匿名浏览。取消勾选且当前音源非 musicbox 时
+# 关闭 musicbox 进程以释放内存（cookie/数据卷保留，切回不丢登录态）。
+# webui 是常驻对账的单一事实来源：保存配置时收口 + 进程启动后开机自愈。
+_RESIDENT_FLAG = "FNMUSIC_NETEASE_PLAYLIST_RESIDENT"
+_RESIDENT_LOGIN_TTL = 60.0
+_RESIDENT_RETRY_BLOCK_S = 300.0
+_RESIDENT_NOT_LOGGED_IN = "未登录网易账号，网易云歌单常驻未生效（请先在音乐源页扫码登录）"
+# {"ts": float, "value": bool|None}：登录态短缓存（True/False 确定值；None=不可达）。
+_resident_login_cache: dict = {"ts": 0.0, "value": None}
+# 常驻当前是否生效（musicbox 进程由常驻逻辑保活），供 preview_reap 同步查询
+_resident_state = {"active": False}
+# 确认未登录后短时间内不再尝试拉起（否则每次保存都 start→校验→stop 空转一轮）
+_resident_start_block: dict = {"until": 0.0, "reason": ""}
+
+
+def _resident_flag(values: dict[str, str]) -> bool:
+    return str(values.get(_RESIDENT_FLAG, "")).strip().lower() in ("true", "1", "yes")
+
+
+def _resident_active(values: dict[str, str]) -> bool:
+    """常驻生效判定：账号歌单或至少一份网易公共歌单需要 musicbox 供数。"""
+    if not _resident_flag(values):
+        return False
+    account = str(values.get("FNMUSIC_NETEASE_MY_PLAYLISTS", "")).strip().lower() in ("true", "1", "yes")
+    if account:
+        return True
+    public = str(values.get("FNMUSIC_PUBLIC_PLAYLISTS_ENABLED", "")).strip().lower() in ("true", "1", "yes")
+    if not public:
+        return False
+    return any(
+        isinstance(item, dict) and item.get("provider") == "musicbox"
+        and str(item.get("id") or "").strip()
+        for item in _public_selection_rows(values)
+    )
+
+
+def _public_selection_rows(values: dict[str, str]) -> list:
+    if "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION" not in values:
+        return [{"provider": "musicbox", "source": "netease", "kind": "chart", "id": "3778678"}]
+    try:
+        selection = json.loads(str(values.get("FNMUSIC_PUBLIC_PLAYLISTS_SELECTION") or "[]"))
+    except Exception:
+        return []
+    return selection if isinstance(selection, list) else []
+
+
+def _public_musicbox_needed(values: dict[str, str]) -> bool:
+    if not str(values.get("FNMUSIC_PUBLIC_PLAYLISTS_ENABLED", "")).strip().lower() in ("true", "1", "yes"):
+        return False
+    return any(
+        isinstance(item, dict) and item.get("provider") == "musicbox" and str(item.get("id") or "").strip()
+        for item in _public_selection_rows(values)
+    )
+
+
+def _musicbox_proc_running() -> bool:
+    return supervisor_status().get("musicbox", {}).get("state") == "RUNNING"
+
+
+async def _musicbox_login_state(client) -> "bool | None":
+    """musicbox 登录态三态：True/False 为 auth/status 的确定结论，None=不可达。"""
+    now = time.monotonic()
+    if now - _resident_login_cache["ts"] < _RESIDENT_LOGIN_TTL:
+        return _resident_login_cache["value"]
+    value = None
+    try:
+        resp = await client.get(f"{CONF['musicbox_url']}/api/v1/auth/status", timeout=25.0)
+        data = _resp_json(resp)
+        payload = data.get("data") if isinstance(data.get("data"), dict) else data
+        if isinstance(payload, dict) and "logged_in" in payload:
+            value = bool(payload.get("logged_in"))
+    except Exception:  # noqa: BLE001  # musicbox 未启动/网络抖动：结论未知
+        value = None
+    _resident_login_cache["ts"] = now
+    _resident_login_cache["value"] = value
+    return value
+
+
+async def _musicbox_wait_healthy(client, timeout_s: float = 30.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            resp = await client.get(f"{CONF['musicbox_url']}/healthz", timeout=2.0)
+            if resp.status_code == 200:
+                return True
+        except Exception:  # noqa: BLE001  # uvicorn 尚未监听：按间隔重试到超时
+            pass
+        await asyncio.sleep(0.5)
+    return False
+
+
+async def _reconcile_musicbox_resident(client, values: dict[str, str],
+                                       actions: list[dict], warn: bool = False) -> None:
+    """按常驻期望对账 musicbox 进程（幂等；provider=musicbox 时进程归音源切换管，跳过）。
+
+    - 常驻生效：进程未运行则拉起并等 healthz；公共歌单可匿名保活。
+    - 账号歌单确认未登录但无公共歌单：回收进程；仍有公共歌单则保留进程并提示账号部分不可用。
+    - 常驻不生效且进程在跑：停止释放内存（需求：取消勾选后节省内存）。
+    warn=True 时（本次保存涉及常驻/切源）把未登录告警写进响应 actions。
+    """
+    provider = current_provider(values)
+    if provider == "musicbox":
+        _resident_state["active"] = False
+        return
+    want = _resident_active(values)
+    _resident_state["active"] = False
+    running = _musicbox_proc_running()
+    if want and _public_musicbox_needed(values) and time.monotonic() < _resident_start_block["until"]:
+        _resident_start_block.update(until=0.0, reason="")
+    if not want:
+        if running:
+            code, out = supervisorctl("stop", "musicbox")
+            actions.append({"kind": "resident", "op": "stop",
+                            "ok": code == 0, "error": "" if code == 0 else out})
+            logger.info("[resident] 网易云歌单常驻未勾选，停止 musicbox 进程")
+        return
+    if not running:
+        if time.monotonic() < _resident_start_block["until"]:
+            if warn:
+                actions.append({"kind": "resident", "op": "deactivate", "ok": False,
+                                "error": _resident_start_block["reason"]})
+            return
+        code, out = supervisorctl("start", "musicbox")
+        if code != 0:
+            actions.append({"kind": "resident", "op": "start", "ok": False, "error": out})
+            logger.warning("[resident] musicbox 常驻启动失败: %s", out)
+            return
+        if not await _musicbox_wait_healthy(client):
+            actions.append({"kind": "resident", "op": "start", "ok": False,
+                            "error": "启动后未通过健康检查"})
+            logger.warning("[resident] musicbox 常驻启动后未通过健康检查")
+            return
+        actions.append({"kind": "resident", "op": "start", "ok": True, "error": ""})
+        logger.info("[resident] musicbox 已为网易云歌单常驻启动")
+        running = True
+    logged = await _musicbox_login_state(client)
+    if logged is False:
+        public_only = not str(values.get("FNMUSIC_NETEASE_MY_PLAYLISTS", "")).strip().lower() in ("true", "1", "yes")
+        if public_only:
+            _resident_state["active"] = True
+            return
+        public_needed = _public_musicbox_needed(values)
+        if public_needed:
+            _resident_state["active"] = True
+            if warn:
+                actions.append({"kind": "resident", "op": "account_deactivate", "ok": False,
+                                "error": _RESIDENT_NOT_LOGGED_IN})
+            return
+        _resident_start_block.update(until=time.monotonic() + _RESIDENT_RETRY_BLOCK_S,
+                                     reason=_RESIDENT_NOT_LOGGED_IN)
+        code, out = supervisorctl("stop", "musicbox")
+        actions.append({"kind": "resident", "op": "stop", "ok": code == 0, "error": "" if code == 0 else out})
+        if warn:
+            actions.append({"kind": "resident", "op": "deactivate", "ok": False,
+                            "error": _RESIDENT_NOT_LOGGED_IN})
+        logger.info("[resident] musicbox 未登录，网易云歌单常驻未生效，已停止进程")
+        return
+    _resident_state["active"] = True
 
 
 # ------------------------------------------------------------------ 校验 --
@@ -298,6 +496,23 @@ def validate_updates(values: dict) -> dict[str, str]:
         raise ValueError(f"音源三选一：{'、'.join(enabled)} 同时启用，请只保留一个")
     if updates.keys() & _PROVIDER_KEYS and not enabled:
         raise ValueError("至少需要启用一个音源")
+    if "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION" in updates:
+        try:
+            selection = json.loads(str(updates["FNMUSIC_PUBLIC_PLAYLISTS_SELECTION"] or "[]"))
+        except Exception as exc:
+            raise ValueError(f"公共歌单选择不是合法 JSON: {exc}") from exc
+        if not isinstance(selection, list):
+            raise ValueError("公共歌单选择必须是 JSON 数组")
+        if len(selection) > 50:
+            raise ValueError("公共歌单最多选择 50 份")
+        allowed = {"musicbox", "lx"}
+        for item in selection:
+            if not isinstance(item, dict) or item.get("provider") not in allowed:
+                raise ValueError("公共歌单条目无效")
+            if item.get("kind") not in {"playlist", "chart"}:
+                raise ValueError("公共歌单类型无效")
+            if not str(item.get("source") or "").strip() or not str(item.get("id") or "").strip():
+                raise ValueError("公共歌单条目缺少平台或 ID")
     return updates
 
 
@@ -316,6 +531,17 @@ async def _lifespan(_app: FastAPI):
             except Exception:  # noqa: BLE001
                 logger.exception("预览清退循环异常")
     reaper = asyncio.create_task(_preview_reaper())
+    # 网易云歌单常驻：开机自愈（entrypoint 只认三选一开关，容器/原生重启后由这里兜底）
+    async def _resident_boot():
+        await asyncio.sleep(5.0)
+        try:
+            values = read_env()
+            if _resident_active(values) and current_provider(values) != "musicbox":
+                async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=3.0)) as bclient:
+                    await _reconcile_musicbox_resident(bclient, values, [])
+        except Exception:  # noqa: BLE001  # 开机对账失败不影响 WebUI，下次保存再收口
+            logger.exception("网易云歌单常驻开机对账异常")
+    resident_task = asyncio.create_task(_resident_boot())
     # 清掉上次升级残留的临时安装包（离线包 400MB+，不清会白占磁盘）
     try:
         upgrade.cleanup()
@@ -325,6 +551,7 @@ async def _lifespan(_app: FastAPI):
         yield
     finally:
         reaper.cancel()
+        resident_task.cancel()
         client = getattr(_app.state, "http", None)
         if client is not None:
             await client.aclose()
@@ -537,6 +764,23 @@ def _changelog_notes(local: str, remote: str, limit: int = 12) -> list:
     return out
 
 
+def _normalize_hotfix(assets: list) -> "dict | None":
+    """从 release 资产里挑出热更新包与其 sha256 的下载地址。无则返回 None。"""
+    tar_url = sha_url = None
+    for a in assets:
+        if not isinstance(a, dict):
+            continue
+        n = str(a.get("name") or "")
+        u = str(a.get("browser_download_url") or a.get("url") or "")
+        if re.search(r"hotfix\.tar\.gz$", n):
+            tar_url = u
+        elif re.search(r"hotfix\.tar\.gz\.sha256$", n):
+            sha_url = u
+    if not tar_url:
+        return None
+    return {"tarball_url": tar_url, "sha256_url": sha_url}
+
+
 def _normalize_release(data: dict, src: dict) -> "dict | None":
     """把一条 release JSON 归一成内部结构；无版本号返回 None。"""
     tag = str(data.get("tag_name") or data.get("name") or "").strip()
@@ -559,6 +803,9 @@ def _normalize_release(data: dict, src: dict) -> "dict | None":
             for a in (data.get("assets") or [])
             if isinstance(a, dict) and str(a.get("name") or "").endswith(".fpk")
         ],
+        # 热更新包：fnmusic-ext-<ver>-hotfix.tar.gz 与其官方 .sha256。
+        # 仅记录这两个资产，供前端"在线更新"下拉框列出可热更新的版本。
+        "hotfix": _normalize_hotfix(data.get("assets") or []),
     }
 
 
@@ -665,6 +912,50 @@ async def _available_mirrors(request: Request, working: str = "") -> list:
     return out
 
 
+async def _fetch_hotfix_versions(request: Request, local: str) -> list:
+    """列出可在线热更新的版本（仅含带 fnmusic-ext-<ver>-hotfix.tar.gz 的 release，
+    且版本号严格高于本机）。供前端「在线更新」下拉框使用。
+
+    走与版本检测相同的 GitHub / Gitee 双源；任一源列出即采用，全部失败返回空列表
+    （降级为"无可用在线更新"，绝不阻塞版本检测主流程）。
+    """
+    client = get_http(request)
+    out: dict[str, dict] = {}
+    for src in RELEASE_SOURCES:
+        list_api = src.get("list_api")
+        if not list_api:
+            continue
+        try:
+            resp = await client.get(list_api, headers=_source_headers(src), timeout=6.0)
+            if resp.status_code >= 400:
+                continue
+            items = resp.json()
+            if not isinstance(items, list):
+                continue
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("hotfix versions %s failed: %s", src["name"], exc)
+            continue
+        for it in items:
+            if not isinstance(it, dict) or it.get("draft") or it.get("prerelease"):
+                continue
+            rel = _normalize_release(it, src)
+            if not rel or not rel.get("hotfix"):
+                continue
+            ver = rel["version"]
+            if not _newer_than(ver, local):
+                continue
+            if ver not in out:
+                out[ver] = {
+                    "version": ver,
+                    "published": rel.get("published", ""),
+                    "tarball_url": rel["hotfix"]["tarball_url"],
+                    "sha256_url": rel["hotfix"]["sha256_url"],
+                }
+    lst = list(out.values())
+    lst.sort(key=lambda x: _parse_version(x["version"]) or (0,), reverse=True)
+    return lst
+
+
 # ------------------------------------------------------------------ API --
 
 @app.get("/healthz")
@@ -767,6 +1058,8 @@ async def api_version(request: Request):
         # 能否提供离线完整包（只作提示用，真正的准入判断在 upgrade.start_upgrade 里）
         "can_install": bool(_pick_offline_asset(rel["assets"], remote)),
         "free_mb": _upgrade_free_mb(),
+        # 可在线热更新的版本（仅列带 hotfix 包且高于当前的），供前端下拉框选择
+        "hotfix_versions": await _fetch_hotfix_versions(request, local),
     }
 
 
@@ -847,8 +1140,10 @@ async def api_config():
     return {
         "ok": True,
         "values": {key: values.get(key, spec["default"]) for key, spec in SCHEMA.items()},
+        "presence": dict.fromkeys(values.keys(), True),
         "schema": SCHEMA,
         "env_path": str(ENV_PATH),
+        "resident_active": _resident_state["active"],
     }
 
 
@@ -868,21 +1163,39 @@ async def api_preview(body: PreviewBody, request: Request):
         raise HTTPException(status_code=400, detail="provider 必须是 musicdl/musicbox/lxmusic 之一")
     if current_provider(read_env()) == provider:
         return {"ok": True, "preview": False, "note": "该音源已启用，进程常驻"}
+    if provider == "musicbox" and (
+            _resident_state["active"]
+            or (_resident_flag(read_env()) and _musicbox_proc_running())):
+        # 常驻进程已在跑：不再走预览拉起（对 RUNNING 进程 start 会报已启动错误）。
+        # 内存标记外再兜一层「开关勾选 + 进程实跑」：开机对账未跑的 5 秒窗口、
+        # 对账时健康检查超时但进程仍活等场景，点卡也不会 start 撞"already started"
+        return {"ok": True, "preview": False, "note": "网易云歌单常驻运行中"}
     if preview_seconds_left(provider) > 0:
         preview_renew(provider)
         return {"ok": True, "preview": True, "seconds_left": preview_seconds_left(provider)}
-    code, out = supervisorctl("start", PROVIDER_PROGRAM[provider])
-    if code != 0:
-        return JSONResponse(content={"ok": False, "error": out or "supervisorctl start 失败"}, status_code=500)
+    started: list[str] = []
+    for prog in PROVIDER_PROGRAMS.get(provider, [provider]):
+        code, out = supervisorctl("start", prog)
+        if code != 0:
+            for p in reversed(started):
+                supervisorctl("stop", p)
+            return JSONResponse(content={"ok": False, "error": f"supervisorctl start {prog} 失败: {out}"}, status_code=500)
+        started.append(prog)
     client = get_http(request)
+    healthy = False
     for _ in range(60):  # 等待服务真正可用（healthz），最长约 30s
         try:
             r = await client.get(f"{PROVIDER_HEALTH[provider]}/healthz", timeout=2.0)
             if r.status_code == 200:
+                healthy = True
                 break
         except httpx.HTTPError:
             pass
         await asyncio.sleep(0.5)
+    if not healthy:
+        for p in reversed(started):
+            supervisorctl("stop", p)
+        return JSONResponse(content={"ok": False, "error": f"{provider} 启动后未能通过健康检查"}, status_code=504)
     _preview_until[provider] = time.monotonic() + PREVIEW_TTL
     return {"ok": True, "preview": True, "seconds_left": PREVIEW_TTL}
 
@@ -924,11 +1237,13 @@ async def api_config_put(body: ConfigBody, request: Request):
 
     after = read_env()
     new_provider = current_provider(after)
+    # 网易云歌单常驻：当前非 musicbox 音源但常驻生效时，切源/收尾不停 musicbox 进程
+    resident_keep = _resident_active(after) and current_provider(after) != "musicbox"
     actions: list[dict] = []
 
     # 音源切换（先停旧再起新）
     if old_provider != new_provider:
-        actions.extend(switch_provider_process(old_provider, new_provider))
+        actions.extend(switch_provider_process(old_provider, new_provider, keep_musicbox=resident_keep))
     # lx 换源激活：热切换 SOURCE_MANAGER（进程刚被拉起时 state.json 仍是旧源，必须显式激活）
     if new_provider == "lxmusic" and lx_url_changed:
         client = get_http(request)
@@ -949,7 +1264,18 @@ async def api_config_put(body: ConfigBody, request: Request):
                         "ok": code == 0, "error": "" if code == 0 else out})
 
     # 预览收尾：保存启用的转正常驻，其余预览进程立即停止
-    actions.extend(preview_reconcile_after_save())
+    actions.extend(preview_reconcile_after_save(keep_musicbox=resident_keep))
+
+    # 网易云歌单常驻对账（幂等；provider=musicbox 时归音源切换管，内部跳过）
+    client = get_http(request)
+    try:
+        await _reconcile_musicbox_resident(
+            client, after, actions,
+            warn=bool({_RESIDENT_FLAG, "FNMUSIC_NETEASE_MY_PLAYLISTS"} & set(updates)
+                      or old_provider != new_provider),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("[resident] 配置保存时常驻对账异常")
 
     restart_keys = [k for k in changed if SCHEMA.get(k, {}).get("reload") == "restart"]
     return {"ok": True, "changed": changed, "actions": actions, "restart_keys": restart_keys}
@@ -1162,6 +1488,70 @@ async def api_platforms(request: Request):
     return {"ok": True, "enabled": data.get("enabled") or [], "registered": data.get("registered") or []}
 
 
+# ------------------------------------------------- 公共歌单浏览代理（#55） --
+
+_public_discovery_cache: dict[tuple, tuple[float, bytes, str]] = {}
+_public_discovery_locks: dict[tuple, asyncio.Lock] = {}
+
+
+@app.api_route("/api/public-playlists", methods=["GET"])
+@app.api_route("/api/public-playlists/{target:path}", methods=["GET"])
+async def api_public_playlists(target: str = "", request: Request = None):
+    """公共歌单浏览代理：provider 选择 musicbox/lxmusic，固定白名单目标路径。"""
+    provider = str(request.query_params.get("provider") or "").strip()
+    if provider not in ("musicbox", "lxmusic"):
+        return JSONResponse(content={"ok": False, "error": "provider 必须是 musicbox 或 lxmusic"}, status_code=400)
+    allowed = (
+        "capabilities", "categories",
+    )
+    if target and target not in allowed and not re.fullmatch(r"[^/]+(/tracks)?", target):
+        return JSONResponse(content={"ok": False, "error": "unknown public playlist endpoint"}, status_code=404)
+    if provider == "musicbox":
+        preview_renew("musicbox")
+        base = CONF["musicbox_url"]
+    else:
+        preview_renew("lxmusic")
+        base = CONF["lx_url"]
+    params = {key: value for key, value in request.query_params.items() if key != "provider"}
+    if target in {".", ".."}:
+        return JSONResponse(content={"ok": False, "error": "invalid playlist ID"}, status_code=400)
+    upstream_path = "/api/v1/public-playlists" + (f"/{target}" if target else "")
+    cacheable = target != "capabilities" and not target.endswith("/tracks") and params.get("channel") != "account_recommend"
+    cache_key = (provider, target, tuple(sorted(params.items())))
+    if len(_public_discovery_locks) > 512:
+        for key, existing_lock in list(_public_discovery_locks.items()):
+            if not existing_lock.locked():
+                _public_discovery_locks.pop(key, None)
+    cached = _public_discovery_cache.get(cache_key)
+    if cacheable and cached and cached[0] > time.monotonic():
+        return Response(content=cached[1], media_type=cached[2])
+    try:
+        lock = _public_discovery_locks.setdefault(cache_key, asyncio.Lock())
+        async with lock:
+            cached = _public_discovery_cache.get(cache_key)
+            if cacheable and cached and cached[0] > time.monotonic():
+                return Response(content=cached[1], media_type=cached[2])
+            resp = await get_http(request).get(
+                f"{base}{upstream_path}", params=params,
+                timeout=httpx.Timeout(65.0, connect=3.0),
+            )
+            if cacheable and resp.status_code == 200 and _resp_json(resp).get("ok") is True:
+                ttl = 86400 if target == "categories" or params.get("channel") == "charts" else 1800
+                if len(_public_discovery_cache) >= 256:
+                    _public_discovery_cache.pop(next(iter(_public_discovery_cache)))
+                _public_discovery_cache[cache_key] = (time.monotonic() + ttl, resp.content, resp.headers.get("content-type", "application/json"))
+    except httpx.HTTPError as exc:
+        return JSONResponse(
+            content={"ok": False, "error": f"音源服务不可达: {exc}", "hint": "请先在管理页预览或启用该音源"},
+            status_code=503,
+        )
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type", "application/json"),
+    )
+
+
 # ------------------------------------------------- 网易扫码（反代 musicbox） --
 
 @app.api_route("/api/netease/auth/{path:path}", methods=["GET", "POST"])
@@ -1181,6 +1571,21 @@ async def netease_auth_proxy(path: str, request: Request):
         )
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"musicbox 服务不可达: {exc}") from exc
+    # 扫码成功（803）：musicbox 侧已重建实例读新 cookie，此处清公共歌单发现缓存
+    # （未登录时 account_recommend 等频道可能缓存了降级结果），并即时转常驻保活
+    # （否则预览到期会被清退，要等下次保存才恢复）。803 每次登录只出现一次。
+    try:
+        payload = resp.json()
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        if isinstance(data, dict) and data.get("code") == 803:
+            _public_discovery_cache.clear()
+            _resident_login_cache.update(ts=0.0, value=None)
+            _resident_start_block.update(until=0.0, reason="")
+            values = read_env()
+            if _resident_active(values) and current_provider(values) != "musicbox":
+                await _reconcile_musicbox_resident(client, values, [])
+    except Exception:  # noqa: BLE001  # 钩子失败不影响登录轮询本身
+        pass
     return Response(content=resp.content, status_code=resp.status_code,
                     media_type=resp.headers.get("content-type", "application/json"))
 

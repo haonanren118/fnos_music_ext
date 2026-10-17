@@ -127,6 +127,11 @@
           <div class="card-title">网易账号歌单</div>
           <label class="switch-row"><span>音乐页显示网易账号歌单<div class="sub">需要「网易云音乐盒子」已启用并扫码登录。开启后，网易账号里自己创建的歌单会出现在音乐页「热门推荐」下方、官方歌单上方，点开就能听；收藏的他人歌单不显示。歌单只读：在音乐页往里加歌、移歌或删除都不会写回网易。默认关闭，保存后立即生效。</div></span><input type="checkbox" id="netease-my-playlists"></label>
         </div>
+
+        <div class="card">
+          <div class="card-title">网易云歌单常驻</div>
+          <label class="switch-row"><span>网易云歌单常驻（容器保活）<div class="sub">勾选后，即使当前音源不是「网易云音乐盒子」，musicbox 进程也保持常驻，为网易账号歌单持续供数。需已开启「音乐页显示网易账号歌单」并扫码登录；未登录时本选项不生效。取消勾选且当前音源非网易时，自动停止 musicbox 进程以释放内存（登录态与数据保留，切回不丢）。默认关闭。</div></span><input type="checkbox" id="netease-resident"></label>
+        </div>
       </section>
 
       <!-- 播放与推荐 -->
@@ -144,6 +149,31 @@
           <div class="card-title">推荐</div>
           <label class="switch-row"><span>热门榜单推荐<div class="sub">独立「热门推荐」歌单：热歌榜/飙升榜原味</div></span><input type="checkbox" id="recommend-hot"></label>
           <label class="switch-row"><span>每日推荐<div class="sub">独立「每日推荐」歌单；其他音源在配置大模型后生效</div></span><input type="checkbox" id="recommend-daily"></label>
+          <label class="switch-row"><span>公共歌单<div class="sub">浏览并勾选网易/洛雪的原生推荐、分类歌单和榜单；勾选后作为独立只读歌单显示。musicdl 没有统一的推荐歌单发现接口。</div></span><input type="checkbox" id="public-playlists-enabled"></label>
+          <div id="public-playlists-browser" class="stack" hidden>
+            <div class="btn-row">
+              <select class="input" id="public-provider" aria-label="歌单音源"></select>
+              <select class="input" id="public-channel" aria-label="歌单入口"></select>
+              <select class="input" id="public-source" aria-label="洛雪平台" hidden></select>
+              <select class="input" id="public-sort" aria-label="排序" hidden></select>
+            </div>
+            <div class="btn-row">
+              <select class="input grow" id="public-category" aria-label="分类"></select>
+              <input class="input grow" id="public-keyword" placeholder="歌单关键词，回车搜索" aria-label="歌单关键词" hidden>
+              <button class="btn" id="public-refresh">刷新</button>
+            </div>
+            <p class="hint" id="public-note">选择音源后加载歌单。</p>
+            <div id="public-list" class="public-list"></div>
+            <div class="btn-row">
+              <button class="btn small" id="public-prev">上一页</button>
+              <span id="public-page" class="muted">1 / 1</span>
+              <button class="btn small" id="public-next">下一页</button>
+            </div>
+            <div>
+              <div class="card-title">已选歌单（音乐页展示顺序）</div>
+              <div id="public-selected" class="stack"></div>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -243,6 +273,32 @@
         <div class="card" id="ver-changelog-card" hidden>
           <div class="card-title">升级点明细</div>
           <div id="ver-changelog" class="stack"></div>
+        </div>
+
+        <div class="card" id="ver-hotfix-card">
+          <div class="card-title">热更新</div>
+          <div class="btn-row hotfix-online" id="hotfix-online-row" hidden>
+            <span class="hotfix-label">在线更新</span>
+            <select id="hotfix-online-ver" class="input hotfix-ver"></select>
+            <button class="btn primary hotfix-go" id="hotfix-online">更新</button>
+          </div>
+          <div id="hotfix-online-result" class="report" hidden></div>
+          <details id="hotfix-manual" style="margin-top:10px">
+            <summary class="muted">手动安装（高级）</summary>
+            <div class="btn-row" style="margin-top:10px">
+              <input type="file" id="hotfix-file" accept=".json,application/json" hidden>
+              <button class="btn" id="hotfix-pick">选择文件</button>
+              <input class="input grow" id="hotfix-url" placeholder="或粘贴链接获取">
+              <button class="btn" id="hotfix-fetch">获取</button>
+            </div>
+            <div id="hotfix-preview" class="report" hidden></div>
+            <div class="btn-row">
+              <button class="btn primary" id="hotfix-apply" hidden>应用热更新</button>
+              <button class="btn" id="hotfix-rollback" hidden>回滚上一版</button>
+              <span id="hotfix-note" class="muted"></span>
+            </div>
+            <div id="hotfix-result" class="report" hidden></div>
+          </details>
         </div>
       </section>
     </main>

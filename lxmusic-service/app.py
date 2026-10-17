@@ -17,12 +17,13 @@ import logging
 import os
 import re
 import time
+import urllib.parse
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Header, Query
+from fastapi import FastAPI, Header, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -34,6 +35,16 @@ from source_runtime import (
     parse_script_meta,
     save_upload,
     script_quality_for_tier,
+)
+
+# lxserver 客户端（#55 公共歌单发现层）：仅歌单/榜单发现，不参与播放。
+# 注意不导入 normalize_source —— 本文件 L61 自有同语义实现，避免命名遮蔽。
+from lxserver_client import (
+    DEFAULT_ADMIN_PASSWORD,
+    DEFAULT_LXSERVER_URL,
+    LxServerClient,
+    SUPPORTED_PLATFORMS,
+    map_lxserver_song,
 )
 
 logger = logging.getLogger("lxmusic_service")
@@ -97,10 +108,21 @@ CONF = {
     # 逐曲探活开关（beta）：默认关。开启时在搜索阶段逐曲调用用户源解析+Range探活；
     # 慢速用户源或多平台并发容易引发搜索超时，建议保持关闭（播放时实时解析直链）
     "search_probe": os.environ.get("FNMUSIC_SEARCH_PROBE", "false").lower() in ("true", "1", "yes"),
+    # lxserver（#55 发现层）songInfo 磁盘持久化目录，随 LX_DATA_DIR（容器内 /data/lxmusic）
+    "data_dir": os.environ.get("LX_DATA_DIR", "/data/lxmusic"),
 }
 
 # 当前激活的用户自定义源（启动时从 state.json / LX_SOURCE_URL 恢复）
 SOURCE_MANAGER = SourceManager(seed_url=CONF["source_url"])
+
+# lxserver（#55 公共歌单发现层）客户端实例：歌单/榜单发现走它，播放仍走用户源链。
+# songInfo 磁盘持久化：重启后榜单/搜索反查缓存不丢。
+LXSERVER = LxServerClient(
+    base_url=os.environ.get("LXSERVER_URL", DEFAULT_LXSERVER_URL),
+    admin_password=os.environ.get("LXSERVER_ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD),
+    timeout=CONF["resolver_timeout"],
+    store_path=os.path.join(CONF["data_dir"], "songinfo_store.json"),
+)
 
 UA_PC = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 UA_MOBILE = "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
@@ -247,13 +269,25 @@ async def kg_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
         # 1. 收费/VIP 曲目不直接丢弃，转入探活队列（直链解析+Range探活通过才返回）
         pay_type = int(it.get("pay_type") or 0)
         is_vip = pay_type != 0 or int(it.get("pkg_price") or 0) != 0 or int(it.get("price") or 0) != 0
-        # 2. 排除仅免费试听片段标记 (is_free_part=1) 及 VIP 拦截 (fail_process=4)，真不可播
-        if int(it.get("is_free_part") or 0) != 0 or int(it.get("fail_process") or 0) == 4:
+        # 原唱标识（酷狗独有硬字段）：提前取出。它既用于下游「原唱优先」排序，
+        # 也决定下面的 VIP 条目是否放行（见第 3 条）。
+        is_orig = _is_original_kg(it)
+        # 2. 仅排除「免费试听片段」(is_free_part=1)，这类真的只有片段，不可播
+        if int(it.get("is_free_part") or 0) != 0:
+            continue
+        # 3. fail_process=4 是酷狗的「VIP 拦截」标记，默认丢弃；**但明确原唱除外**。
+        #    2026-10-09 实测：晴天/周杰伦（lx:kg:b3a52a7a958bf0aed0ebfba2e9a818b7）
+        #    虽 fail_process=4 / pay_type=3 / price=200，仍能解析出**完整**直链
+        #    （HTTP 200 / flac / 31633244 B / 路径含 /yp/full/）。
+        #    若连原唱一并丢弃，上游唯一带 isoriginal 硬标识的条目就全没了 —— 实测
+        #    12 条结果里 is_original=True 为 0，「原唱优先」将无原唱可排。
+        #    ⚠ 只对「明确原唱 (=True)」开口；None/False 一律维持原过滤，不扩大放行。
+        if int(it.get("fail_process") or 0) == 4 and is_orig is not True:
             continue
 
         singer = str(it.get("singername") or "")
         title = str(it.get("songname") or it.get("filename") or "").replace(f"{singer} - ", "")
-        # 3. 标题带有试听片段标记的坚决不返回
+        # 4. 标题带有试听片段标记的坚决不返回
         if any(marker in title for marker in _TRIAL_TITLE_MARKERS):
             continue
         sq = str(it.get("sqhash") or "")
@@ -261,7 +295,15 @@ async def kg_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
         # v3 搜索接口 duration 单位为秒（2026-09 实测：晴天=269，4:29）；
         # 按毫秒除以 1000 会把时长变成 0:00（下游按秒渲染）
         duration_s = int(it.get("duration") or 0)
-        cover = str(it.get("origin_cover") or it.get("img") or "").replace("{size}", "480")
+        # trans_param.union_cover 是带日期的真专辑图，比 stdmusic/<hash>.jpg 默认黑胶图可信。
+        # （is_orig 已在循环顶部取出，与 VIP 放行判定共用同一结果，此处不再重复计算）
+        tp = it.get("trans_param") if isinstance(it.get("trans_param"), dict) else {}
+        union_cover = str(tp.get("union_cover") or "").replace("{size}", "480")
+        # ★ 2026-10-09：酷狗 v3 搜索接口**没有** origin_cover/img 字段 → cover 恒为空
+        #   （实测 kg_search 全部条目 cover_url 空、union_cover 有值）。union_cover 既已是
+        #   可信真图，就以它兜底 cover —— 否则下游只能直构 stdmusic/<hash>.jpg（酷狗默认
+        #   黑胶图，被黑名单拦下）再靠网易同名曲碰运气，大列表封面大量回落占位图。
+        cover = str(it.get("origin_cover") or it.get("img") or "").replace("{size}", "480") or union_cover
         item = {
             "id": f"lx:kg:{fhash}",
             "lx_source": "kg",
@@ -271,6 +313,9 @@ async def kg_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
             "duration_s": duration_s,
             "ext": "flac" if sq else "mp3",
             "cover_url": cover,
+            "union_cover": union_cover,
+            "is_original": is_orig,
+            "has_version_marker": _title_has_version_marker(title),
             "file_size": int(sq and it.get("sq_size") or it.get("filesize") or 0) or 0,
             "lyric": "",
             "hash": fhash,
@@ -280,7 +325,9 @@ async def kg_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
             "mixsongid": str(it.get("mixsongid") or ""),
             "pay_type": pay_type,
         }
-        if is_vip:
+        # 明确原唱的 VIP 曲目直接放行（已验证可解析完整直链，见上方第 3 条说明）；
+        # 其余 VIP 仍转入候选队列，不改变原有行为。
+        if is_vip and is_orig is not True:
             vip_candidates.append(item)
         else:
             item.update(verified=False, validation_status="unverified", completeness="unknown")
@@ -299,6 +346,132 @@ async def kg_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
                 items.append(it)
                 _publish(it)
     return items[: limit + limit // 2]
+
+
+async def _kg_info_by_hash(client: httpx.AsyncClient, fhash: str) -> "dict | None":
+    """酷狗源自查补全：hash → getSongInfo 取歌名/歌手 → 再搜一次取真专辑图。
+
+    ★ 2026-10-09 新增。内存搜索缓存（_SONG_CACHE，TTL 1800s / 上限 2000 条）
+    未命中时用它兜底 —— 否则 /api/v1/track/info 对历史条目（如「最近播放」）
+    只能返回空 stub，proxy 的封面链拿不到 title/artist/cover_url，最终回落占位图。
+
+    实测（2026-10-09）：`http://m.kugou.com/app/i/getSongInfo.php?cmd=playInfo&hash=`
+    可稳定取回 songName/singerName；再用「歌名 歌手」走 kg_search 拿到
+    trans_param.union_cover（带日期的真专辑图）。5/5 用例覆盖成功。
+
+    失败返回 None，调用方维持原空 stub 行为（不抛异常）。
+    """
+    if not fhash:
+        return None
+    try:
+        r = await client.get(
+            "http://m.kugou.com/app/i/getSongInfo.php",
+            params={"cmd": "playInfo", "hash": fhash},
+            headers={"User-Agent": UA_MOBILE},
+        )
+        r.raise_for_status()
+        detail = r.json()
+    except Exception as e:  # noqa: BLE001
+        logger.debug("kg getSongInfo failed for %s: %s", fhash, e)
+        return None
+    if not isinstance(detail, dict):
+        return None
+    title = str(detail.get("songName") or "").strip()
+    artist = str(detail.get("singerName") or detail.get("author_name") or "").strip()
+    if not title:
+        return None
+
+    items: list = []
+    try:
+        items = await kg_search(client, f"{title} {artist}".strip(), 5)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("kg backfill search failed for %s: %s", fhash, e)
+
+    want = fhash.strip().casefold()
+    best = next((it for it in items if str(it.get("hash") or "").casefold() == want), None)
+    if best is None and items:
+        best = items[0]          # 搜索首条通常就是同一首歌（歌名+歌手一致）
+
+    if best is None:
+        # 连搜索都没结果：至少回填歌名/歌手，proxy 仍可据此走网易同名曲反查
+        return {
+            "id": f"lx:kg:{fhash}", "lx_source": "kg",
+            "title": title, "artist": artist, "album": "",
+            "duration_s": int(detail.get("timeLength") or 0),
+            "ext": "mp3", "cover_url": "", "union_cover": "", "file_size": 0, "lyric": "",
+            "hash": fhash, "hash_hq": "", "hash_sq": "",
+            "album_id": str(detail.get("req_albumid") or ""), "mixsongid": "",
+            "pay_type": 0, "is_original": None, "has_version_marker": False,
+        }
+
+    out = dict(best)
+    # ⚠ 必须保留**请求的** hash：播放直链解析要用它。搜索结果里的 hash 可能是
+    #   同一首歌的另一个 hash（且大小写不同），直接沿用会解析出另一条音源。
+    out["id"] = f"lx:kg:{fhash}"
+    out["hash"] = fhash
+    out["title"] = out.get("title") or title
+    out["artist"] = out.get("artist") or artist
+    return out
+
+
+async def _wy_info_by_id(client: httpx.AsyncClient, sid: str) -> "dict | None":
+    """网易源自查补全：song id → /api/song/detail 取歌名/歌手/专辑图。
+
+    ★ 2026-10-09 新增，与 _kg_info_by_hash 同一目的（内存缓存未命中时补元数据）。
+
+    实测（2026-10-09）：`https://music.163.com/api/song/detail/?id=<id>&ids=[<id>]`
+    稳定返回 `songs[0]`（name / artists[].name / album.picUrl / duration(ms)）。
+
+    失败返回 None，调用方维持原空 stub 行为（不抛异常）。
+    """
+    if not sid:
+        return None
+    try:
+        r = await client.get(
+            "https://music.163.com/api/song/detail/",
+            params={"id": sid, "ids": f"[{sid}]"},
+            headers={
+                "User-Agent": UA_PC,
+                "Referer": "https://music.163.com/",
+                "Cookie": "os=pc; appver=9.1.15",
+            },
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:  # noqa: BLE001
+        logger.debug("wy song/detail failed for %s: %s", sid, e)
+        return None
+    songs = (data or {}).get("songs") or []
+    if not songs or not isinstance(songs[0], dict):
+        return None
+    s = songs[0]
+    title = str(s.get("name") or "").strip()
+    if not title:
+        return None
+    al = s.get("album") if isinstance(s.get("album"), dict) else {}
+    names: list[str] = []
+    for a in s.get("artists") or []:
+        if isinstance(a, dict) and a.get("name"):
+            names.append(str(a["name"]))
+        elif isinstance(a, str):
+            names.append(a)
+    dur_ms = s.get("duration") or 0
+    try:
+        duration_s = float(dur_ms) / 1000.0 if dur_ms else 0.0
+    except (TypeError, ValueError):
+        duration_s = 0.0
+    return {
+        "id": f"lx:wy:{sid}", "lx_source": "wy",
+        "title": title, "artist": " / ".join(names),
+        "album": str(al.get("name") or ""),
+        "duration_s": duration_s,
+        "ext": "mp3",
+        "cover_url": str(al.get("picUrl") or ""),   # 网易真专辑图
+        "union_cover": "", "file_size": 0, "lyric": "",
+        "hash": "", "hash_hq": "", "hash_sq": "",
+        "album_id": "", "mixsongid": "",
+        "pay_type": 0, "is_original": None, "has_version_marker": False,
+    }
 
 
 async def kg_resolve_lyric(client: httpx.AsyncClient, item: dict) -> str:
@@ -402,6 +575,9 @@ async def wy_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
             "duration_s": int(it.get("duration") or 0) / 1000.0,
             "ext": "mp3",
             "cover_url": str(album.get("picUrl") or "") if isinstance(album, dict) else "",
+            # 网易无原唱字段：只能标记「标题是否含版本词」，交给下游做启发式排序
+            "is_original": None,
+            "has_version_marker": _title_has_version_marker(str(it.get("name") or "")),
             "file_size": 0,
             "lyric": "",
             "song_id": sid,
@@ -481,6 +657,9 @@ async def mg_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
             "lyric": "",
             "lrc_url": str(it.get("lrcUrl") or ""),
             "copyright_id": cid,
+            # 咪咕无原唱字段；toneFlags 里的 ORI 类标记非原唱语义，不做硬标识
+            "is_original": None,
+            "has_version_marker": _title_has_version_marker(title),
         }
         return item
 
@@ -708,6 +887,92 @@ def _explicit_trial(data: dict) -> bool:
                 or data.get("trial_url") or data.get("trialUrl"))
 
 
+# ------------------------------------------------------- 原唱识别（搜索排序用）---
+#
+# 目标：搜索结果里「原唱」排在翻唱/伴奏/remix 之前。
+# 硬标识只有酷狗（kg）提供：trans_param.is_original / 顶层 isoriginal。
+# 其余源没有该字段，只能交给下游（proxy）按「标题 ≈ 关键词 + 版本词降权」启发式排。
+# 这里只负责「把能拿到的硬标识捞出来并透传」，不做排序——排序要跨源统一做，
+# 单源内部排序在合并后会被打散（酷我 _title_relevance 就是只作用于单源的先例）。
+
+# 酷狗原唱标识是**数字枚举**（不是布尔字符串）——实测 100 条样本 + 12 个
+# 「确知原唱」条目交叉验证（2026-10-09）：
+#
+#   顶层 isoriginal            1 = 原唱，0 = 非原唱        ← 二值，最干净
+#   trans_param.is_original    1 = 原唱
+#                              2 = 非原唱（翻唱/女声版/普通）
+#                              4 = 非原唱（Live/Remix/纯音乐/3D版）
+#                              5 = 非原唱（钢琴曲/纯音乐/Live）
+#                              6 = 非原唱（DJ版）
+#                              7 / 10 = 非原唱（合声 Live）
+#
+# 12 个真原唱（周杰伦/薛之谦/田馥甄/于文文…）全部落到 tp=1 & top=1；
+# 非原唱条目一律 top=0。**顶层字段与「tp==1」一一对应**，故优先取顶层。
+#
+# ⚠ v2.6.24 的初版把它当布尔串处理（只认 "1"/"0"），导致 2/4/5/6/7/10 全落
+#   None → 硬标识几乎全失效（100 条里只有 7 条生效）。本版修正。
+_ORIGINAL_TRUE = ("1", "true", "yes", "y", "t")
+_ORIGINAL_FALSE = ("0", "false", "no", "n", "f")
+
+
+def _is_original_kg(data: dict) -> "bool | None":
+    """酷狗原唱硬标识，**三态**返回：
+
+      True  —— 明确是原唱（顶层 isoriginal==1，或 trans_param.is_original==1）
+      False —— 明确不是原唱（字段存在且值指向非原唱）
+      None  —— 上游没给这个字段 / 给的值无法解析 → 交下游启发式判断
+
+    必须区分 None 与 False：把「没标识」当成「非原唱」会让所有老数据被判成
+    非原唱而整体降权，比不排序更糟（2026-10-08 单测抓出此 bug）。
+
+    取值顺序（2026-10-09 修正）：**先顶层 isoriginal**——它是干净的 1/0 二值，
+    与「tp.is_original==1」实测完全一一对应；缺失/不可解析时才回退 tp 字段。
+    tp 字段按数字枚举解释：1=原唱，其余已知值=非原唱，未知值=None（不降权）。
+    """
+    top = data.get("isoriginal")
+    if top is not None:
+        token = str(top).strip().casefold()
+        if token in _ORIGINAL_TRUE:
+            return True
+        if token in _ORIGINAL_FALSE:
+            return False
+        # 顶层给了但值怪异 → 继续看 tp，别急着判未知
+    tp = data.get("trans_param")
+    raw = tp.get("is_original") if isinstance(tp, dict) else None
+    if raw is None:
+        return None
+    token = str(raw).strip().casefold()
+    if token in _ORIGINAL_TRUE:
+        return True
+    if token in _ORIGINAL_FALSE:
+        return False
+    # 数字枚举：只有 **1** 是原唱；其余可解析整数（2/4/5/6/7/10…）都是非原唱。
+    # ⚠ 方向极易写反：是 `== 1` 判原唱，不是 `!= 1`（2026-10-09 单测抓出过反写）。
+    try:
+        return int(token) == 1
+    except (TypeError, ValueError):
+        return None      # 无法识别的值 → 当未知处理，不降权
+
+# 标题里的「非原唱」版本词。命中即认为不是原版，供下游降权/过滤。
+# 注意：这些词**只用于排序权重**，绝不用于丢弃数据——用户明确要求「软优先」。
+_NON_ORIGINAL_TITLE_MARKERS = (
+    "伴奏", "伴唱", "卡拉ok", "karaoke", "ktv",
+    "翻唱", "cover", "致敬",
+    "remix", "混音", "remix版", "dj", "电音",
+    "纯音乐", "instrumental", "演奏", "钢琴版", "吉他版", "口琴",
+    "童声", "儿童", "女声版", "男声版",
+    "铃音", "铃声", "彩铃",
+    "现场", "live", "演唱会", "音乐会",
+    "demo", "试唱",
+)
+
+
+def _title_has_version_marker(title: str) -> bool:
+    """标题是否命中「非原唱」版本词（伴奏/翻唱/remix 等）。"""
+    low = (title or "").casefold()
+    return any(m in low for m in _NON_ORIGINAL_TITLE_MARKERS)
+
+
 def _actual_tier(result: dict) -> str:
     if result.get("ext") in ("flac", "wav", "ape"):
         return "lossless"
@@ -717,18 +982,75 @@ def _actual_tier(result: dict) -> str:
     return "standard" if br > 0 else "unknown"
 
 
+# 广告/试听片段拦截（2026-10-10）。
+# 实测酷我「酷我官方」候选源对部分 rid 返回的是自家推广片段：URL 形如
+#   .../resource/30106/trackmedia/<hash>.mp3?bitrate$1&format$mp3     ← bitrate$1
+# 而正常曲目是
+#   .../resource/30106/trackmedia/long/<hash>.mp3?bitrate$128&format$mp3
+# 该片段只有 12 秒 / 181 KB，而搜索元数据声明的时长是 312 秒 ——
+# 平均码率 185336*8/312 ≈ 4.8 kbps（正常 128 kbps）。
+# 它同样是**合法 MP3**，探活（probe_url 只看前 1KB 能否解码）查不出来，
+# 于是被判 media_verified 直接播放 —— 用户听到的就是 12 秒推广。
+# 只能用「声明时长 vs 实际字节数」的平均码率识别。
+_AD_CLIP_MIN_KBPS = 32.0          # 正常最低也有 64k；低于 32k 必是异常资源
+_AD_CLIP_MIN_DURATION_S = 45.0    # 时长太短（铃声/片段）不做码率判断，避免误伤
+_AD_CLIP_FALLBACK_BYTES = 200_000  # 无声明时长时的绝对下限：低于此值不可能是完整歌曲
+#                                   （1 分钟 32kbps 也要 240KB）
+
+
+def _is_ad_clip(item: "dict | None", result: dict) -> bool:
+    """判定广告/试听片段。
+
+    主判据：平均码率（声明时长 vs 实际总字节）< 32 kbps。
+    兜底判据：拿不到声明时长时（例如 lxmusic 重启后缓存未命中、客户端直接点
+    「最近播放」而不经过搜索），只能靠绝对字节下限 —— 实测酷我推广片段
+    185336 B 会被兜底拦下，而任何完整歌曲都远大于 200KB。
+    """
+    if not isinstance(item, dict) or not isinstance(result, dict):
+        return False
+    try:
+        duration = float(item.get("duration_s") or 0)
+        size = float(result.get("file_size") or 0)
+    except (TypeError, ValueError):
+        return False
+    if size <= 0:
+        return False
+    if duration >= _AD_CLIP_MIN_DURATION_S:
+        return (size * 8.0 / duration / 1000.0) < _AD_CLIP_MIN_KBPS
+    if duration > 0:
+        return False        # 声明时长过短：可能是铃声/短曲，不下结论
+    return size < _AD_CLIP_FALLBACK_BYTES
+
+
 async def _verify_result(client: httpx.AsyncClient, result: dict | None,
-                         *, report_transport: bool = False) -> dict | None:
+                         *, item: "dict | None" = None,
+                         report_transport: bool = False) -> dict | None:
     if not result or not result.get("url") or _explicit_trial(result):
         return None
     result = dict(result)
+    probe_size = 0
     if not result.get("probed"):
         ok, final, ct, size = await probe_url(client, result["url"], result.get("headers"),
                                             report_transport=report_transport)
         if not ok:
             return None
-        result.update(url=final, file_size=size or result.get("file_size") or 0,
+        probe_size = int(size or 0)
+        result.update(url=final, file_size=probe_size or result.get("file_size") or 0,
                       ext=ct.split("/")[-1], probed=True)
+    # 广告判定只在 probe 给出**可信总大小**时进行。probe_size 来自响应头的
+    # Content-Range（真实全文件大小）；若 CDN 没给，_content_total_size 返回 0，
+    # 此时 result["file_size"] 会退化成**音源脚本自报的值** —— 那个值不可靠
+    # （实测即有小到 13 万字节却声明 269 秒的条目），拿它判会误杀正常曲目。
+    # 取舍：宁可漏判广告，不可误杀歌曲。
+    if probe_size > 0 and _is_ad_clip(item, {"file_size": probe_size}):
+        try:
+            dur = float((item or {}).get("duration_s") or 0)
+            kbps = probe_size * 8.0 / dur / 1000.0 if dur else 0.0
+        except (TypeError, ValueError):
+            dur = kbps = 0.0
+        logger.info("ad/clip rejected: id=%s declared=%.0fs size=%d kbps=%.1f",
+                    str((item or {}).get("id") or "")[:44], dur, probe_size, kbps)
+        return None
     result.update(validation_status="media_verified", completeness="unknown")
     result["actual_tier"] = _actual_tier(result)
     return result
@@ -834,7 +1156,9 @@ async def _resolve_and_probe(client: httpx.AsyncClient, src: str, item: dict,
             url = await runtime.music_url(
                 music_info, quality, platform=src, timeout=CONF["resolver_timeout"]
             )
-            result = await _verify_result(client, {"url": url}, report_transport=True)
+            # item 传进去用于广告/试听片段识别（声明时长 vs 实际字节数）
+            result = await _verify_result(client, {"url": url}, item=item,
+                                          report_transport=True)
         except asyncio.CancelledError:
             # Deadline/client cancellation says nothing about source health.
             _CHAIN_HEALTH.get("user_source", {}).pop("half_open", None)
@@ -992,6 +1316,9 @@ async def tx_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
                 "str_media_mid": str(file_obj.get("media_mid") or ""),
                 "album_id": str(album.get("id") or ""),
                 "pay_type": int(pay.get("pay_play") or 0),
+                # QQ 无原唱字段（顶层 act/ksong/vf 等均非原唱标识，2026-10 实勘）
+                "is_original": None,
+                "has_version_marker": _title_has_version_marker(title),
             }
         )
     # 直链由用户自定义源解析+探活；未开启逐曲探活时直接作为未验证条目返回
@@ -1121,6 +1448,9 @@ async def kw_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list
                 "duration_s": int(it.get("DURATION") or 0),
                 "ext": "mp3",
                 "cover_url": f"https://img1.kuwo.cn/star/albumcover/{cover_short}" if cover_short else "",
+                # 酷我无原唱字段，标题里常见「(KTV版伴奏)」这类版本词
+                "is_original": None,
+                "has_version_marker": _title_has_version_marker(title),
                 "file_size": 0,
                 "lyric": "",
                 "rid": rid,
@@ -1206,6 +1536,9 @@ async def kg_chart_songs(client: httpx.AsyncClient, limit: int) -> list[dict]:
             "hash_sq": sq,
             "mixsongid": str(it.get("album_audio_id") or ""),
             "pay_type": pay_type,
+            # rank 接口通常无 trans_param，但顶层 isoriginal 偶有；同样透传
+            "is_original": _is_original_kg(it),
+            "has_version_marker": _title_has_version_marker(title),
         }
         if is_vip:
             vip_candidates.append(item)
@@ -1281,6 +1614,8 @@ async def kw_chart_songs(client: httpx.AsyncClient, limit: int) -> list[dict]:
                 "lyric": "",
                 "rid": rid,
                 "pay_type": 1 if str(fee_type.get("song") or "0") != "0" else 0,
+                "is_original": None,
+                "has_version_marker": _title_has_version_marker(title),
             }
         )
     if is_probe_enabled():
@@ -1384,11 +1719,19 @@ async def lifespan(fastapi_app: FastAPI):
         loader.cancel()
         await asyncio.gather(loader, return_exceptions=True)
         await SOURCE_MANAGER.shutdown()
+        await LXSERVER.close()
         if created:
             await fastapi_app.state.http.aclose()
 
 
 app = FastAPI(title="fnmusic-lxmusic", version=SERVICE_VERSION, lifespan=lifespan)
+
+
+# 公共歌单端点的参数校验失败统一走 400 + {"ok": false}（与 _err 同构），
+# 避免 ValueError 冒泡成 500。本文件其余端点不抛 ValueError，互不影响。
+@app.exception_handler(ValueError)
+async def value_error_handler(_request: Request, exc: ValueError):
+    return JSONResponse(status_code=400, content={"ok": False, "error": str(exc)})
 
 
 def get_http(fastapi_app: FastAPI) -> httpx.AsyncClient:
@@ -1645,6 +1988,331 @@ async def recommend_charts(
     return {"ok": True, "items": items[:limit], "errors": errors, "charts": sorted(_CHARTERS)}
 
 
+# ------------------------------------------------- 公共歌单（#55 发现层） ---
+# 数据来自容器内 lxserver（127.0.0.1:8005）的免登录歌单/榜单接口；
+# 播放仍走本服务的用户源链（track/url），与上游「lxmusic 整体基于 lxserver」不同。
+
+def _public_source(source: str) -> str:
+    src = normalize_source(source)
+    if not src or src not in SUPPORTED_PLATFORMS:
+        raise ValueError(f"unsupported source {source!r}")
+    return src
+
+
+# ==== 榜单元信息缓存（曲目数 + 图标，2026-10-17） ====
+# lxserver 的 leaderboard/boards 只给 {id,name,bangid}：既没有曲目数、也没有榜图。
+# 而 leaderboard/list 第 1 页就带 total 和每首曲目的 img（实测 0.15~0.5s/条）。
+# 榜单页一次要展示 40+ 条，因此并发补取（上限 8）并落盘缓存 6 小时：
+# 首次约 2~3s，之后零上游调用。
+_CHART_META_TTL_S = 6 * 3600.0
+_CHART_META_CONCURRENCY = 8
+_CHART_META_BUDGET_S = 12.0
+_CHART_META_CACHE: "dict[str, dict]" = {}
+_CHART_META_LOADED = False
+_CHART_META_LOCK = asyncio.Lock()
+
+
+def _chart_meta_path() -> str:
+    return os.path.join(CONF["data_dir"], "chart_meta.json")
+
+
+def _chart_meta_load() -> None:
+    global _CHART_META_LOADED
+    if _CHART_META_LOADED:
+        return
+    _CHART_META_LOADED = True
+    try:
+        with open(_chart_meta_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        entries = data.get("entries") if isinstance(data, dict) else None
+        if isinstance(entries, dict):
+            for key, value in entries.items():
+                if not isinstance(value, dict):
+                    continue
+                try:
+                    _CHART_META_CACHE[str(key)] = {
+                        "total": int(value["total"]) if value.get("total") is not None else None,
+                        "cover_url": str(value.get("cover_url") or ""),
+                        "at": float(value["at"]),
+                    }
+                except (KeyError, TypeError, ValueError):
+                    continue
+    except Exception:
+        pass
+
+
+def _chart_meta_save() -> None:
+    try:
+        path = _chart_meta_path()
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        payload = {"version": 1, "savedAt": int(time.time()), "entries": _CHART_META_CACHE}
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as exc:
+        logger.warning("chart meta cache write failed: %s", exc)
+
+
+async def _chart_meta_for(src: str, board_ids: "list[str]") -> "dict[str, dict]":
+    """board_id → {total, cover_url}；缓存命中的直接给，未命中的并发补取。"""
+    if not board_ids:
+        return {}
+    _chart_meta_load()
+    now = time.time()
+    out: dict[str, dict] = {}
+    missing: list[str] = []
+    for board_id in board_ids:
+        hit = _CHART_META_CACHE.get(f"{src}:{board_id}")
+        if hit and now - float(hit.get("at") or 0) < _CHART_META_TTL_S:
+            out[board_id] = hit
+        else:
+            missing.append(board_id)
+    if not missing:
+        return out
+    sem = asyncio.Semaphore(_CHART_META_CONCURRENCY)
+
+    async def one(board_id: str) -> None:
+        async with sem:
+            meta = await LXSERVER.get_leaderboard_meta(src, board_id)
+        if not meta:
+            return
+        record = {
+            "total": meta.get("total"),
+            "cover_url": str(meta.get("cover_url") or ""),
+            "at": time.time(),
+        }
+        _CHART_META_CACHE[f"{src}:{board_id}"] = record
+        out[board_id] = record
+
+    async with _CHART_META_LOCK:
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*[one(b) for b in missing], return_exceptions=True),
+                timeout=_CHART_META_BUDGET_S,
+            )
+        except asyncio.TimeoutError:
+            logger.info("chart meta fill timed out: src=%s boards=%d", src, len(missing))
+        if out:
+            _chart_meta_save()
+    return out
+
+
+def _apply_chart_meta(item: dict, meta: "dict | None") -> None:
+    """把缓存里的曲目数/图标补进榜单条目（不覆盖已有真实值）。"""
+    if not isinstance(meta, dict):
+        return
+    if item.get("track_count") is None and meta.get("total") is not None:
+        item["track_count"] = meta["total"]
+    if not item.get("cover_url") and meta.get("cover_url"):
+        item["cover_url"] = meta["cover_url"]
+
+
+@app.get("/api/v1/public-playlists/capabilities")
+async def public_playlist_capabilities():
+    caps = source_capabilities()
+    return {
+        "ok": True,
+        "provider": "lx",
+        "sources": [{
+            "id": src,
+            "name": {"kw": "酷我", "kg": "酷狗", "tx": "QQ", "wy": "网易", "mg": "咪咕"}.get(src, src.upper()),
+            "playback_available": bool(caps.get(src, {}).get("playback_available")),
+            "reason": caps.get(src, {}).get("reason") or "",
+            "channels": [
+                {"id": "top", "name": "热门与分类", "login_required": False},
+                {"id": "charts", "name": "排行榜", "login_required": False},
+                # lxserver 另有 songList/search（免登录），此前没接到 WebUI，
+                # 洛雪面板的「通道」下拉因此只有 2 项。
+                {"id": "search", "name": "歌单搜索", "login_required": False},
+            ],
+            "logged_in": False,
+        } for src in SUPPORTED_PLATFORMS],
+    }
+
+
+@app.get("/api/v1/public-playlists/categories")
+async def public_playlist_categories(source: str = Query(...), kind: str = Query("playlist")):
+    src = _public_source(source)
+    if kind not in ("playlist", "chart"):
+        raise ValueError("kind must be playlist or chart")
+    if kind == "chart":
+        boards = await LXSERVER.get_leaderboard_boards(src)
+        return {"ok": True, "categories": [{"id": "", "name": "全部"}], "tags": boards, "sorts": []}
+    data = await LXSERVER.get_song_list_tags(src)
+    tags = data.get("tags")
+    if isinstance(tags, list):
+        data["tags"] = [
+            {**tag, "id": str(tag.get("id") or tag.get("name") or ""), "name": str(tag.get("name") or tag.get("id") or "")}
+            if isinstance(tag, dict) else {"id": str(tag), "name": str(tag)}
+            for tag in tags
+        ]
+    return {
+        "ok": True,
+        "categories": data.get("tags") or [],
+        "tags": data.get("hotTag") or data.get("hotTags") or [],
+        "sorts": data.get("sortList") or [],
+    }
+
+
+@app.get("/api/v1/public-playlists")
+async def public_playlists(
+    source: str = Query(...),
+    channel: str = Query("top"),
+    category: str = Query(""),
+    sort: str = Query(""),
+    page: int = Query(1, ge=1, le=100),
+    limit: int = Query(30, ge=1, le=50),
+    cursor: str = Query(""),
+    keyword: str = Query(""),
+):
+    src = _public_source(source)
+    if channel == "search":
+        # 歌单搜索通道（WebUI 第三项）：无关键词时返回空列表而不是报错，
+        # 避免用户刚切到该通道就看到一条红色错误提示。
+        text = str(keyword or "").strip()
+        if not text:
+            return {"ok": True, "items": [], "total": 0, "has_more": False, "keyword": ""}
+        data = await LXSERVER.search_song_lists(src, text, page)
+        raw_items = data.get("list") or []
+        items = [LXSERVER.normalize_public_playlist(row, src) for row in raw_items if isinstance(row, dict)]
+        try:
+            total = int(data.get("total") or 0)
+        except (TypeError, ValueError):
+            total = 0
+        return {
+            "ok": True,
+            "items": [it for it in items if it["id"]],
+            "total": total or len(items),
+            "has_more": bool(data.get("has_more")) or (page * 20 < total if total else False),
+            "keyword": text,
+        }
+    if channel == "charts":
+        rows = await LXSERVER.get_leaderboard_boards(src)
+        items = [it for it in (LXSERVER.normalize_public_playlist(row, src, "chart")
+                               for row in rows if isinstance(row, dict)) if it["id"]]
+        # 榜单曲目数 + 图标：lxserver 的 boards 接口两者都不给，这里并发补取 + 缓存
+        meta = await _chart_meta_for(src, [it["id"] for it in items])
+        for it in items:
+            _apply_chart_meta(it, meta.get(it["id"]))
+        return {"ok": True, "items": items, "total": len(items), "has_more": False}
+    if channel != "top":
+        raise ValueError(f"unsupported channel {channel!r}")
+    if not sort:
+        tags = await LXSERVER.get_song_list_tags(src)
+        sorts = tags.get("sortList") or []
+        if sorts:
+            sort = str(sorts[0].get("id") or "")
+    data = await LXSERVER.get_song_lists(src, category, sort, page)
+    raw_items = data.get("list") or []
+    items = [LXSERVER.normalize_public_playlist(row, src) for row in raw_items if isinstance(row, dict)]
+    try:
+        total = int(data.get("total") or 0)
+    except (TypeError, ValueError):
+        total = 0
+    try:
+        page_limit = max(1, int(data.get("limit") or 30))
+    except (TypeError, ValueError):
+        page_limit = 30
+    return {
+        "ok": True,
+        "items": [it for it in items if it["id"]],
+        "total": total,
+        "has_more": bool(data.get("has_more")) or (page * page_limit < total if total else bool(raw_items)),
+    }
+
+
+@app.get("/api/v1/public-playlists/{playlist_id}/tracks")
+async def public_playlist_tracks(
+    playlist_id: str,
+    source: str = Query(...),
+    kind: str = Query("playlist", pattern="^(playlist|chart)$"),
+):
+    async with asyncio.timeout(60):
+        return await _public_playlist_tracks(playlist_id, source, kind)
+
+
+async def _public_playlist_tracks(playlist_id: str, source: str, kind: str):
+    src = _public_source(source)
+    raw_id = urllib.parse.unquote(playlist_id)
+    items: list[dict] = []
+    truncated = False
+    if kind == "chart":
+        page = 1
+        seen_ids: set[str] = set()
+        while len(items) < 1000 and page <= 100:
+            rows = await LXSERVER.get_leaderboard_list(src, raw_id, page=page, strict=True)
+            fresh = []
+            for row in rows:
+                identifier = str(row.get("id") or "")
+                if identifier and identifier not in seen_ids:
+                    seen_ids.add(identifier)
+                    fresh.append(row)
+            for row in fresh:
+                items.append(row)
+            # 部分平台忽略 page 并重复返回整榜，此时重复页就是结束条件。
+            if not fresh:
+                break
+            page += 1
+        if page > 100 and len(items) < 1000:
+            raise RuntimeError("lxserver leaderboard pagination did not finish")
+        if len(items) >= 1000:
+            truncated = True
+            items = items[:1000]
+    else:
+        page = 1
+        hit_limit = False
+        while len(items) < 1000:
+            data = await LXSERVER.get_song_list_detail(src, raw_id, page=page)
+            rows = data.get("list") or []
+            for raw in rows:
+                item = map_lxserver_song(raw, fallback_source=src)
+                LXSERVER.cache_song_info(item["id"], raw)
+                _cache_put(item)
+                items.append(item)
+                if len(items) >= 1000:
+                    hit_limit = True
+                    break
+            try:
+                total = int(data["total"]) if data.get("total") is not None else None
+                page_limit = max(1, int(data.get("limit") or len(rows) or 1))
+            except (TypeError, ValueError):
+                total, page_limit = None, max(1, len(rows))
+            if not rows and total is not None and len(items) < min(total, 1000):
+                raise RuntimeError("lxserver playlist ended before reported total")
+            if not rows or (total is not None and len(items) >= total) or (total is None and len(rows) < page_limit):
+                break
+            page += 1
+        truncated = hit_limit and (total is None or total > 1000)
+    for item in items:
+        _cache_put(item)
+    return {"ok": True, "data": items[:1000], "total": len(items), "truncated": truncated}
+
+
+@app.get("/api/v1/public-playlists/{playlist_id}")
+async def public_playlist(playlist_id: str, source: str = Query(...), kind: str = Query("playlist", pattern="^(playlist|chart)$")):
+    src = _public_source(source)
+    raw_id = urllib.parse.unquote(playlist_id)
+    if kind == "chart":
+        boards = await LXSERVER.get_leaderboard_boards(src)
+        for row in boards:
+            if not isinstance(row, dict):
+                continue
+            summary = LXSERVER.normalize_public_playlist(row, src, "chart")
+            if summary["id"] == raw_id:
+                if summary.get("track_count") is None or not summary.get("cover_url"):
+                    meta = await _chart_meta_for(src, [raw_id])
+                    _apply_chart_meta(summary, meta.get(raw_id))
+                return {"ok": True, "data": summary}
+        raise ValueError(f"chart {raw_id} not found")
+    data = await LXSERVER.get_song_list_detail(src, raw_id, page=1)
+    info = data.get("info") if isinstance(data.get("info"), dict) else {}
+    summary = LXSERVER.normalize_public_playlist({**info, "id": raw_id}, src)
+    if not summary["name"]:
+        summary["name"] = raw_id
+    return {"ok": True, "data": summary}
+
+
 @app.get("/api/v1/track/url")
 async def track_url(
     id: str = Query("", alias="id"),
@@ -1682,6 +2350,35 @@ async def track_info(id: str = Query("", alias="id"), guid: str = Query("", alia
     cached = _cache_get(f"lx:{src}:{identifier}")
     if cached:
         return {"ok": True, "data": cached}
+    # ★ 2026-10-09：缓存未命中 → 回源头查详情（目前仅酷狗源）。
+    #   内存缓存 TTL 1800s / 上限 2000 条，且服务重启即清空 —— 「最近播放」这类
+    #   历史条目往往查不到，proxy 封面链便拿不到 title/artist/cover_url，最终回落
+    #   占位图。这里按 hash 回源补全后写入缓存（下次直接命中）。
+    if src == "kg":
+        try:
+            fresh = await asyncio.wait_for(
+                _kg_info_by_hash(get_http(app), identifier), timeout=8.0
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("kg info backfill failed for %s: %s", track_id, e)
+            fresh = None
+        if fresh:
+            _cache_put(fresh)
+            return {"ok": True, "data": fresh}
+    elif src == "wy":
+        # 网易源同理回源（song/detail 免登录，含 album.picUrl 真专辑图）。
+        # 酷我（kw）免登录详情接口已全部失效（2026-09 实测），故不做；
+        # 其历史条目由 proxy 侧「播放历史快照回落」补齐 title/artist 后走网易反查。
+        try:
+            fresh = await asyncio.wait_for(
+                _wy_info_by_id(get_http(app), identifier), timeout=8.0
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("wy info backfill failed for %s: %s", track_id, e)
+            fresh = None
+        if fresh:
+            _cache_put(fresh)
+            return {"ok": True, "data": fresh}
     return {"ok": True, "data": {"id": track_id, "source": "lx", "lx_source": src, "title": "", "artist": "", "album": "", "duration_s": 0, "ext": "mp3", "file_size": 0, "cover_url": "", "lyric": ""}}
 
 

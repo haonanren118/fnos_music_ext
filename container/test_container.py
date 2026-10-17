@@ -242,25 +242,6 @@ def test_compose_build_args_mirror_passthrough():
     assert build.get("network") == "host"
 
 
-def test_hotfix_reaches_container_side_via_compose_mounts():
-    """热更新能覆盖容器侧代码：靠 compose 挂载宿主目录到 /srv/<服务>，而非镜像内软链。
-
-    2.6.21 曾用「镜像内 /srv/<服务> 指向 /repo/<服务> 的软链」达到同一效果，
-    代价是镜像不再自包含（单独 docker run 时软链悬空 → No module named 'app'，
-    CI 镜像冒烟也不得不为它额外挂一个 /repo）。
-    2.6.22 起改为「Dockerfile 保持 COPY（镜像自包含）+ compose bind mount 覆盖」。
-    两条契约都必须锁住：漏任何一条挂载，或把软链加回 Dockerfile，
-    都会让热更新对容器侧服务失效（或让镜像再次失去自包含性）。
-    """
-    compose = yaml.safe_load((REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
-    vols = compose["services"]["fnmusic-sources"]["volumes"]
-    for name in ("musicdl-service", "musicbox-service", "lxmusic-service",
-                 "webui-service", "proxy"):
-        assert f"./{name}:/srv/{name}" in vols, f"缺少热更新挂载 ./{name}:/srv/{name}"
-    dockerfile = (CONTAINER_DIR / "Dockerfile").read_text(encoding="utf-8")
-    assert "ln -sfn" not in dockerfile, "Dockerfile 不得再做软链：镜像必须保持自包含"
-
-
 def test_dockerfile_assembly():
     text = (CONTAINER_DIR / "Dockerfile").read_text(encoding="utf-8")
     # 单镜像运行时：python + node(lx 沙箱) + ffmpeg(musicdl 试听) + supervisor

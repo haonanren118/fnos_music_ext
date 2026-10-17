@@ -96,6 +96,10 @@ def _map_song_detail(item: dict[str, Any]) -> dict[str, Any]:
         album_name = ""
         album_pic_url = ""
     duration_ms = int(item.get("dt") or item.get("duration") or 0)
+    try:
+        fee = int(item.get("fee") or 0)
+    except (TypeError, ValueError):
+        fee = 0
     return {
         "song_id": song_id,
         "name": name,
@@ -105,7 +109,61 @@ def _map_song_detail(item: dict[str, Any]) -> dict[str, Any]:
         "duration_ms": duration_ms,
         "has_sq": bool(item.get("sq")),
         "has_hr": bool(item.get("hr")),
+        # fee 收费类型（0=免费 1=VIP 4=购买专辑 8=非会员免费低音质）。
+        # 纯展示字段：proxy 侧 _vip_tag_prefix 据此在歌名前加 [VIP] 前缀，
+        # 不影响可播性判定（可播过滤只看 freeTrialInfo / url / code）。
+        "fee": fee,
     }
+
+
+# ==== 账号详情（VIP 标识，2026-10-17） ====
+# WebUI「网易扫码登录」面板要显示 VIP 标识，但 musicbox CLI 的 `auth status`
+# 只回 logged_in/user_id/nickname。这里用 NEMbox 的 get_account_info 补 VIP 档位。
+# vipType 是档位枚举（实测付费号 110，历史值 10/11）：0 = 非会员。
+_ACCOUNT_CACHE: dict = {"ts": 0.0, "value": None}
+_ACCOUNT_TTL_S = 60.0
+
+
+def _vip_label(vip_type: int) -> str:
+    if vip_type <= 0:
+        return ""
+    if vip_type == 10:
+        return "音乐包"
+    if vip_type >= 11:
+        return "黑胶VIP"
+    return "VIP"
+
+
+def account_detail() -> dict:
+    """账号详情（含 VIP 档位）：供 WebUI 显示 VIP 标识。60 秒内存缓存。
+
+    失败返回空 dict（调用方按「无 VIP 信息」处理），绝不抛错打断登录态查询。
+    """
+    now = time.monotonic()
+    cached = _ACCOUNT_CACHE.get("value")
+    if isinstance(cached, dict) and now - float(_ACCOUNT_CACHE.get("ts") or 0) < _ACCOUNT_TTL_S:
+        return cached
+    try:
+        with _api_lock:
+            api = _get_api_locked()
+            info = api.get_account_info() or {}
+    except Exception:
+        return {}
+    profile = info.get("profile") if isinstance(info.get("profile"), dict) else {}
+    account = info.get("account") if isinstance(info.get("account"), dict) else {}
+    try:
+        vip_type = int(profile.get("vipType") or account.get("vipType") or 0)
+    except (TypeError, ValueError):
+        vip_type = 0
+    detail = {
+        "user_id": profile.get("userId") or account.get("id") or "",
+        "nickname": str(profile.get("nickname") or ""),
+        "avatar_url": str(profile.get("avatarUrl") or ""),
+        "vip_type": vip_type,
+        "vip_label": _vip_label(vip_type),
+    }
+    _ACCOUNT_CACHE.update({"ts": now, "value": detail})
+    return detail
 
 
 def check_is_logged_in() -> bool:
@@ -224,7 +282,16 @@ def get_song_url(song_id: int, quality: str) -> "dict[str, Any] | None":
     return item
 
 
-def batch_song_details(ids: list[int]) -> list[dict[str, Any]]:
+def batch_song_details(ids: list[int], playable_only: bool = True) -> list[dict[str, Any]]:
+    """批量歌曲详情（名称/歌手/专辑/封面/时长/有无无损/fee），按请求顺序返回。
+
+    playable_only=True（默认，既有行为，勿改）：过 filter_playable_song_ids
+    （songs_url 真实取链探测），搜索/推荐入口依赖该过滤。
+    playable_only=False（#55 端口新增）：全量返回，与上游 v2.8.0「封面与可播性
+    解耦」同语义——详情行是纯展示元数据，不因取链判定的可播状态整行丢弃
+    （登录态抖动/VIP 波动/风控都会让 songs_url 拿不全 url）。公共歌单的曲目
+    行同理：可播性由点播侧自然呈现，不该让榜单少歌。
+    """
     if not ids:
         return []
     with _api_lock:
@@ -233,13 +300,13 @@ def batch_song_details(ids: list[int]) -> list[dict[str, Any]]:
     if not raw_items or not isinstance(raw_items, list):
         return []
 
-    playable_ids = filter_playable_song_ids(ids)
+    playable_ids = filter_playable_song_ids(ids) if playable_only else None
 
     detail_map: dict[int, dict[str, Any]] = {}
     for item in raw_items:
         if isinstance(item, dict):
             mapped = _map_song_detail(item)
-            if mapped["song_id"] in playable_ids:
+            if mapped["song_id"] and (playable_ids is None or mapped["song_id"] in playable_ids):
                 detail_map[mapped["song_id"]] = mapped
     return [detail_map[sid] for sid in ids if sid in detail_map]
 
@@ -435,3 +502,285 @@ def playlist_track_ids(playlist_id: int) -> "list[int] | None":
         if sid > 0:
             ids.append(sid)
     return ids
+
+
+# ---------------------------------------------------------------------------
+# 公共歌单数据层（#55，上游 javycoder/fnos_music_ext v2.9.0 整段移植）
+#
+# 只依赖 NEMbox 内部 API，全部四件已在生产容器实证（NEMbox 0.5.3）：
+#   NEMbox.api.BASE_URL（https://music.163.com）
+#   NetEase._raw_request(method, endpoint, data)  —— endpoint 收全 URL，返回 response
+#   NetEase.request(method, path, params)        —— 内部拼 BASE_URL + weapi 加密，返回 dict
+#   NetEase.eapi_request(path, params)           —— /api/ 前缀原样，返回 dict
+#
+# 与我方版本的差异（有意保留）：
+#   - 不移植上游 vip_entitled()/_mark_needs_vip()：我方 [VIP] 展示在 proxy 层
+#     （_vip_tag_prefix，纯 fee 判定），此处不重复造一套权益探测。
+#   - _map_song_detail 增加 fee 字段（与上游一致），供 proxy 展示层使用。
+# ---------------------------------------------------------------------------
+
+def _public_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    from NEMbox.api import BASE_URL
+
+    with _api_lock:
+        api = _get_api_locked()
+        resp = api._raw_request("GET", f"{BASE_URL}{path}", params or {})
+        resp.raise_for_status()
+        return _validate_public_response(resp.json())
+
+
+def _validate_public_response(data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict) or data.get("code", 200) != 200:
+        raise RuntimeError(f"netease public request failed: code={data.get('code') if isinstance(data, dict) else 'invalid'}")
+    return data
+
+
+def _public_post(path: str, params: dict[str, Any]) -> dict[str, Any]:
+    with _api_lock:
+        api = _get_api_locked()
+        return _validate_public_response(api.request("POST", path, params))
+
+
+def public_playlist_categories(kind: str = "playlist") -> dict[str, Any]:
+    highquality_tags: list[dict[str, str]] = []
+    if kind == "highquality":
+        data = _public_get("/api/playlist/highquality/tags")
+        tags = data.get("tags") if isinstance(data, dict) else []
+        rows = []
+        for item in tags if isinstance(tags, list) else []:
+            tag = (item.get("playlistTag") or item) if isinstance(item, dict) else None
+            if isinstance(tag, dict) and tag.get("name"):
+                rows.append({"id": str(tag.get("name")), "name": str(tag.get("name"))})
+        return {"ok": True, "categories": [{"id": "", "name": "全部"}], "tags": rows}
+
+    data = _public_post("/weapi/playlist/catalogue", {})
+    if not isinstance(data, dict) or data.get("code") != 200:
+        raise RuntimeError(f"netease catalogue failed: code={data.get('code') if isinstance(data, dict) else 'invalid'}")
+    names = data.get("categories") or {}
+    grouped: dict[str, list[dict]] = {}
+    for raw in data.get("sub") or []:
+        if not isinstance(raw, dict) or not raw.get("name"):
+            continue
+        group = str(names.get(str(raw.get("category")), "其他"))
+        grouped.setdefault(group, []).append({"id": str(raw["name"]), "name": str(raw["name"])})
+    categories = [{"id": "", "name": "全部"}]
+    categories.extend({"id": name, "name": name} for name in grouped)
+    try:
+        high_rows = public_playlist_categories("highquality").get("tags") or []
+        highquality_tags.extend(high_rows)
+    except Exception:
+        pass
+    return {"ok": True, "categories": categories, "tags": grouped, "highquality_tags": highquality_tags}
+
+
+# ==== 排行榜分类（#55 后续修复） ====
+# 上游 v2.9.0 的 charts 通道把分类写死成「全部」：/api/toplist 是 64 条扁平榜单，
+# WebUI 的分类下拉因此只有一个选项、形同虚设（用户实测反馈）。
+# 榜单行本身带两个可用字段：
+#   ToplistType —— S/N/O/H 为官方四榜（飙升/新歌/原创/热歌），其余为空；
+#   tags        —— 特色榜的分类标签（华语/欧美/流行/电子/说唱/古典…）。
+# 按这两者归类即可给出真实分类，且分类筛选在前端只影响列表过滤，不改任何上游调用。
+_CHART_OFFICIAL_TYPES = frozenset(("S", "N", "O", "H"))
+
+# 标签展示名映射：网易给一批特色榜打的 tag 就是「榜单」（实测 16 个），
+# 直接当分类名会出现「分类→榜单」这种歧义，展示为「特色榜」。
+_CHART_TAG_LABELS = {"榜单": "特色榜"}
+
+
+def _toplist_rows() -> list[dict[str, Any]]:
+    """拉取网易榜单全集（/api/toplist 的 list 字段）。"""
+    data = _public_get("/api/toplist")
+    rows = data.get("list") if isinstance(data, dict) else []
+    return [row for row in rows or [] if isinstance(row, dict) and row.get("id")]
+
+
+def _chart_is_official(row: dict[str, Any]) -> bool:
+    return str(row.get("ToplistType") or "").strip().upper() in _CHART_OFFICIAL_TYPES
+
+
+def public_chart_categories() -> list[dict[str, Any]]:
+    """排行榜分类分组（供 WebUI 分类下拉渲染）。
+
+    返回 [{id: "", name: "榜单分类", list: [{id, name}, ...]}]，
+    id 约定："official" = 官方榜；"tag:<标签>" = 该标签下的特色榜。
+    标签按榜单数量降序，数量相同按名称排序，保证下拉顺序稳定。
+    """
+    counts: dict[str, int] = {}
+    for row in _toplist_rows():
+        if _chart_is_official(row):
+            continue
+        for tag in row.get("tags") or []:
+            name = str(tag or "").strip()
+            if name:
+                counts[name] = counts.get(name, 0) + 1
+    options = [{"id": "official", "name": "官方榜"}]
+    for name, _count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+        options.append({"id": "tag:" + name, "name": _CHART_TAG_LABELS.get(name, name)})
+    return [{"id": "", "name": "榜单分类", "list": options}]
+
+
+def _chart_matches(row: dict[str, Any], category: str) -> bool:
+    """榜单是否命中分类筛选。
+
+    约定：空分类 = 全部；无法识别的分类值也按全部处理（避免旧书签/过期参数
+    给出空列表）；"official" 精确匹配官方四榜；"tag:<标签>" 是精确筛选，
+    标签不存在时返回 False（用户明确在按该标签过滤）。
+    """
+    cat = str(category or "").strip()
+    if not cat:
+        return True
+    if cat == "official":
+        return _chart_is_official(row)
+    if cat.startswith("tag:"):
+        want = cat[len("tag:"):].strip()
+        tags = [str(tag or "").strip() for tag in (row.get("tags") or [])]
+        return bool(want) and want in tags
+    return True
+
+
+def _public_summary(item: dict[str, Any], kind: str = "playlist") -> dict[str, Any]:
+    creator = item.get("creator") if isinstance(item.get("creator"), dict) else {}
+    cover = str(
+        item.get("coverImgUrl") or item.get("cover_url")
+        or item.get("picUrl") or item.get("cover") or ""
+    )
+    try:
+        updated = int(item.get("updateTime") or item.get("trackNumberUpdateTime") or 0) // 1000
+    except (TypeError, ValueError):
+        updated = 0
+    return {
+        "id": str(item.get("id") or ""),
+        "kind": kind,
+        "source": "netease",
+        "name": str(item.get("name") or ""),
+        "cover_url": cover,
+        "track_count": _int_or_zero(item.get("trackCount") or item.get("trackcount")),
+        "author": str(item.get("nickname") or creator.get("nickname") or ""),
+        "description": str(item.get("description") or item.get("copywriter") or ""),
+        "updated_at": updated,
+    }
+
+
+def public_playlists(
+    channel: str,
+    category: str = "",
+    sort: str = "hot",
+    page: int = 1,
+    limit: int = 30,
+    cursor: str = "",
+) -> dict[str, Any]:
+    page = max(1, int(page or 1))
+    limit = max(1, min(int(limit or 30), 50))
+    if channel == "charts":
+        # 分类筛选：官方榜 / tag:<标签> / 空=全部（见 _chart_matches）
+        rows = [row for row in _toplist_rows() if _chart_matches(row, category)]
+        items = [_public_summary(row, "chart") for row in rows]
+        return {"ok": True, "items": items, "total": len(items), "has_more": False}
+
+    if channel == "recommend":
+        data = _public_get("/api/personalized/playlist", {"limit": min(limit, 30)})
+        rows = data.get("result") if isinstance(data, dict) else []
+        return {"ok": True, "items": [_public_summary(row) for row in rows or [] if isinstance(row, dict) and row.get("id")], "has_more": False}
+
+    if channel == "account_recommend":
+        with _api_lock:
+            api = _get_api_locked()
+            raw = api.request("POST", "/weapi/v1/discovery/recommend/resource", {})
+            if isinstance(raw, dict) and raw.get("code") == 301:
+                return {"ok": False, "error": "not_logged_in", "logged_in": False}
+            _validate_public_response(raw)
+            rows = raw.get("recommend") or []
+        if not isinstance(rows, list):
+            raise RuntimeError("netease account recommend returned invalid payload")
+        return {"ok": True, "items": [_public_summary(row) for row in rows if isinstance(row, dict) and row.get("id")], "has_more": False}
+
+    if channel == "highquality":
+        params: dict[str, Any] = {"limit": limit}
+        if category:
+            params["cat"] = category
+        if cursor:
+            params["before"] = cursor
+        data = _public_get("/api/playlist/highquality/list", params)
+        rows = data.get("playlists") if isinstance(data, dict) else []
+        next_cursor = ""
+        if rows:
+            last = rows[-1] if isinstance(rows[-1], dict) else {}
+            next_cursor = str(last.get("updateTime") or "")
+        return {
+            "ok": True,
+            "items": [_public_summary(row) for row in rows or [] if isinstance(row, dict) and row.get("id")],
+            "total": _int_or_zero(data.get("total")),
+            "has_more": bool(data.get("more")) if isinstance(data, dict) else bool(rows),
+            "next_cursor": next_cursor,
+        }
+
+    data = _public_post("/weapi/playlist/list", {
+        "cat": category or "全部",
+        "order": sort if sort in ("hot", "new") else "hot",
+        "offset": (page - 1) * limit,
+        "total": "true",
+        "limit": limit,
+    })
+    if not isinstance(data, dict) or data.get("code") != 200:
+        raise RuntimeError(f"netease playlists failed: code={data.get('code') if isinstance(data, dict) else 'invalid'}")
+    rows = data.get("playlists") or []
+    total = _int_or_zero(data.get("total"))
+    return {
+        "ok": True,
+        "items": [_public_summary(row) for row in rows if isinstance(row, dict) and row.get("id")],
+        "total": total,
+        "has_more": bool(data.get("more")) or (page * limit < total if total else bool(rows)),
+    }
+
+
+def public_playlist(playlist_id: int, kind: str = "playlist") -> dict[str, Any]:
+    if kind == "chart":
+        rows = public_playlists("charts").get("items") or []
+        for row in rows:
+            if row.get("id") == str(playlist_id):
+                return {"ok": True, "data": row}
+    with _api_lock:
+        api = _get_api_locked()
+        raw = api.eapi_request("/api/v6/playlist/detail", {
+            "id": int(playlist_id), "n": 0, "s": 0,
+        })
+    playlist = raw.get("playlist") if isinstance(raw, dict) else None
+    if not isinstance(playlist, dict) or not playlist.get("id"):
+        raise RuntimeError(f"playlist {playlist_id} not found")
+    return {"ok": True, "data": _public_summary(playlist, "chart" if kind == "chart" else "playlist")}
+
+
+def public_playlist_tracks(playlist_id: int, kind: str = "playlist") -> dict[str, Any]:
+    with _api_lock:
+        api = _get_api_locked()
+        raw = api.eapi_request("/api/v6/playlist/detail", {
+            "id": int(playlist_id), "n": 1000, "s": 0,
+        })
+    playlist = raw.get("playlist") if isinstance(raw, dict) else None
+    if not isinstance(playlist, dict) or not isinstance(playlist.get("trackIds"), list):
+        raise RuntimeError(f"playlist {playlist_id} tracks unavailable")
+    track_ids_raw = playlist["trackIds"]
+    ids: list[int] = []
+    seen: set[int] = set()
+    truncated = False
+    for item in track_ids_raw or []:
+        sid = item if isinstance(item, int) else (item.get("id") if isinstance(item, dict) else 0)
+        sid = _int_or_zero(sid)
+        if sid <= 0 or sid in seen:
+            continue
+        if len(ids) >= 1000:
+            truncated = True
+            break
+        seen.add(sid)
+        ids.append(sid)
+    rows: list[dict[str, Any]] = []
+    for start in range(0, len(ids), 100):
+        # playable_only=False（我方适配）：上游此函数不过滤可播（v2.8.0 解耦），
+        # 而我方 batch_song_details 默认可播过滤会给公共歌单榜单丢歌，
+        # 导致下面的完整性校验必然失败。其余调用方行为不变。
+        rows.extend(batch_song_details(ids[start:start + 100], playable_only=False))
+    by_id = {int(row["song_id"]): row for row in rows}
+    if any(sid not in by_id for sid in ids):
+        raise RuntimeError("netease playlist song details incomplete")
+    total = max(len(track_ids_raw), _int_or_zero(playlist.get("trackCount")))
+    return {"ok": True, "data": [by_id[sid] for sid in ids], "total": total, "truncated": truncated or total > 1000}

@@ -99,9 +99,72 @@ def test_kg_search_contract(with_source):
     vip = by_id["lx:kg:h2"]
     assert vip["validation_status"] == "media_verified"
     assert vip["verified"] is True
-    # 试听标记 / 缺 hash / VIP 拦截(fail_process=4) 一律剔除
+    # 试听标记 / 缺 hash 一律剔除；fail_process=4 且**非明确原唱**仍剔除
+    # （h5 无 isoriginal 字段 → _is_original_kg 返回 None → 维持原过滤，见下方专测）
     assert "lx:kg:h3" not in by_id and "lx:kg:h5" not in by_id
     assert len(items) == 2
+
+
+def test_kg_search_keeps_vip_original(with_source):
+    """★ fail_process=4 的**明确原唱**必须放行（2026-10-09 修复）。
+
+    实测背景：酷狗上游前 30 条里第 1 条就是真原唱（晴天/周杰伦），但它同时是
+    pay_type=3 / pkg_price=1 / price=200 / fail_process=4 的 VIP 曲目。
+    旧逻辑把 fail_process=4 一律 continue，导致上游唯一带 isoriginal 硬标识的
+    条目全被丢弃 —— 实测 12 条结果里 is_original=True 为 0，「原唱优先」无原唱可排。
+    该曲目实测可解析出**完整**直链（200 / flac / 31633244 B / 路径含 /yp/full/），
+    故对「明确原唱 (=True)」开口放行。
+    """
+    payload = {"data": {"info": [
+        {"hash": "orig1", "songname": "晴天", "singername": "周杰伦",
+         "album_name": "叶惠美", "album_id": 966846, "duration": 269,
+         "pay_type": 3, "pkg_price": 1, "price": 200, "fail_process": 4,
+         "isoriginal": 1,
+         "trans_param": {"is_original": 1, "union_cover": "http://c/{size}.jpg"},
+         "filesize": 4317292, "mixsongid": 77},
+    ]}}
+    http = mock_client(media_handler(payload))
+    try:
+        items = run(lxapp.kg_search(http, "晴天", 10))
+    finally:
+        run(http.aclose())
+    by_id = {it["id"]: it for it in items}
+    assert "lx:kg:orig1" in by_id, "VIP 原唱被 fail_process=4 过滤误杀"
+    it = by_id["lx:kg:orig1"]
+    assert it["is_original"] is True
+    assert it["artist"] == "周杰伦"
+    assert it["pay_type"] == 3          # 仍是 VIP，但已放行
+    assert it["union_cover"] == "http://c/480.jpg"
+
+
+def test_kg_search_still_drops_non_original_vip(with_source):
+    """★ 只对「明确原唱」开口：VIP 且非原唱（None / False）仍维持原过滤。
+
+    防止「修复原唱」被扩大成「放开所有 VIP」—— 后者会把大量不可播的 VIP 翻唱
+    放进列表，反而降低可用性。
+    """
+    payload = {"data": {"info": [
+        # 无 isoriginal 字段 → None → 仍剔除
+        {"hash": "vip_none", "songname": "某VIP歌", "singername": "甲",
+         "pay_type": 3, "price": 200, "fail_process": 4},
+        # 明确非原唱 → 仍剔除
+        {"hash": "vip_false", "songname": "某VIP翻唱", "singername": "乙",
+         "pay_type": 3, "price": 200, "fail_process": 4,
+         "isoriginal": 0, "trans_param": {"is_original": 2}},
+        # 明确原唱但没有 fail_process=4 → 仍走原 VIP 候选队列（行为不变）
+        {"hash": "orig_backup", "songname": "某原唱", "singername": "丙",
+         "pay_type": 3, "price": 200, "isoriginal": 1},
+    ]}}
+    http = mock_client(media_handler(payload))
+    try:
+        items = run(lxapp.kg_search(http, "x", 10))
+    finally:
+        run(http.aclose())
+    ids = {it["id"] for it in items}
+    assert "lx:kg:vip_none" not in ids, "非原唱 VIP 不应被放行"
+    assert "lx:kg:vip_false" not in ids, "明确非原唱的 VIP 不应被放行"
+    # 明确原唱：即便走 VIP 通路也直接进结果（is_orig=True → 不转候选队列）
+    assert "lx:kg:orig_backup" in ids
 
 
 def test_kg_resolve_lyric_contract():
@@ -423,3 +486,162 @@ def test_fixture_meta_records_capture():
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     assert meta["captured_at"]
     assert meta["keyword"]
+
+
+# ------------------------------------------------- 原唱标识透传（2026-10-08）---
+#
+# 「搜索优先排原唱」的地基：只有酷狗提供硬标识（trans_param.is_original /
+# 顶层 isoriginal），其余源没有，只能标记「标题是否含版本词」交给下游启发式。
+# 这里守住「字段被正确捞出并透传」这一层——一旦上游改字段名，回放立即失败。
+
+def _kg_original_payload() -> dict:
+    return {"data": {"info": [
+        # 原唱：trans_param.is_original=1
+        {"hash": "o1", "songname": "晴天", "singername": "周杰伦", "album_name": "叶惠美",
+         "duration": 269, "pay_type": 0, "filesize": 4300000,
+         "trans_param": {"is_original": 1,
+                         "union_cover": "http://imge.kugou.com/stdmusic/{size}/20230920/real.jpg"}},
+        # 原唱：顶层 isoriginal=1（trans_param 缺失）
+        {"hash": "o2", "songname": "稻香", "singername": "周杰伦", "album_name": "魔杰座",
+         "duration": 263, "pay_type": 0, "filesize": 4200000, "isoriginal": 1},
+        # 非原唱：is_original=0
+        {"hash": "o3", "songname": "晴天 (伴奏)", "singername": "周杰伦", "album_name": "叶惠美",
+         "duration": 268, "pay_type": 0, "filesize": 4000000,
+         "trans_param": {"is_original": 0}},
+        # 无任何标识：is_original 应为 None
+        {"hash": "o4", "songname": "夜曲", "singername": "周杰伦", "album_name": "十一月的萧邦",
+         "duration": 227, "pay_type": 0, "filesize": 4100000},
+    ]}}
+
+
+def test_kg_search_exposes_original_flag(with_source):
+    """酷狗原唱硬标识必须被捞出：is_original 真/假/未知三态都要正确。"""
+    http = mock_client(media_handler(_kg_original_payload()))
+    try:
+        items = run(lxapp.kg_search(http, "晴天", 10))
+    finally:
+        run(http.aclose())
+    by_id = {it["id"]: it for it in items}
+
+    assert by_id["lx:kg:o1"]["is_original"] is True          # trans_param 路径
+    assert by_id["lx:kg:o2"]["is_original"] is True          # 顶层 isoriginal 路径
+    assert by_id["lx:kg:o3"]["is_original"] is False         # 明确非原唱
+    assert by_id["lx:kg:o4"]["is_original"] is None          # 无标识 → 交启发式
+
+    # union_cover 透传（{size} 展开为 480）
+    assert by_id["lx:kg:o1"]["union_cover"] == \
+        "http://imge.kugou.com/stdmusic/480/20230920/real.jpg"
+    assert by_id["lx:kg:o4"]["union_cover"] == ""
+
+    # 版本词标记：只有 o3（标题带「伴奏」）命中
+    assert by_id["lx:kg:o3"]["has_version_marker"] is True
+    assert by_id["lx:kg:o1"]["has_version_marker"] is False
+    assert by_id["lx:kg:o4"]["has_version_marker"] is False
+
+
+def _wy_version_payload() -> dict:
+    return {"result": {"songs": [
+        {"id": 1, "name": "晴天", "fee": 0, "artists": [{"name": "周杰伦"}],
+         "album": {"name": "叶惠美", "picUrl": "http://p/1.jpg"}, "duration": 269000},
+        {"id": 2, "name": "晴天（KTV版伴奏）", "fee": 0, "artists": [{"name": "甲"}],
+         "album": {"name": "B", "picUrl": "http://p/2.jpg"}, "duration": 268000},
+        {"id": 3, "name": "晴天 (Live)", "fee": 0, "artists": [{"name": "乙"}],
+         "album": {"name": "C", "picUrl": "http://p/3.jpg"}, "duration": 300000},
+    ]}}
+
+
+def test_wy_search_marks_version_titles(with_source):
+    """网易无原唱字段：is_original 恒为 None，但版本词标记要正确。"""
+    http = mock_client(media_handler(_wy_version_payload()))
+    try:
+        items = run(lxapp.wy_search(http, "晴天", 10))
+    finally:
+        run(http.aclose())
+    by_id = {it["id"]: it for it in items}
+
+    assert by_id["lx:wy:1"]["is_original"] is None
+    assert by_id["lx:wy:1"]["has_version_marker"] is False   # 干净原版标题
+    assert by_id["lx:wy:2"]["has_version_marker"] is True    # 伴奏
+    assert by_id["lx:wy:3"]["has_version_marker"] is True    # Live
+
+
+def test_original_helper_edge_cases():
+    """_is_original_kg / _title_has_version_marker 的边界。
+
+    ★ 关键：三态语义。None（上游没给）必须与 False（明确非原唱）区分开——
+    把「没标识」当「非原唱」会让所有老数据整体降权，比不排序更糟。
+    """
+    A = lxapp
+
+    # is_original 的各种真值写法 → True
+    for truthy in (1, "1", "true", "True", "yes", "Y", "t"):
+        assert A._is_original_kg({"trans_param": {"is_original": truthy}}) is True
+    # 假值 → False（明确非原唱）
+    for falsy in (0, "0", "false", "no", "N", "f"):
+        assert A._is_original_kg({"trans_param": {"is_original": falsy}}) is False
+    # 字段缺失 → None（未知，不降权）
+    assert A._is_original_kg({}) is None
+    assert A._is_original_kg({"trans_param": None}) is None
+    assert A._is_original_kg({"trans_param": {}}) is None
+    # 顶层 isoriginal 路径（trans_param 缺失时）
+    assert A._is_original_kg({"isoriginal": 1}) is True
+    assert A._is_original_kg({"isoriginal": 0}) is False
+    # trans_param 不是 dict 时不能崩，且要能落到顶层字段
+    assert A._is_original_kg({"trans_param": "x", "isoriginal": 1}) is True
+    assert A._is_original_kg({"trans_param": "x"}) is None
+    # 无法解析的取值 → None
+    assert A._is_original_kg({"trans_param": {"is_original": "maybe"}}) is None
+
+    # 版本词判定
+    assert A._title_has_version_marker("晴天") is False
+    assert A._title_has_version_marker("晴天 (伴奏)") is True
+    assert A._title_has_version_marker("Hello (KTV版)") is True
+    assert A._title_has_version_marker("Song [Live]") is True
+    assert A._title_has_version_marker("") is False
+    assert A._title_has_version_marker(None) is False
+
+
+def test_original_kg_numeric_enum():
+    """★ 酷狗 is_original 是**数字枚举**，不是布尔串（2026-10-09 实测修正）。
+
+    实测 100 条样本 + 12 个确知原唱条目的值域：
+      顶层 isoriginal         1=原唱 / 0=非原唱（二值，最干净）
+      trans_param.is_original 1=原唱；2/4/5/6/7/10=非原唱（翻唱/Live/Remix/
+                              纯音乐/DJ版/合声…）
+
+    v2.6.24 初版按布尔串处理，只认 "1"/"0" → 2/4/5/6/7/10 全落 None，
+    硬标识几乎全失效（100 条里仅 7 条生效）。此测试锁死修正后的语义。
+    """
+    A = lxapp
+
+    # 顶层 isoriginal 优先：1=原唱、0=非原唱
+    assert A._is_original_kg({"isoriginal": 1}) is True
+    assert A._is_original_kg({"isoriginal": 0}) is False
+
+    # trans_param 数字枚举：只有 1 是原唱，其余可解析整数都是非原唱
+    assert A._is_original_kg({"trans_param": {"is_original": 1}}) is True
+    for non_orig in (2, 4, 5, 6, 7, 10):
+        assert A._is_original_kg({"trans_param": {"is_original": non_orig}}) is False, \
+            f"is_original={non_orig} 应判为非原唱"
+    for non_orig in ("2", "4", "5", "6", "7", "10"):
+        assert A._is_original_kg({"trans_param": {"is_original": non_orig}}) is False
+
+    # 顶层优先于 tp：顶层说非原唱就非原唱，即便 tp 是 1（防矛盾数据）
+    assert A._is_original_kg({"isoriginal": 0, "trans_param": {"is_original": 1}}) is False
+    assert A._is_original_kg({"isoriginal": 1, "trans_param": {"is_original": 4}}) is True
+
+    # 顶层值怪异时回退到 tp（不能因顶层乱值就放弃已知的 tp）
+    assert A._is_original_kg({"isoriginal": "?", "trans_param": {"is_original": 1}}) is True
+    assert A._is_original_kg({"isoriginal": "?", "trans_param": {"is_original": 2}}) is False
+
+    # 真实样本回归（酷狗 search/song 原始字段，见 2026-10-09 抓包）
+    real_orig = {"hash": "b3a52a7a", "songname": "晴天", "singername": "周杰伦",
+                 "isoriginal": 1, "trans_param": {"is_original": 1,
+                                                  "union_cover": "http://x/{size}/a.jpg"}}
+    real_cover = {"hash": "48c685f6", "songname": "晴天", "singername": "蓝心羽",
+                  "isoriginal": 0, "trans_param": {"is_original": 2}}
+    real_live = {"hash": "91a662a6", "songname": "晴天 (Live)", "singername": "周深",
+                 "isoriginal": 0, "trans_param": {"is_original": 4}}
+    assert A._is_original_kg(real_orig) is True
+    assert A._is_original_kg(real_cover) is False
+    assert A._is_original_kg(real_live) is False

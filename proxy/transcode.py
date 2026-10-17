@@ -9,8 +9,11 @@ ffmpeg 输出 fMP4 分片到 cache/hls/{safe_guid}/，playlist 由服务端按�
 设计要点：
 - 分片用 -hls_flags temp_file：ffmpeg 先写 .tmp 再改名，文件出现即完整，
   服务端无需猜测分片是否写完。
-- 合成分片数取 floor(duration/hls_time)：ffmpeg 实际产出 ceil ≥ floor，
-  App 多要一片会 404、少要一片只是末尾 <1s 尾差，取 floor 永不越界。
+- 合成分片数取 ceil(duration/hls_time)：ffmpeg 每片只多不少，ceil 才覆盖全部音频。
+  取 floor 会让清单短一片 → App 播到声明末尾即判整曲结束、提前切歌（实测事故）。
+  ⚠ 该估算仅在**转码中**使用；done 后一律改用 ffmpeg 真实清单（见 playlist_text）。
+- ⚠ 禁止给 ffmpeg 加 -hls_init_time：它会让 -hls_time 完全失效（实测片长被压到
+  init_time 的值），磁盘片数暴涨而清单仍按 hls_time 算，直接造成上述提前切歌。
 - 会话 heartbeat 续期；超时 / quit 杀进程；完整缓存在配额内 LRU 复用，
   半成品目录（running 中被杀 / failed）直接清理不残留。
 """
@@ -19,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -112,13 +116,85 @@ def _usable_cache(directory: str) -> dict | None:
 
 
 def _declared_count(duration_s: float, hls_time: float) -> int:
+    """预合成分片数（仅转码中使用；done 后一律用 ffmpeg 真实清单）。
+
+    取 ceil：ffmpeg 每片时长只多不少（关键帧对齐），实际片数 = ceil(duration/hls_time)。
+    取 floor 会让清单**短一片**，App 播到声明末尾就认为整曲结束 → 提前切下一首
+    （2026-10-07 实测：185s 音频切出 19 片，floor 只声明 18 片）。
+    多声明一片的最坏后果仅是该分片 404，远轻于提前掐掉尾音。
+    """
     if duration_s <= 0 or hls_time <= 0:
         return 1
-    return max(1, int(duration_s // hls_time))
+    return max(1, int(math.ceil(duration_s / hls_time)))
+
+
+def _ffmpeg_playlist_as_vod(directory: str) -> str | None:
+    """转码已完成：直接采用 ffmpeg 自己写的 preset.m3u8（片数与时长 100% 真实）。
+
+    ffmpeg 写的是 EVENT 清单（转码中会持续变长，故仅 done 后可用）；这里改成
+    VOD 返回，去掉 temp_file 等无关行。任何解析失败返回 None，退回预合成，
+    绝不让「服务端猜的清单」与磁盘真实分片脱节（历史 bug：见下 playlist_text）。
+    """
+    try:
+        with open(os.path.join(directory, PLAYLIST_NAME), encoding="utf-8") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    if "#EXT-X-ENDLIST" not in raw:
+        return None
+
+    # 逐行处理：丢掉 ffmpeg 的 EVENT 头（改用 VOD 头重放），正文（EXTINF/分片/
+    # MAP）原样保留，ENDLIST 只保留一次且放最后。
+    body: list[str] = []
+    seen_map = False
+    for ln in raw.splitlines():
+        s = ln.strip()
+        if not s or s == "#EXTM3U":
+            continue
+        if s.startswith("#EXT-X-PLAYLIST-TYPE"):
+            continue
+        if s.startswith("#EXT-X-MEDIA-SEQUENCE"):
+            continue
+        if s.startswith("#EXT-X-VERSION"):     # 头里统一重放，避免重复
+            continue
+        if s.startswith("#EXT-X-ENDLIST"):
+            continue
+        if s.startswith("#EXT-X-MAP"):
+            seen_map = True
+        body.append(s)
+    if not body or not seen_map:
+        return None
+    # 任一 #EXTINF 缺少后继分片名则视为残档，退回预合成
+    if "#EXTINF" not in raw or ".m4s" not in raw:
+        return None
+
+    lines = [
+        "#EXTM3U",
+        "#EXT-X-VERSION:7",
+        "#EXT-X-PLAYLIST-TYPE:VOD",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+    ]
+    # TARGETDURATION 沿用 ffmpeg 的真实值（在 body 里，位置不定，取出来前置）
+    td = next((s for s in body if s.startswith("#EXT-X-TARGETDURATION")), None)
+    rest = [s for s in body if not s.startswith("#EXT-X-TARGETDURATION")]
+    if td:
+        lines.append(td)
+    lines.extend(rest)
+    lines.append("#EXT-X-ENDLIST")
+    return "\n".join(lines) + "\n"
 
 
 def playlist_text(sess: Session) -> str:
-    """按声明分片数预合成完整 VOD playlist（App 只拉一次，必须一次给全）。"""
+    """按声明分片数预合成完整 VOD playlist（App 只拉一次，必须一次给全）。
+
+    已完成的会话优先返回 ffmpeg 的真实清单——预合成依赖 declared_count 与实际
+    切片参数一致，一旦参数被改偏（历史上 -hls_init_time 把片长从 10s 压到 4s），
+    预合成清单就会**短于**真实音频，App 播完即提前切歌。
+    """
+    if sess.status == "done":
+        real = _ffmpeg_playlist_as_vod(sess.directory)
+        if real:
+            return real
     hls_time = sess.hls_time
     count = sess.declared_count
     lines = [
@@ -155,7 +231,12 @@ def _ffmpeg_argv(src: str, headers: dict | None, sess: Session, directory: str) 
         "-hls_playlist_type", "event",
         "-hls_flags", "temp_file+independent_segments",
         "-hls_time", str(sess.hls_time),
-        "-hls_init_time", str(min(4, int(sess.hls_time) or 4)),
+        # ⚠ 严禁在此加 -hls_init_time：
+        #   实测（ffmpeg 60s 正弦波，2026-10-07）—— `-hls_time 10 -hls_init_time 4`
+        #   会把**整轨**都按 4s 切片（16 片），-hls_time 10 完全失效（与 `-hls_time 4`
+        #   结果完全一致）；只给 `-hls_time 10` 或两者相等时才是 7 片 / 10s。
+        #   片长被压到 4s 后，磁盘实际片数是声明值的 ~2.5 倍，而清单按 10s 预合成，
+        #   App 播完声明片数即提前判定整曲结束 → 「没播完就跳下一首」。
         "-hls_segment_filename", os.path.join(directory, "%05d.m4s"),
         os.path.join(directory, PLAYLIST_NAME),
     ]

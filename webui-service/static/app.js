@@ -16,6 +16,11 @@ let platforms = { enabled: [], registered: [] };
 let dirty = false;
 let qrTimer = null;
 let lxVerifiedUrl = null; // 已通过测试的 lx URL（保存时免二次校验提示用）
+let configPresence = {};  // .env 显式存在的键（区分默认空与管理员清空）
+// #55 公共歌单：已选条目（内存态含 _name/_cover_url/_track_count/_reason 展示字段，保存时只持久化四元组）
+let publicSelection = [];
+let publicCapabilities = null;
+let publicState = { provider: "musicbox", channel: "charts", source: "netease", category: "", sort: "", keyword: "", page: 1, items: [], hasMore: false, total: 0, cursor: "" };
 
 async function api(path, options) {
   const resp = await fetch(APP_BASE + path, options);
@@ -99,6 +104,7 @@ async function loadStatus() {
 async function loadConfig() {
   const cfg = await api("/api/config");
   configValues = cfg.values;
+  configPresence = cfg.presence || {};
   applyConfigToForm();
   clearDirty();
 }
@@ -115,6 +121,13 @@ function applyConfigToForm() {
   $$("input[name=quality]").forEach((el) => { el.checked = el.value === quality; });
   $("#recommend-hot").checked = v.FNMUSIC_RECOMMEND_HOT === "true";
   $("#recommend-daily").checked = v.FNMUSIC_RECOMMEND_DAILY === "true";
+  $("#public-playlists-enabled").checked = v.FNMUSIC_PUBLIC_PLAYLISTS_ENABLED === "true";
+  try {
+    publicSelection = JSON.parse(v.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION || "[]");
+    if (!Array.isArray(publicSelection)) publicSelection = [];
+  } catch (_) { publicSelection = []; }
+  $("#public-playlists-browser").hidden = !$("#public-playlists-enabled").checked;
+  renderPublicSelected();
   $("#tee-enabled").checked = v.FNMUSIC_TEE_SAVE_ENABLED === "true";
   $("#auto-cover").checked = v.FNMUSIC_AUTO_COVER !== "false";
   $("#lyric-auto-dl").checked = v.FNMUSIC_LYRIC_AUTO_DL === "true";
@@ -132,6 +145,7 @@ function applyConfigToForm() {
   $("#search-timeout").value = v.FNMUSIC_SEARCH_TIMEOUT || "15";
   $("#search-probe").checked = v.FNMUSIC_SEARCH_PROBE === "true";
   $("#netease-my-playlists").checked = v.FNMUSIC_NETEASE_MY_PLAYLISTS === "true";
+  $("#netease-resident").checked = v.FNMUSIC_NETEASE_PLAYLIST_RESIDENT === "true";
   $("#lx-url").value = v.LX_SOURCE_URL || "";
   lxVerifiedUrl = v.LX_SOURCE_URL || null;
   renderPlatformChips();
@@ -146,6 +160,7 @@ function collectConfig() {
     FNMUSIC_QUALITY_MODE: ($$("input[name=quality]").find((el) => el.checked) || {}).value || "high",
     FNMUSIC_RECOMMEND_HOT: $("#recommend-hot").checked,
     FNMUSIC_RECOMMEND_DAILY: $("#recommend-daily").checked,
+    FNMUSIC_PUBLIC_PLAYLISTS_ENABLED: $("#public-playlists-enabled").checked,
     FNMUSIC_TEE_SAVE_ENABLED: $("#tee-enabled").checked,
     FNMUSIC_AUTO_COVER: $("#auto-cover").checked,
     FNMUSIC_LYRIC_AUTO_DL: $("#lyric-auto-dl").checked,
@@ -161,7 +176,14 @@ function collectConfig() {
     FNMUSIC_SEARCH_TIMEOUT: parseInt($("#search-timeout").value || "15", 10) || 15,
     FNMUSIC_SEARCH_PROBE: $("#search-probe").checked,
     FNMUSIC_NETEASE_MY_PLAYLISTS: $("#netease-my-playlists").checked,
+    FNMUSIC_NETEASE_PLAYLIST_RESIDENT: $("#netease-resident").checked,
   };
+  // #55：开关开着、有勾选、或 .env 里已有该键（管理员清空也要落盘）时才写 SELECTION
+  if ($("#public-playlists-enabled").checked || publicSelection.length || configPresence.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION) {
+    values.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION = JSON.stringify(
+      publicSelection.map(({ provider, source, kind, id }) => ({ provider, source, kind, id }))
+    );
+  }
   if (provider === "musicdl") {
     values.FNMUSIC_ONLINE_SOURCES = platforms.enabled.join(",");
     values.MUSICDL_SOURCES = platforms.enabled.join(",");
@@ -360,21 +382,424 @@ function renderPlatformChips() {
 $("#platform-search").addEventListener("input", renderPlatformChips);
 $("#platform-reload").addEventListener("click", loadPlatforms);
 
+/* -------------------------------------------------------------- 公共歌单（#55）
+ *
+ * 端口自上游 javycoder/fnos_music_ext v2.9.0：浏览并勾选网易云/洛雪的原生推荐歌单、
+ * 分类歌单与榜单，勾选后作为独立只读歌单展示（guid 前缀 online:playlist:public:）。
+ * 数据经 webui /api/public-playlists 代理转发到对应音源进程（musicbox/lxmusic），
+ * 进程未起时自动 startPreview 拉起重试一次。选择结果只持久化四元组
+ * {provider, source, kind, id}，展示字段（_name/_cover_url 等）为内存态。
+ */
+const PUBLIC_PROVIDER_OPTIONS = [
+  { value: "musicbox", label: "网易云音乐" },
+  { value: "lxmusic", label: "洛雪内置歌单" },
+];
+const PUBLIC_SOURCE_LABEL = { netease: "网易", wy: "网易", kw: "酷我", kg: "酷狗", tx: "QQ", mg: "咪咕" };
+
+function publicEntryKey(item) {
+  return [item.provider, item.source, item.provider === "musicbox" ? "playlist" : item.kind, item.id].join("|");
+}
+
+function selectedPublicEntry(item) {
+  return publicSelection.find((it) => publicEntryKey(it) === publicEntryKey(item));
+}
+
+function setPublicSelection(item, selected) {
+  if (selected) {
+    if (selectedPublicEntry(item)) return true;
+    if (publicSelection.length >= 50) {
+      toast("公共歌单最多选择 50 份", "fail");
+      return false;
+    }
+    publicSelection.push({
+      provider: item.provider, source: item.source, kind: item.kind, id: String(item.id),
+      _name: item.name || "", _cover_url: item.cover_url || "", _track_count: item.track_count || 0,
+    });
+  } else {
+    publicSelection = publicSelection.filter((it) => publicEntryKey(it) !== publicEntryKey(item));
+  }
+  renderPublicSelected();
+  updateResidentAvailability();
+  markDirty("公共歌单选择已修改");
+  renderPublicList();
+  return true;
+}
+
+function movePublicSelection(index, delta) {
+  const next = index + delta;
+  if (next < 0 || next >= publicSelection.length) return;
+  const items = publicSelection.splice(index, 1);
+  publicSelection.splice(next, 0, items[0]);
+  renderPublicSelected();
+  markDirty("公共歌单顺序已修改");
+}
+
+function renderPublicSelected() {
+  const box = $("#public-selected");
+  if (!box) return;
+  box.innerHTML = publicSelection.length ? publicSelection.map((item, index) => `
+    <div class="public-selected">
+      <img src="${escapeHtml(item._cover_url || "")}" alt="" ${item._cover_url ? "" : "hidden"}>
+      <div class="min">
+        <b>${escapeHtml(item._name || item.id)}</b>
+        <span>${escapeHtml(PUBLIC_SOURCE_LABEL[item.source] || item.source)} · ${item.kind === "chart" ? "榜单" : "歌单"} · ${item.id}</span>
+        ${item._reason ? `<small>${escapeHtml(item._reason)}</small>` : ""}
+        ${Number(item._track_count || 0) > 1000 ? '<small>超过 1,000 首，仅载入前 1,000 首。</small>' : ""}
+      </div>
+      <div class="btn-row">
+        <button class="btn small" data-public-up="${index}" ${index === 0 ? "disabled" : ""}>↑</button>
+        <button class="btn small" data-public-down="${index}" ${index === publicSelection.length - 1 ? "disabled" : ""}>↓</button>
+        <button class="btn small danger" data-public-remove="${index}">移除</button>
+      </div>
+    </div>
+  `).join("") : '<p class="hint">尚未选择歌单。</p>';
+  box.querySelectorAll("[data-public-up]").forEach((btn) =>
+    btn.addEventListener("click", () => movePublicSelection(Number(btn.dataset.publicUp), -1)));
+  box.querySelectorAll("[data-public-down]").forEach((btn) =>
+    btn.addEventListener("click", () => movePublicSelection(Number(btn.dataset.publicDown), 1)));
+  box.querySelectorAll("[data-public-remove]").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      publicSelection.splice(Number(btn.dataset.publicRemove), 1);
+      updateResidentAvailability();
+      renderPublicSelected(); renderPublicList(); markDirty("公共歌单选择已修改");
+    }));
+}
+
+function renderPublicList() {
+  const box = $("#public-list");
+  if (!box) return;
+  box.innerHTML = publicState.items.length ? publicState.items.map((item) => {
+    const checked = !!selectedPublicEntry(item);
+    // track_count 可能是 null：洛雪榜单接口只给榜名不给曲目数（见 lxserver normalize），
+    // 此时不显示「· N 首」，避免整页「0 首」被误读成数据坏了。
+    const count = Number(item.track_count || 0);
+    const meta = `${escapeHtml(item.author || PUBLIC_SOURCE_LABEL[item.source] || item.source)}${count ? ` · ${count} 首` : ""}`;
+    return `
+      <label class="public-item">
+        <input type="checkbox" data-public-id="${escapeHtml(String(item.id))}" ${checked ? "checked" : ""}>
+        <img src="${escapeHtml(item.cover_url || "")}" alt="" ${item.cover_url ? "" : "hidden"}>
+        <span class="min">
+          <b>${escapeHtml(item.name || item.id)}</b>
+          <small>${meta}</small>
+        </span>
+      </label>`;
+  }).join("") : '<p class="hint">当前入口没有返回歌单。</p>';
+  box.querySelectorAll("input[data-public-id]").forEach((input) => {
+    input.addEventListener("change", () => {
+      const item = publicState.items.find((it) => String(it.id) === input.dataset.publicId);
+      if (item) setPublicSelection(item, input.checked);
+    });
+  });
+}
+
+async function publicApi(target, params = {}, retry = true) {
+  const query = new URLSearchParams({ provider: publicState.provider, ...params });
+  try {
+    const data = await api(`/api/public-playlists/${target}?${query.toString()}`);
+    if (data.ok === false) throw new Error(data.error || "歌单请求失败");
+    return data;
+  } catch (exc) {
+    if (!retry) throw exc;
+    if (!await startPreview(publicState.provider)) throw exc;
+    return await publicApi(target, params, false);
+  }
+}
+
+function currentUiProvider() {
+  return ($$("input[name=provider]").find((el) => el.checked) || {}).value || savedProvider();
+}
+
+async function loadPublicCapabilities(retry = true) {
+  try {
+    publicCapabilities = await publicApi("capabilities");
+  } catch (exc) {
+    publicCapabilities = null;
+    $("#public-note").textContent = "音源不可达：" + exc.message;
+  }
+  renderPublicControls();
+  return publicCapabilities;
+}
+
+function renderPublicControls() {
+  const providerSelect = $("#public-provider");
+  const channelSelect = $("#public-channel");
+  const sourceSelect = $("#public-source");
+  providerSelect.innerHTML = PUBLIC_PROVIDER_OPTIONS.map((item) =>
+    `<option value="${item.value}">${item.label}</option>`).join("");
+  providerSelect.value = publicState.provider;
+
+  const channels = publicState.provider === "musicbox" ? [
+    { id: "charts", name: "排行榜" }, { id: "recommend", name: "推荐歌单" },
+    { id: "top", name: "热门与分类" }, { id: "highquality", name: "精品歌单" },
+    { id: "account_recommend", name: "账号推荐歌单" },
+  ] : [{ id: "top", name: "热门与分类" }, { id: "charts", name: "排行榜" },
+       { id: "search", name: "歌单搜索" }];
+  const logged = !!(((publicCapabilities || {}).sources || []).find((item) => item.id === "netease") || {}).logged_in;
+  channelSelect.innerHTML = channels.filter((item) =>
+    item.id !== "account_recommend" || logged).map((item) =>
+    `<option value="${item.id}">${item.name}</option>`).join("");
+  if (![...channelSelect.options].some((opt) => opt.value === publicState.channel)) {
+    publicState.channel = publicState.provider === "musicbox" ? "charts" : "top";
+  }
+  channelSelect.value = publicState.channel;
+
+  sourceSelect.hidden = publicState.provider !== "lxmusic";
+  const sources = ((publicCapabilities || {}).sources || []).filter((item) =>
+    publicState.provider !== "lxmusic" || item.playback_available);
+  sourceSelect.innerHTML = sources.map((item) =>
+    `<option value="${item.id}">${item.playback_available ? "" : "⚠ "}${escapeHtml(item.name)}</option>`).join("");
+  if (!sources.some((item) => item.id === publicState.source)) publicState.source = sources[0]?.id || "";
+  sourceSelect.value = publicState.source;
+  syncPublicChannelUi();
+}
+
+function syncPublicChannelUi() {
+  // 歌单搜索通道：隐藏「分类」，显示关键词输入框（洛雪 songList/search 免登录可用）
+  const search = publicState.channel === "search";
+  const keywordInput = $("#public-keyword");
+  if (keywordInput) keywordInput.hidden = !search;
+  const categorySelect = $("#public-category");
+  if (categorySelect) categorySelect.hidden = search;
+  if (search) {
+    const sortSelect = $("#public-sort");
+    if (sortSelect) sortSelect.hidden = true;
+  }
+}
+
+function fillPublicCategories(data) {
+  publicState.cursor = "";
+  publicState.cursors = { 1: "" };
+  const select = $("#public-category");
+  const groups = Array.isArray(data.categories) ? data.categories : [];
+  select.innerHTML = '<option value="">全部分类</option>' + groups.map((group) => {
+    const list = Array.isArray(group.list) ? group.list : [group];
+    return `<optgroup label="${escapeHtml(group.name || "分类")}">${list.map((tag) =>
+      `<option value="${escapeHtml(String(tag.id ?? tag.name ?? ""))}">${escapeHtml(tag.name || tag.id)}</option>`).join("")}</optgroup>`;
+  }).join("");
+  publicState.category = "";
+  const sorts = Array.isArray(data.sorts) ? data.sorts : [];
+  $("#public-sort").hidden = !sorts.length;
+  $("#public-sort").innerHTML = sorts.map((item) =>
+    `<option value="${escapeHtml(String(item.id))}">${escapeHtml(item.name || item.id)}</option>`).join("");
+  publicState.sort = sorts[0]?.id || "";
+}
+
+async function loadPublicCategories() {
+  if (publicState.channel === "recommend" || publicState.channel === "account_recommend") {
+    fillPublicCategories({ categories: [] });
+    return;
+  }
+  if (publicState.channel === "search") {
+    // 搜索通道没有分类/排序，只留关键词输入框
+    fillPublicCategories({ categories: [] });
+    syncPublicChannelUi();
+    return;
+  }
+  try {
+    const highquality = publicState.provider === "musicbox" && publicState.channel === "highquality";
+    const data = await publicApi("categories", {
+      source: publicState.source, kind: publicState.channel === "charts" ? "chart" : "playlist",
+    });
+    fillPublicCategories(highquality ? { categories: data.highquality_tags || data.tags || [] } : data);
+  } catch (exc) {
+    fillPublicCategories({ categories: [] });
+    $("#public-note").textContent = "分类加载失败：" + exc.message;
+  }
+}
+
+async function loadPublicList() {
+  if (publicState.channel === "search" && !String(publicState.keyword || "").trim()) {
+    publicState.items = []; publicState.hasMore = false; publicState.total = 0;
+    renderPublicList(); renderPublicPage();
+    $("#public-note").textContent = "输入关键词后回车搜索歌单。";
+    return;
+  }
+  $("#public-note").textContent = "正在加载歌单…";
+  try {
+    const params = {
+      source: publicState.source, channel: publicState.channel,
+      category: publicState.category, sort: publicState.sort, page: publicState.page,
+    };
+    if (publicState.channel === "search") params.keyword = String(publicState.keyword || "").trim();
+    if (publicState.channel === "highquality") params.cursor = (publicState.cursors || {})[publicState.page] || "";
+    const data = await publicApi("", params);
+    publicState.items = (data.items || []).map((item) => ({
+      ...item, provider: publicState.provider === "musicbox" ? "musicbox" : "lx", source: publicState.source,
+      kind: publicState.channel === "charts" ? "chart" : "playlist",
+    }));
+    publicState.hasMore = !!data.has_more;
+    publicState.total = Number(data.total || 0);
+    publicState.cursor = data.next_cursor || publicState.cursor;
+    if (publicState.channel === "highquality") {
+      publicState.cursors = publicState.cursors || { 1: "" };
+      publicState.cursors[publicState.page + 1] = data.next_cursor || "";
+    }
+    const suffix = publicState.total ? `，接口报告 ${publicState.total} 份` : "";
+    $("#public-note").textContent = `返回 ${publicState.items.length} 份${suffix}；勾选后保存生效。`;
+  } catch (exc) {
+    publicState.items = []; publicState.hasMore = false;
+    $("#public-note").textContent = "歌单加载失败：" + exc.message;
+  }
+  renderPublicList();
+  renderPublicPage();
+}
+
+function renderPublicPage() {
+  $("#public-page").textContent = String(publicState.page);
+  $("#public-prev").disabled = publicState.page <= 1;
+  $("#public-next").disabled = !publicState.hasMore;
+}
+
+async function initPublicDefaults() {
+  const provider = currentUiProvider() === "lxmusic" ? "lx" : "musicbox";
+  if (provider === "musicbox") {
+    publicSelection = [
+      { provider: "musicbox", source: "netease", kind: "chart", id: "3778678", _name: "热歌榜" },
+      { provider: "musicbox", source: "netease", kind: "chart", id: "3779629", _name: "新歌榜" },
+      { provider: "musicbox", source: "netease", kind: "chart", id: "19723756", _name: "飙升榜" },
+      { provider: "musicbox", source: "netease", kind: "chart", id: "2884035", _name: "原创榜" },
+    ];
+    renderPublicSelected();
+    markDirty("已填入默认网易榜单");
+    return;
+  }
+  publicState.provider = "lxmusic";
+  await loadPublicCapabilities();
+  const caps = publicCapabilities || {};
+  const wanted = [
+    { source: "kg", label: "TOP500" }, { source: "kw", label: "飙升榜" }, { source: "wy", label: "新歌榜" },
+  ];
+  publicSelection = [];
+  for (const target of wanted) {
+    const cap = (caps.sources || []).find((item) => item.id === target.source && item.playback_available);
+    if (!cap) continue;
+    publicState.source = target.source; publicState.channel = "charts";
+    try {
+      const data = await publicApi("", { source: target.source, channel: "charts" });
+      const row = (data.items || []).find((item) => String(item.name || "").includes(target.label));
+      if (row) publicSelection.push({ ...row, provider: "lx", source: target.source, kind: "chart", id: String(row.id) });
+    } catch (_) { /* 平台不可用则跳过 */ }
+  }
+  renderPublicSelected();
+  markDirty("已按可用平台填入默认洛雪榜单");
+}
+
+async function showPublicBrowser() {
+  $("#public-playlists-browser").hidden = false;
+  const saved = savedProvider();
+  publicState.provider = currentUiProvider() === "lxmusic" ? "lxmusic" : "musicbox";
+  await loadPublicCapabilities();
+  await loadPublicCategories();
+  await loadPublicList();
+  const browsingProvider = publicState.provider;
+  for (const item of publicSelection) {
+    const uiProvider = item.provider === "lx" ? "lxmusic" : "musicbox";
+    if (uiProvider !== browsingProvider) continue;
+    const cap = ((publicCapabilities || {}).sources || []).find((source) => source.id === item.source);
+    item._reason = cap && !cap.playback_available ? cap.reason || "当前平台没有播放能力" : "";
+    try {
+      const response = await publicApi(encodeURIComponent(item.id), { source: item.source, kind: item.kind });
+      item._name = response.data.name;
+      item._cover_url = response.data.cover_url;
+      item._track_count = response.data.track_count;
+    } catch (exc) { item._reason = item._reason || exc.message; }
+  }
+  renderPublicSelected();
+  if (saved === "musicdl") $("#public-note").textContent = "当前音源是 musicdl：它没有统一推荐歌单接口；可浏览网易/洛雪，保存后按常驻规则展示网易公共歌单。";
+}
+
+$("#public-playlists-enabled").addEventListener("change", async () => {
+  const enabled = $("#public-playlists-enabled").checked;
+  updateResidentAvailability();
+  markDirty(enabled ? "公共歌单已开启" : "公共歌单已关闭");
+  if (!enabled) { $("#public-playlists-browser").hidden = true; return; }
+  if (!publicSelection.length && !configPresence.FNMUSIC_PUBLIC_PLAYLISTS_SELECTION) await initPublicDefaults();
+  await showPublicBrowser();
+});
+$("#public-provider").addEventListener("change", async () => {
+  publicState.provider = $("#public-provider").value;
+  publicState.page = 1; publicState.channel = publicState.provider === "musicbox" ? "charts" : "top";
+  markDirty(); await loadPublicCapabilities(); await loadPublicCategories(); await loadPublicList();
+});
+$("#public-channel").addEventListener("change", async () => {
+  publicState.channel = $("#public-channel").value; publicState.page = 1;
+  syncPublicChannelUi();
+  markDirty(); await loadPublicCategories(); await loadPublicList();
+});
+$("#public-source").addEventListener("change", async () => {
+  publicState.source = $("#public-source").value; publicState.page = 1;
+  markDirty(); await loadPublicCategories(); await loadPublicList();
+});
+$("#public-category").addEventListener("change", async () => {
+  publicState.category = $("#public-category").value; publicState.page = 1;
+  publicState.cursors = { 1: "" }; publicState.cursor = "";
+  markDirty(); await loadPublicList();
+});
+$("#public-sort").addEventListener("change", async () => {
+  publicState.sort = $("#public-sort").value; publicState.page = 1;
+  markDirty(); await loadPublicList();
+});
+$("#public-refresh").addEventListener("click", async () => {
+  await loadPublicCapabilities(); await loadPublicCategories(); await loadPublicList();
+});
+(() => {
+  const input = $("#public-keyword");
+  if (!input) return;
+  const run = async () => {
+    publicState.keyword = input.value.trim();
+    publicState.page = 1;
+    publicState.cursors = { 1: "" };
+    await loadPublicList();
+  };
+  input.addEventListener("change", run);
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); run(); }
+  });
+})();
+$("#public-prev").addEventListener("click", async () => {
+  if (publicState.page > 1) { publicState.page--; await loadPublicList(); }
+});
+$("#public-next").addEventListener("click", async () => {
+  if (publicState.hasMore) { publicState.page++; await loadPublicList(); }
+});
+
 /* -------------------------------------------------------------- 网易扫码 */
+let neteaseLoggedIn = false;
+
+function updateResidentAvailability() {
+  // 账号歌单仍需登录；公共网易歌单可匿名常驻，因此仅在两者都无需求时置灰。
+  const publicNeedsMusicbox = $("#public-playlists-enabled").checked
+    && publicSelection.some((item) => item.provider === "musicbox");
+  $("#netease-resident").disabled = !neteaseLoggedIn && !publicNeedsMusicbox;
+}
+
 async function syncNeteaseAccount(retries = 0) {
-  // 把网易账号态同步到 #qr-check（已登录显示昵称；未登录/失败清空）
+  // 把网易账号态同步到 #qr-check（已登录显示昵称；未登录/失败清空），
+  // 同时驱动「网易云歌单常驻」复选框的可用态
+  neteaseLoggedIn = false;
+  updateResidentAvailability();
   for (let i = 0; ; i++) {
     try {
       const st = await api("/api/netease/auth/status");
       const d = st.data || st;
       if (d.logged_in) {
-        $("#qr-check").textContent = `当前登录：${d.nickname || d.user_id || "已登录用户"}`;
-        return;
+        neteaseLoggedIn = true;
+        const who = d.nickname || d.user_id || "已登录用户";
+        // VIP 标识：vip_type>0 即付费会员（10=音乐包，11/110=黑胶VIP）
+        const vipLabel = String(d.vip_label || "");
+        const isVip = Number(d.vip_type || 0) > 0 || !!vipLabel;
+        $("#qr-check").innerHTML = `当前登录：${escapeHtml(String(who))}`
+          + (isVip ? ` <span class="vip-badge" title="${escapeHtml(vipLabel || "VIP")}">VIP</span>` : "");
+        break;
       }
     } catch (_) { /* status 不可达视为未登录 */ }
-    if (i >= retries) { $("#qr-check").textContent = ""; return; }
+    if (i >= retries) break;
     await new Promise((r) => setTimeout(r, 1500));
   }
+  // 我方保留行为：未登录/请求失败时清空 #qr-check（上游 v2.9.0 此版去掉了该清空，
+  // 但我方既有测试与交互预期是「未登录即清空」，按「已有功能一律不动」原则保留）
+  if (!neteaseLoggedIn) $("#qr-check").textContent = "";
+  updateResidentAvailability();
 }
 
 async function startQrLogin() {
@@ -431,6 +856,14 @@ function stopQrPolling() {
   if (qrTimer) { clearInterval(qrTimer); qrTimer = null; }
 }
 $("#qr-btn").addEventListener("click", startQrLogin);
+
+$("#netease-resident").addEventListener("change", () => {
+  // 常驻为账号/公共歌单供数；仅在没有公共选择时自动带出账号歌单开关。
+  const publicNeedsMusicbox = publicSelection.some((item) => item.provider === "musicbox");
+  if ($("#netease-resident").checked && !$("#netease-my-playlists").checked && !publicNeedsMusicbox) {
+    $("#netease-my-playlists").checked = true;
+  }
+});
 
 /* -------------------------------------------------------------- lx 源测试 */
 $("#lx-test").addEventListener("click", async () => {
@@ -580,7 +1013,7 @@ $("#lx-pick").addEventListener("click", lxPickFromNas);
 ["#tee-dir", "#tee-max", "#llm-base", "#llm-key", "#llm-model", "#lx-url", "#search-timeout", "#bind-timeout", "#handoff-max", "#scan-path"].forEach((sel) =>
   $(sel).addEventListener("input", () => markDirty()));
 $$("input[name=quality]").forEach((el) => el.addEventListener("change", () => markDirty("音质偏好需保存后生效")));
-["#recommend-hot", "#recommend-daily", "#search-probe", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists"].forEach((sel) =>
+["#recommend-hot", "#recommend-daily", "#search-probe", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists", "#netease-resident"].forEach((sel) =>
   $(sel).addEventListener("change", () => markDirty()));
 
 function updateTeeCountLabel() {
@@ -609,6 +1042,16 @@ let versionInfo = null;
 function esc(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// #55 公共歌单段（上游 v2.9.0 移植）使用；与 esc 等价，保留上游原名便于对账同步
+function escapeHtml(str) {
+  return String(str || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function fmtBytes(n) {
@@ -677,6 +1120,9 @@ function renderVersion(v) {
   if (cur) {
     cur.innerHTML = `<div class="kv"><b>已安装</b>v${esc(v.current)}</div>`;
   }
+
+  // 在线热更新下拉框：列出可热更新的已发布版本
+  renderHotfixVersions(v);
 
   // 侧边栏版本号旁的升级角标（点击直达发行页看升级点）
   const badge = $("#brand-upgrade");
@@ -934,12 +1380,210 @@ async function startUpgrade() {
   } catch (e) { /* 忽略 */ }
 })();
 
+/* -------------------------------------------------------------- 代码热更新（S6 前端按钮） */
+/* 直接消费 make_hotfix.sh 产出的 .hotfix.json（host-hotfix 端点请求体原样）。 */
+let hotfixPlan = null;  // 当前选中的 {version, files:[...], restart:[...]}
+
+function setupHotfix() {
+  const pick = $("#hotfix-pick");
+  const file = $("#hotfix-file");
+  const fetchBtn = $("#hotfix-fetch");
+  const urlInput = $("#hotfix-url");
+  const applyBtn = $("#hotfix-apply");
+  const rollbackBtn = $("#hotfix-rollback");
+  if (!pick || !file || !applyBtn || !rollbackBtn) return;
+
+  pick.addEventListener("click", () => file.click());
+  file.addEventListener("change", async () => {
+    const f = file.files && file.files[0];
+    if (!f) return;
+    try { loadHotfixPlan(await f.text()); }
+    catch (exc) { toast("读取失败：" + exc.message, "fail"); }
+    finally { file.value = ""; }
+  });
+
+  if (fetchBtn && urlInput) {
+    fetchBtn.addEventListener("click", async () => {
+      const url = urlInput.value.trim();
+      if (!url) { toast("请输入热更新包链接", "fail"); return; }
+      $("#hotfix-note").textContent = "获取中…";
+      try {
+        const r = await fetch(url);
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        loadHotfixPlan(await r.text());
+      } catch (exc) { toast("获取失败：" + exc.message, "fail"); }
+      finally { $("#hotfix-note").textContent = ""; }
+    });
+  }
+
+  applyBtn.addEventListener("click", applyHotfix);
+  rollbackBtn.addEventListener("click", rollbackHotfix);
+
+  // 在线一键更新：下拉选择已发布的可热更新版本，网关自己拉包并应用（用户侧零下载）
+  const onlineBtn = $("#hotfix-online");
+  if (onlineBtn) {
+    onlineBtn.addEventListener("click", async () => {
+      const sel = $("#hotfix-online-ver");
+      const target = sel && sel.value;
+      if (!target) { toast("请先选择要更新的版本", "fail"); return; }
+      if (!confirm(`确认在线更新到 v${target}？\n将从官方发行源拉取热更新包并自动应用（仅代码级热更新）。`)) return;
+      onlineBtn.disabled = true;
+      onlineBtn.textContent = "更新中…";
+      const res = $("#hotfix-online-result");
+      res.hidden = false; res.className = "report"; res.textContent = "正在拉取并应用 v" + target + " …";
+      try {
+        const r = await api("/api/host-auto-update", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ target }),
+        });
+        if (r && r.ok) {
+          res.className = "report ok";
+          res.innerHTML = `<div class="ok">✓ 已更新到 v${r.version}</div>` +
+            `<div>写入文件数：<b>${r.applied != null ? r.applied : "?"}</b></div>` +
+            (r.need_reload_browser ? `<div class="muted">⚠ 请刷新浏览器以加载新前端</div>` : "");
+          toast("更新成功，请刷新浏览器", "ok");
+        } else {
+          res.className = "report fail";
+          res.innerHTML = `<div class="fail">✗ 更新失败：${(r && r.error) || "未知错误"}</div>`;
+          toast("更新失败", "fail");
+        }
+      } catch (exc) {
+        res.className = "report fail";
+        res.innerHTML = `<div class="fail">✗ 更新异常：${exc.message}</div>`;
+        toast("更新异常：" + exc.message, "fail");
+      } finally {
+        onlineBtn.disabled = false;
+        onlineBtn.textContent = "更新";
+      }
+    });
+  }
+}
+
+function renderHotfixVersions(v) {
+  const row = $("#hotfix-online-row");
+  const sel = $("#hotfix-online-ver");
+  const btn = $("#hotfix-online");
+  if (!row || !sel) return;
+  // 旧后端无此字段：整个功能不存在，保持隐藏
+  if (!v || !Array.isArray(v.hotfix_versions)) { row.hidden = true; return; }
+  // 常驻显示：无可用版本时给出禁用态说明，而不是把整行藏起来
+  row.hidden = false;
+  const list = v.hotfix_versions;
+  if (!list.length) {
+    sel.disabled = true;
+    if (btn) btn.disabled = true;
+    sel.innerHTML = `<option value="">已是最新，暂无可在线更新的版本</option>`;
+    return;
+  }
+  sel.disabled = false;
+  if (btn) btn.disabled = false;
+  sel.innerHTML = list.map((it) =>
+    `<option value="${esc(it.version)}">v${esc(it.version)}</option>`).join("");
+}
+
+function loadHotfixPlan(text) {
+  let obj;
+  try { obj = JSON.parse(text); } catch (_) { toast("不是合法 JSON", "fail"); return; }
+  if (!obj || typeof obj.version !== "string" || !Array.isArray(obj.files) || !obj.files.length) {
+    toast("不是有效的热更新包（缺 version/files）", "fail"); return;
+  }
+  for (const it of obj.files) {
+    if (!it || typeof it.path !== "string" || !it.path.startsWith("/repo/")
+        || typeof it.sha256 !== "string" || typeof it.content_b64 !== "string") {
+      toast("文件项格式不合法：" + (it && it.path || "?"), "fail"); return;
+    }
+  }
+  hotfixPlan = obj;
+  const ver = obj.version;
+  const restart = (obj.restart && obj.restart.length) ? obj.restart.join(", ") : "无（静态资源刷新即生效）";
+  const list = obj.files.map(f => {
+    const rel = f.path.replace(/^\/repo\//, "");
+    let kb = "?";
+    try { kb = (atob(f.content_b64).length / 1024).toFixed(1); } catch (_) {}
+    return `<div>• ${rel} <span class="muted">(${kb} KB)</span></div>`;
+  }).join("");
+  $("#hotfix-preview").innerHTML =
+    `<div><b>目标版本：</b>v${ver}</div>` +
+    `<div><b>将重启：</b>${restart}</div>` +
+    `<div><b>改动文件（${obj.files.length}）：</b></div>${list}`;
+  $("#hotfix-preview").hidden = false;
+  $("#hotfix-apply").hidden = false;
+  $("#hotfix-rollback").hidden = false;
+  $("#hotfix-result").hidden = true;
+  toast("已载入热更新包 v" + ver, "ok");
+}
+
+async function applyHotfix() {
+  if (!hotfixPlan) return;
+  const btn = $("#hotfix-apply");
+  btn.disabled = true;
+  $("#hotfix-note").textContent = "应用热更新中（写入并重启服务）…";
+  try {
+    const r = await api("/api/host-hotfix", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(hotfixPlan),
+    });
+    const back = r.backup ? `<div>备份：<code>${r.backup}</code></div>` : "";
+    const reload = r.need_reload_browser ? `<div class="muted">⚠ 请刷新浏览器以加载新前端</div>` : "";
+    $("#hotfix-result").innerHTML =
+      `<div class="ok">✓ 应用成功</div>` +
+      `<div>写入文件数：<b>${r.applied != null ? r.applied : "?"}</b></div>` +
+      `<div>当前版本：<b>v${r.version || hotfixPlan.version}</b></div>` +
+      `<div>已重启：<b>${(r.restarted || []).join(", ") || "无"}</b></div>` +
+      back + reload;
+    $("#hotfix-result").hidden = false;
+    toast("热更新已应用", "ok");
+  } catch (exc) {
+    $("#hotfix-result").innerHTML =
+      `<div class="fail">✗ 应用失败：${exc.message}</div>` +
+      `<div class="muted">若已部分写入，可点「回滚上一版」恢复。</div>`;
+    $("#hotfix-result").hidden = false;
+    toast("应用失败：" + exc.message, "fail");
+  } finally {
+    btn.disabled = false;
+    $("#hotfix-note").textContent = "";
+  }
+}
+
+async function rollbackHotfix() {
+  if (!hotfixPlan) { toast("请先选择要回滚的热更新包", "fail"); return; }
+  const ver = hotfixPlan.version;
+  if (!confirm(`确认回滚到应用 v${ver} 之前的状态？相关文件会被还原，并重启对应服务。`)) return;
+  const btn = $("#hotfix-rollback");
+  btn.disabled = true;
+  $("#hotfix-note").textContent = "回滚中…";
+  try {
+    const r = await api("/api/host-hotfix-rollback", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ version: ver }),
+    });
+    $("#hotfix-result").innerHTML =
+      `<div class="ok">✓ 已回滚</div>` +
+      `<div>还原文件：<b>${(r.restored || []).join(", ") || "无"}</b></div>` +
+      `<div>已重启：<b>${(r.restarted || []).join(", ") || "无"}</b></div>`;
+    $("#hotfix-result").hidden = false;
+    toast("已回滚到应用前状态", "ok");
+  } catch (exc) {
+    $("#hotfix-result").innerHTML = `<div class="fail">✗ 回滚失败：${exc.message}</div>`;
+    $("#hotfix-result").hidden = false;
+    toast("回滚失败：" + exc.message, "fail");
+  } finally {
+    btn.disabled = false;
+    $("#hotfix-note").textContent = "";
+  }
+}
+
 /* -------------------------------------------------------------- 启动 */
 (async function boot() {
   await loadConfig();
   await loadStatus();
   await loadPlatforms(false);  // 页面加载不自动拉起预览进程，等用户点选音源
+  if ($("#public-playlists-enabled").checked) await showPublicBrowser();
   // 版本检测不阻塞启动：静默失败无所谓，用户可随时手动点「检查更新」
   loadVersion(true);
+  setupHotfix();
   setInterval(loadStatus, 15000);
 })();

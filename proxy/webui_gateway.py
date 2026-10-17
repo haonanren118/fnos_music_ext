@@ -20,6 +20,9 @@
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import io
 import json
 import os
 import re
@@ -28,7 +31,11 @@ import signal
 import socket
 import subprocess
 import sys
+import tarfile
+import tempfile
 import threading
+import time
+import urllib.request
 from pathlib import Path
 
 UPSTREAM = ("127.0.0.1", 8774)
@@ -67,6 +74,125 @@ CONTAINER_REPO_PREFIX = "/repo"
 HOST_REPO_ROOT = Path("/vol1/@appcenter/fnmusic-ext/repo")
 # 容器内 WebUI 用它连宿主 root 网关（同在 /repo 下，容器可见）
 UPGRADE_SOCK_NAME = ".upgrade-gw.sock"
+
+# ── host-hotfix：代码级热更新（改宿主 repo 里的代码，不重建镜像） ──────────────
+#
+# 【为什么需要】S1 之后容器内 /srv/* 已是指向 /repo/* 的软链，改宿主代码分三种生效方式：
+#   - static/*            → 刷新浏览器即生效（StaticFiles 每次请求读盘）
+#   - webui-service/*.py  → docker exec supervisorctl restart webui（1~2s）
+#   - proxy/*.py          → systemctl restart fnmusic-ext（本进程也会被重启）
+# 这三件事容器里做不了（无 root、无 docker、无 systemctl），必须由宿主 root 代劳。
+#
+# 【版本基线从哪来】热更新改的是代码，不改应用中心登记的 fpk 版本，所以不能只看
+# `_installed_version()`。这里用三处取最大：
+#   1) 应用中心登记版本（_installed_version，本机实测可能为空）
+#   2) 仓库根 VERSION 文件
+#   3) .hotfix-version（本端点自己维护，每次成功写入后更新）
+# 每次成功写入后，把 to_version 落到 .hotfix-version，后续热更新以此为基线递增。
+HOST_HOTFIX_PATHS = ("/app/fnmusic-ext/api/host-hotfix", "/api/host-hotfix")
+HOST_HOTFIX_ROLLBACK_PATHS = (
+    "/app/fnmusic-ext/api/host-hotfix-rollback", "/api/host-hotfix-rollback")
+HOST_HOTFIX_MAX_BODY = 8 << 20        # 8MB：hotfix 含多文件代码，比 host-file 的 1MB 宽
+HOTFIX_BACKUP_ROOT = HOST_REPO_ROOT / ".hotfix-backup"
+HOTFIX_VERSION_FILE = HOST_REPO_ROOT / ".hotfix-version"
+
+# 白名单：只允许改这些前缀下的文件（用**容器路径**写法，与 CONTAINER_REPO_PREFIX 一致，
+# 因为调用方在容器里，它只知道 /repo/...）。换算成宿主路径后再做逃逸检查。
+HOTFIX_ALLOW_PREFIXES = (
+    "/repo/proxy/",
+    "/repo/webui-service/",
+    "/repo/musicdl-service/",
+    "/repo/musicbox-service/",
+    "/repo/lxmusic-service/",
+)
+# 明确禁止：即便前缀匹配也拦掉。
+#   .env           —— 站点配置，改了要重装
+#   sources-data/  —— 用户数据（曲库缓存、升级包），绝不碰
+#   ui/            —— 桌面入口定义，碰了图标会出问题
+#   container/     —— 镜像构建物，热更新改它没意义（要 rebuild 才生效）
+HOTFIX_DENY_PARTS = (".env", "sources-data", "ui", "container", ".hotfix-backup")
+HOTFIX_ALLOW_SUFFIXES = (".py", ".js", ".html", ".css", ".json", ".sh")
+# 允许重启的服务名 → 实际命令。只接受这几个名字，绝不接受任意命令/参数。
+HOTFIX_RESTART_TARGETS = {
+    "host": ("systemctl", "restart", "fnmusic-ext"),
+    "webui": ("docker", "exec", "fnmusic-sources", "supervisorctl",
+              "-c", "/etc/supervisor/supervisord.conf", "restart", "webui"),
+    "musicdl": ("docker", "exec", "fnmusic-sources", "supervisorctl",
+                "-c", "/etc/supervisor/supervisord.conf", "restart", "musicdl"),
+    "musicbox": ("docker", "exec", "fnmusic-sources", "supervisorctl",
+                 "-c", "/etc/supervisor/supervisord.conf", "restart", "musicbox"),
+    "lxmusic": ("docker", "exec", "fnmusic-sources", "supervisorctl",
+                "-c", "/etc/supervisor/supervisord.conf", "restart", "lxmusic"),
+}
+HOTFIX_MAX_FILES = 200
+
+
+def _sha256_of(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _ver_tuple(raw: str) -> tuple:
+    """把版本串解析成可比较的 4 元组。
+
+    与 webui-service/upgrade.py 的同名函数保持一致的行为（只取数字，
+    不足 4 段补 0），这样两边的"谁更新"判断不会打架。
+    """
+    parts = re.findall(r"\d+", str(raw or ""))
+    return tuple(int(p) for p in parts[:4]) + (0,) * max(0, 4 - len(parts[:4]))
+
+
+def _current_hotfix_base() -> str:
+    """取当前版本基线 = max(应用中心登记, VERSION 文件, .hotfix-version)。"""
+    candidates = [_installed_version()]
+    try:
+        candidates.append((HOST_REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip())
+    except OSError:
+        pass
+    try:
+        candidates.append(HOTFIX_VERSION_FILE.read_text(encoding="utf-8").strip())
+    except OSError:
+        pass
+    valid = [c for c in candidates if re.search(r"\d", str(c or ""))]
+    if not valid:
+        return ""
+    return max(valid, key=_ver_tuple)
+
+
+def _container_to_host(container_path: str) -> "Path | None":
+    """容器路径 → 宿主真实路径；不是 /repo 开头或含 .. 返回 None。
+
+    路径按 POSIX 语义解析（容器与 NAS 都是 Linux），避免在 Windows 上测试时
+    被 os.path.normpath 换成反斜杠而行为不一致。
+    """
+    if not container_path.startswith(CONTAINER_REPO_PREFIX):
+        return None
+    rel = container_path[len(CONTAINER_REPO_PREFIX):].lstrip("/")
+    if not rel:
+        return None
+    parts = Path(rel).parts
+    if ".." in parts:
+        return None
+    return HOST_REPO_ROOT.joinpath(*parts)
+
+
+def _hotfix_path_ok(container_path: str, host_path: Path) -> "str | None":
+    """返回拒绝原因；通过则返回 None。三重校验：前缀 + 后缀 + 禁名单 + 逃逸。"""
+    if not any(container_path.startswith(p) for p in HOTFIX_ALLOW_PREFIXES):
+        return f"路径不在白名单目录内：{container_path}"
+    if not container_path.endswith(HOTFIX_ALLOW_SUFFIXES):
+        return f"文件后缀不允许（仅 {'/'.join(HOTFIX_ALLOW_SUFFIXES)}）：{container_path}"
+    parts = Path(container_path).parts
+    for denied in HOTFIX_DENY_PARTS:
+        if denied in parts:
+            return f"路径命中禁止项 {denied}：{container_path}"
+    try:
+        resolved = host_path.resolve()
+        root = HOST_REPO_ROOT.resolve()
+    except OSError as exc:
+        return f"路径解析失败：{exc}"
+    if resolved != root and root not in resolved.parents:
+        return f"路径逃逸出仓库目录：{container_path}"
+    return None
 
 
 def socket_path_for(base: Path) -> Path:
@@ -124,17 +250,25 @@ def _read_request_head(client: socket.socket) -> "tuple[bytes, dict[str, str]] |
     return head + b"\r\n\r\n" + rest, headers
 
 
-def _read_full_body(client: socket.socket, headers: dict[str, str], head_raw: bytes) -> "bytes | None":
-    """按 Content-Length 收齐 POST 体（小请求：仅路径字符串）。"""
+def _read_full_body(client: "socket.socket | None", headers: dict[str, str], head_raw: bytes,
+                    max_body: int = HOST_FILE_MAX_BODY) -> "bytes | None":
+    """按 Content-Length 收齐 POST 体。
+
+    head_raw 里已含头部之后读到的部分体，先扣出来；不够再 recv（client 为 None
+    时表示调用方已把全部体读进 head_raw，无需再收）。max_body 可覆盖上限：
+    host-file 用默认 1MB，host-hotfix 传 8MB。
+    """
     try:
         length = int(headers.get("content-length", "0"))
     except ValueError:
         return None
-    if length < 0 or length > HOST_FILE_MAX_BODY:
+    if length < 0 or length > max_body:
         return None
     head_end = head_raw.find(b"\r\n\r\n") + 4
     body = head_raw[head_end:]
     while len(body) < length:
+        if client is None:
+            return None
         chunk = client.recv(65536)
         if not chunk:
             return None
@@ -486,6 +620,535 @@ def _is_host_publish_request(head_raw: bytes) -> bool:
     return _is_post_to(head_raw, HOST_PUBLISH_PATHS)
 
 
+def _run_restart(svc: str) -> bool:
+    """按白名单执行重启；未知名字返回 False。绝不接受任意命令。"""
+    cmd = HOTFIX_RESTART_TARGETS.get(svc)
+    if cmd is None:
+        return False
+    try:
+        subprocess.run(list(cmd), capture_output=True, text=True, timeout=120)  # noqa: S603
+    except (subprocess.TimeoutExpired, OSError):
+        # 重启超时不等于没重启（systemctl restart 会先停后起），记录为已尝试
+        return True
+    return True
+
+
+def _restart_after_response(client: socket.socket, svc_list: list[str], payload: bytes) -> None:
+    """先把响应发给调用方、关连接，**再**执行重启。
+
+    【为什么必须这样】restart=["host"] 等价于 `systemctl restart fnmusic-ext`，
+    而本进程（gateway）正是该 service 的 ExecStartPost 子进程 —— 同步执行会
+    在 `client.sendall()` 之前就把自己杀掉，调用方收到 0 字节，无法区分
+    "成功但没回包" 与 "失败"。所以顺序必须是：回包 → 关连接 → 重启。
+
+    【★ 顺序约束（2026-10-09 修）】`host` 必须**放到最后**执行。
+    原因同上：`systemctl restart fnmusic-ext` 会杀掉本进程，而重启动作跑在本
+    函数的线程里 —— 线程随进程一起消失，排在 host 之后的服务**永远不会被重启**。
+    实测事故：restart=["host","lxmusic"] 时 lxmusic 的 pid 不变、代码实际未生效，
+    但端点仍回报 `restarted:["host","lxmusic"]`（静默成功，正是纪律七要防的形态）。
+    """
+    try:
+        client.sendall(payload)
+    except OSError:
+        pass
+    try:
+        client.close()
+    except OSError:
+        pass
+    # host 排到最后：它一旦执行，本进程即终止，后续步骤不可能再运行。
+    ordered = [s for s in svc_list if s != "host"] + [s for s in svc_list if s == "host"]
+    for svc in ordered:
+        _run_restart(svc)
+
+
+def _parse_hotfix_request(client: socket.socket, headers: dict[str, str], head_raw: bytes):
+    """公共前段：管理员校验 + 读体 + JSON 解析。
+
+    返回 (req_dict, None) 或 (None, response_bytes)。
+    """
+    if headers.get("x-trim-isadmin", "").lower() != "true":
+        return None, _json_response(403, {"ok": False, "error": "仅管理员可执行热更新"})
+    body = _read_full_body(client, headers, head_raw, max_body=HOST_HOTFIX_MAX_BODY)
+    if body is None:
+        return None, _json_response(413, {"ok": False, "error": "请求体无效或超过 8MB 上限"})
+    try:
+        req = json.loads(body.decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return None, _json_response(400, {"ok": False, "error": "请求体必须是 JSON"})
+    if not isinstance(req, dict):
+        return None, _json_response(400, {"ok": False, "error": "请求体必须是 JSON 对象"})
+    return req, None
+
+
+def handle_host_hotfix(client: socket.socket, headers: dict[str, str], head_raw: bytes) -> None:
+    """POST /api/host-hotfix：把一批代码文件写入宿主 repo，并按需重启服务。
+
+    请求体：
+      {"version": "2.6.21",
+       "files": [{"path": "/repo/webui-service/app.py",
+                  "sha256": "<hex>", "content_b64": "<base64>"}],
+       "restart": ["webui"]}
+
+    响应：
+      {"ok": true, "applied": 1, "backup": "...", "restarted": ["webui"],
+       "need_reload_browser": false, "version_file_written": true}
+
+    安全约束（这是特权入口，规矩与 host-upgrade 同级）：
+      - 必须是管理员（网关注入的 X-Trim-Isadmin: true）；
+      - 请求体 ≤ 8MB；文件数 ≤ HOTFIX_MAX_FILES；
+      - 路径三重白名单（允许前缀 + 允许后缀 + 禁止项）且 resolve 后不得逃逸出 repo；
+      - 每个文件的 sha256 必须与 base64 内容自洽（防传输损坏/被改）；
+      - 版本必须**严格递增**（基线 = max(应用中心版本, VERSION, .hotfix-version)）；
+      - **先全量预检、后写入** —— 避免"改一半失败"；
+      - 写入前整批备份到 .hotfix-backup/<ver>/ 并写 MANIFEST.json，可原样回滚；
+      - **成功判据是"写入后逐个复查 sha256 与请求一致"**，不是"没抛异常"；
+      - restart 只接受白名单服务名（host/webui/musicdl/musicbox/lxmusic），
+        未知名字忽略，subprocess 不带 shell；若含 host，则**先回包再重启**
+        （本进程就是被重启的对象，同步执行会导致调用方收不到响应）。
+    """
+    handed_off = False
+    try:
+        req, err = _parse_hotfix_request(client, headers, head_raw)
+        if err is not None:
+            client.sendall(err)
+            return
+        handed_off = _run_hotfix(client, req)
+    except OSError:
+        pass
+    finally:
+        if not handed_off:
+            try:
+                client.close()
+            except OSError:
+                pass
+
+
+def _run_hotfix(client: socket.socket, req: dict) -> bool:
+    """执行热更新的写入/备份/重启核心（被 host-hotfix 与 host-auto-update 共用）。
+
+    返回 True 表示响应已移交给后台重启线程（调用方**不得**再关闭 client）；
+    返回 False 表示已同步回包或出错，调用方负责关闭 client。
+    """
+    handed_off = False
+    try:
+        ver = str(req.get("version") or "").strip()
+        files = req.get("files")
+        if not isinstance(files, list) or not files:
+            client.sendall(_json_response(400, {"ok": False, "error": "files 必须是非空数组"}))
+            return
+        if len(files) > HOTFIX_MAX_FILES:
+            client.sendall(_json_response(400, {"ok": False,
+                                                "error": f"文件数超过上限 {HOTFIX_MAX_FILES}"}))
+            return
+
+        # 版本严格递增
+        base = _current_hotfix_base()
+        if not ver or not re.search(r"\d", ver):
+            client.sendall(_json_response(400, {"ok": False, "error": "version 必须是有效版本号"}))
+            return
+        if base and _ver_tuple(ver) <= _ver_tuple(base):
+            client.sendall(_json_response(409, {
+                "ok": False, "current": base,
+                "error": f"目标版本 v{ver} 必须大于当前 v{base}"}))
+            return
+
+        # 全量预检
+        plan: list[tuple[str, Path, bytes]] = []
+        seen: set[str] = set()
+        for i, item in enumerate(files):
+            if not isinstance(item, dict):
+                client.sendall(_json_response(400, {"ok": False, "error": f"files[{i}] 不是对象"}))
+                return
+            cp = str(item.get("path") or "")
+            sha = str(item.get("sha256") or "").lower()
+            b64 = str(item.get("content_b64") or "")
+            if not cp:
+                client.sendall(_json_response(400, {"ok": False, "error": f"files[{i}].path 为空"}))
+                return
+            if cp in seen:
+                client.sendall(_json_response(400, {"ok": False, "error": f"路径重复：{cp}"}))
+                return
+            seen.add(cp)
+            hp = _container_to_host(cp)
+            if hp is None:
+                client.sendall(_json_response(400, {
+                    "ok": False, "error": f"路径必须以 {CONTAINER_REPO_PREFIX}/ 开头且不含 ..：{cp}"}))
+                return
+            why = _hotfix_path_ok(cp, hp)
+            if why:
+                client.sendall(_json_response(403, {"ok": False, "error": why}))
+                return
+            try:
+                raw = base64.b64decode(b64, validate=True)
+            except Exception:  # noqa: BLE001
+                client.sendall(_json_response(400, {"ok": False,
+                                                    "error": f"content_b64 不是合法 base64：{cp}"}))
+                return
+            if _sha256_of(raw) != sha:
+                client.sendall(_json_response(400, {"ok": False,
+                                                    "error": f"sha256 与内容不符：{cp}"}))
+                return
+            plan.append((cp, hp, raw))
+
+        # 备份（整批一次性，便于回滚）
+        bdir = HOTFIX_BACKUP_ROOT / ver
+        try:
+            bdir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            client.sendall(_json_response(500, {"ok": False, "error": f"备份目录不可用: {exc}"}))
+            return
+        backed: list[str] = []
+        for cp, hp, _raw in plan:
+            if hp.is_file():
+                try:
+                    rel = hp.relative_to(HOST_REPO_ROOT)
+                    dst = bdir / rel
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(hp), str(dst))
+                    backed.append(str(rel))
+                except OSError as exc:
+                    client.sendall(_json_response(500, {
+                        "ok": False, "error": f"备份失败 {cp}: {exc}"}))
+                    return
+        restart_list = [s for s in (req.get("restart") or [])
+                        if isinstance(s, str) and s in HOTFIX_RESTART_TARGETS]
+        try:
+            (bdir / "MANIFEST.json").write_text(json.dumps({
+                "from_version": base,
+                "to_version": ver,
+                "files": [str(hp.relative_to(HOST_REPO_ROOT)) for _cp, hp, _r in plan],
+                "backed_up": backed,
+                "restart": restart_list,
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:
+            client.sendall(_json_response(500, {"ok": False, "error": f"写 MANIFEST 失败: {exc}"}))
+            return
+
+        # 写入 + 复查（成功判据：读回来的 sha256 与请求一致）
+        for cp, hp, raw in plan:
+            try:
+                hp.parent.mkdir(parents=True, exist_ok=True)
+                hp.write_bytes(raw)
+            except OSError as exc:
+                client.sendall(_json_response(500, {"ok": False, "error": f"写入失败 {cp}: {exc}"}))
+                return
+        for cp, hp, raw in plan:
+            try:
+                got = _sha256_of(hp.read_bytes())
+            except OSError as exc:
+                client.sendall(_json_response(500, {"ok": False,
+                                                    "error": f"回读失败 {cp}: {exc}"}))
+                return
+            if got != _sha256_of(raw):
+                client.sendall(_json_response(500, {
+                    "ok": False, "error": f"回写校验失败（内容与请求不符）：{cp}"}))
+                return
+
+        # 更新热更新版本基线
+        version_file_ok = False
+        try:
+            HOTFIX_VERSION_FILE.write_text(ver + "\n", encoding="utf-8")
+            # 同步写 /repo/VERSION：UI 版本号（webui-service 的 /api/version）按请求
+            # 实时读取该文件，若不写，热更新装完后界面仍显示旧版本号。
+            if re.fullmatch(r"\d+\.\d+\.\d+", ver):
+                (HOST_REPO_ROOT / "VERSION").write_text(ver + "\n", encoding="utf-8")
+                version_file_ok = True
+        except OSError:
+            pass  # 不影响本次生效，只影响下次递增判断 / UI 版本显示
+
+        need_reload = any(str(hp).endswith((".js", ".css", ".html")) for _c, hp, _r in plan)
+        payload = _json_response(200, {
+            "ok": True, "applied": len(plan), "version": ver,
+            "backup": str(bdir), "restarted": restart_list,
+            "need_reload_browser": need_reload,
+            "version_file_written": version_file_ok,
+        })
+        # 若需要重启 host，则必须"先回包再重启" —— 见 _restart_after_response 的说明。
+        # 交给后台线程，且把 client 的关闭责任一并移交，避免 finally 提前关掉它。
+        if restart_list:
+            handed_off = True
+            threading.Thread(
+                target=_restart_after_response,
+                args=(client, restart_list, payload),
+                daemon=True,
+            ).start()
+            return
+        client.sendall(payload)
+    except OSError:
+        pass
+    return handed_off
+
+
+def handle_host_hotfix_rollback(client: socket.socket, headers: dict[str, str],
+                               head_raw: bytes) -> None:
+    """POST /api/host-hotfix-rollback：按 .hotfix-backup/<ver>/MANIFEST.json 复原。
+
+    请求体：{"version": "2.6.21"}
+    响应：  {"ok": true, "restored": ["proxy/app.py"], "restarted": ["host"]}
+
+    约束与 host-hotfix 同级：管理员、只认白名单路径、只读备份目录里的文件。
+    """
+    handed_off = False
+    try:
+        req, err = _parse_hotfix_request(client, headers, head_raw)
+        if err is not None:
+            client.sendall(err)
+            return
+        ver = str(req.get("version") or "").strip()
+        if not re.fullmatch(r"[0-9A-Za-z._-]+", ver):
+            client.sendall(_json_response(400, {"ok": False, "error": "version 不合法"}))
+            return
+        bdir = HOTFIX_BACKUP_ROOT / ver
+        mpath = bdir / "MANIFEST.json"
+        try:
+            manifest = json.loads(mpath.read_text(encoding="utf-8"))
+        except OSError:
+            client.sendall(_json_response(404, {"ok": False, "error": f"没有 v{ver} 的备份"}))
+            return
+        except Exception:  # noqa: BLE001
+            client.sendall(_json_response(500, {"ok": False, "error": "MANIFEST 解析失败"}))
+            return
+
+        rels = manifest.get("backed_up") or []
+        restored: list[str] = []
+        for rel in rels:
+            rel = str(rel)
+            if ".." in Path(rel).parts:
+                continue
+            src = bdir.joinpath(*Path(rel).parts)
+            dst = HOST_REPO_ROOT.joinpath(*Path(rel).parts)
+            root = HOST_REPO_ROOT.resolve()
+            try:
+                if root not in dst.resolve().parents and dst.resolve() != root:
+                    continue
+                if not src.is_file():
+                    continue
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(src), str(dst))
+                restored.append(rel)
+            except OSError as exc:
+                client.sendall(_json_response(500, {"ok": False, "error": f"复原失败 {rel}: {exc}"}))
+                return
+        restart_list = [s for s in (manifest.get("restart") or [])
+                        if str(s) in HOTFIX_RESTART_TARGETS]
+        payload = _json_response(200, {
+            "ok": True, "version": ver, "restored": restored,
+            "restarted": restart_list})
+        # 同 host-hotfix：含重启时先回包再重启（本进程可能正是被重启的对象）
+        if restart_list:
+            handed_off = True
+            threading.Thread(
+                target=_restart_after_response,
+                args=(client, restart_list, payload),
+                daemon=True,
+            ).start()
+            return
+        client.sendall(payload)
+    except OSError:
+        pass
+    finally:
+        if not handed_off:
+            try:
+                client.close()
+            except OSError:
+                pass
+
+
+# ── host-auto-update：一键在线热更新（网关自己拉包 + 校验 + 应用） ──────────────
+#
+# 用户侧零下载：前端只发 {"target":"2.7.3"}，网关查 GitHub/Gitee release 的
+# fnmusic-ext-<ver>-hotfix.tar.gz + 同包 .sha256 → 下载 → 用官方 .sha256 验真 →
+# 解包读 payload → 复用 _run_hotfix 应用。复用 host-hotfix 的全部安全边界
+# （路径白名单 / 版本严格递增 / 写后复查 / 自动备份 / 重启规则）。
+HOST_AUTO_UPDATE_PATHS = ("/app/fnmusic-ext/api/host-auto-update", "/api/host-auto-update")
+
+# 官方发行仓库（硬编码，不信任客户端传入的 URL，杜绝指向任意地址拉代码）
+_AUTO_GH = ("haonanren118", "fnos_music_ext")
+_AUTO_GITEE = ("yygitee118", "fnos_music_ext")
+
+
+class _HotfixFetchError(Exception):
+    pass
+
+
+def _gateway_github_token() -> str:
+    """只读令牌：环境变量 > 令牌文件（与 webui-service 同源，互不重复读取）。"""
+    tok = (os.environ.get("GITHUB_TOKEN") or "").strip()
+    if tok:
+        return tok
+    for raw in ("/data/config/github_token.txt",
+                str(HOST_REPO_ROOT / "sources-data" / "config" / "github_token.txt")):
+        try:
+            tok = Path(raw).read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if tok:
+            return tok
+    return ""
+
+
+def _http_get_json(url: str, token: str = "") -> "dict | None":
+    headers = {"User-Agent": "fnmusic-ext", "Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            obj = json.loads(r.read().decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001 —— 404 / 限流 / 空响应一律视为"不可用"
+        print(f"[hotfix] GET {url} failed: {exc}", file=sys.stderr)
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _http_download(url: str, token: str = "") -> bytes:
+    headers = {"User-Agent": "fnmusic-ext"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.read()
+
+
+def _find_hotfix_assets(release: dict, target: str) -> "tuple[str | None, str | None]":
+    """从一条 release 里挑出 hotfix 包与其 sha256 的资产下载地址。"""
+    tar_url = sha_url = None
+    need_tar = f"fnmusic-ext-{target}-hotfix.tar.gz"
+    need_sha = need_tar + ".sha256"
+    for a in (release.get("assets") or []):
+        if not isinstance(a, dict):
+            continue
+        n = str(a.get("name") or "")
+        u = str(a.get("browser_download_url") or a.get("url") or "")
+        if n == need_tar:
+            tar_url = u
+        elif n == need_sha:
+            sha_url = u
+    return tar_url, sha_url
+
+
+def _fetch_hotfix_package(target: str) -> dict:
+    """拉取并校验目标版本的热更新包，返回 {"files": {rel: bytes}, "restart": [...]}。
+
+    任一源找不到包 / 校验失败都抛 _HotfixFetchError；调用方转成 502。
+    """
+    token = _gateway_github_token()
+    tar_url = sha_url = None
+    # 1) GitHub（带 Bearer 提额）；2) 失败回退 Gitee 镜像
+    try:
+        rel = _http_get_json(
+            f"https://api.github.com/repos/{_AUTO_GH[0]}/{_AUTO_GH[1]}/releases/tags/v{target}",
+            token)
+        if rel:
+            tar_url, sha_url = _find_hotfix_assets(rel, target)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[hotfix] github lookup v{target} failed: {exc}", file=sys.stderr)
+    if not tar_url:
+        try:
+            rel = _http_get_json(
+                f"https://gitee.com/api/v5/repos/{_AUTO_GITEE[0]}/{_AUTO_GITEE[1]}/releases/tags/v{target}")
+            if rel:
+                tar_url, sha_url = _find_hotfix_assets(rel, target)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[hotfix] gitee lookup v{target} failed: {exc}", file=sys.stderr)
+    if not tar_url:
+        raise _HotfixFetchError(f"GitHub / Gitee 均未找到 v{target} 的热更新包")
+
+    raw = _http_download(tar_url, token)
+    if sha_url:
+        expected = _http_download(sha_url, token).decode("utf-8").split()[0].strip().lower()
+        if _sha256_of(raw) != expected:
+            raise _HotfixFetchError("热更新包 sha256 与官方 .sha256 不符")
+
+    files: "dict[str, bytes]" = {}
+    restart: list = []
+    try:
+        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tf:
+            manifest = None
+            for m in tf.getmembers():
+                if not m.isfile():
+                    continue
+                data = tf.extractfile(m).read()
+                if m.name == "MANIFEST.json":
+                    manifest = json.loads(data.decode("utf-8"))
+                    continue
+                if m.name.startswith("payload/"):
+                    rel = m.name[len("payload/"):]
+                    if rel:
+                        files[rel] = data
+            if manifest:
+                restart = manifest.get("restart") or []
+    except tarfile.TarError as exc:
+        raise _HotfixFetchError(f"解包失败：{exc}")
+    if not files:
+        raise _HotfixFetchError("包内没有 payload 文件")
+    return {"files": files, "restart": restart}
+
+
+def handle_host_auto_update(client: socket.socket, headers: dict[str, str],
+                            head_raw: bytes) -> None:
+    """POST /api/host-auto-update：一键在线热更新。
+
+    请求体：{"target": "2.7.3"}
+    成功复用 _run_hotfix 的响应体（applied/backup/restarted/...）。
+
+    安全：target 必须严格大于当前基线；包只从官方仓库 release 拉取，且用官方
+    .sha256 验真后才解包；之后与手动 hotfix 走完全相同的应用与备份路径。
+    """
+    handed_off = False
+    try:
+        req, err = _parse_hotfix_request(client, headers, head_raw)
+        if err is not None:
+            client.sendall(err)
+            return
+        target = str((req or {}).get("target") or "").strip().lstrip("vV")
+        if not target or not re.search(r"\d", target):
+            client.sendall(_json_response(400, {"ok": False, "error": "target 必须是有效版本号"}))
+            return
+        base = _current_hotfix_base()
+        if base and _ver_tuple(target) <= _ver_tuple(base):
+            client.sendall(_json_response(409, {
+                "ok": False, "current": base,
+                "error": f"目标版本 v{target} 必须大于当前 v{base}"}))
+            return
+        try:
+            pkg = _fetch_hotfix_package(target)
+        except _HotfixFetchError as e:
+            client.sendall(_json_response(502, {"ok": False, "error": f"拉取热更新包失败：{e}"}))
+            return
+        except Exception as e:  # noqa: BLE001
+            client.sendall(_json_response(502, {"ok": False, "error": f"拉取热更新包异常：{e}"}))
+            return
+
+        files = [{"path": f"/repo/{rel}",
+                  "sha256": _sha256_of(raw),
+                  "content_b64": base64.b64encode(raw).decode("ascii")}
+                 for rel, raw in pkg["files"].items()]
+        req2 = {"version": target, "files": files, "restart": pkg.get("restart") or []}
+        handed_off = _run_hotfix(client, req2)
+    except OSError:
+        pass
+    finally:
+        if not handed_off:
+            try:
+                client.close()
+            except OSError:
+                pass
+
+
+def _is_host_hotfix_request(head_raw: bytes) -> bool:
+    return _is_post_to(head_raw, HOST_HOTFIX_PATHS)
+
+
+def _is_host_hotfix_rollback_request(head_raw: bytes) -> bool:
+    return _is_post_to(head_raw, HOST_HOTFIX_ROLLBACK_PATHS)
+
+
+def _is_host_auto_update_request(head_raw: bytes) -> bool:
+    return _is_post_to(head_raw, HOST_AUTO_UPDATE_PATHS)
+
+
 def _handle(client: socket.socket, upstream: tuple[str, int]) -> None:
     head = _read_request_head(client)
     if head is None:
@@ -500,6 +1163,15 @@ def _handle(client: socket.socket, upstream: tuple[str, int]) -> None:
         return
     if _is_host_publish_request(head_raw):
         handle_host_publish(client, headers, head_raw)
+        return
+    if _is_host_hotfix_request(head_raw):
+        handle_host_hotfix(client, headers, head_raw)
+        return
+    if _is_host_hotfix_rollback_request(head_raw):
+        handle_host_hotfix_rollback(client, headers, head_raw)
+        return
+    if _is_host_auto_update_request(head_raw):
+        handle_host_auto_update(client, headers, head_raw)
         return
     try:
         remote = socket.create_connection(upstream, timeout=CONNECT_TIMEOUT)

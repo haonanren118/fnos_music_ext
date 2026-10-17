@@ -183,6 +183,24 @@ input[type="radio"] { accent-color: var(--accent); margin-top: 4px; }
 .dot.err { background: var(--err); }
 .dot.warn { background: var(--warn); }
 
+/* -------------------------------------------------- 公共歌单（#55） */
+.public-list {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 8px; max-height: 390px; overflow-y: auto; padding: 2px;
+}
+.public-item, .public-selected {
+  display: flex; align-items: center; gap: 8px; min-width: 0;
+  border: 1px solid var(--line); border-radius: 8px; padding: 8px;
+  background: var(--card); font-size: 14px;
+}
+.public-item { cursor: pointer; }
+.public-item img { width: 42px; height: 42px; border-radius: 6px; object-fit: cover; flex: none; background: var(--accent-soft); }
+.public-selected img { width: 46px; height: 46px; border-radius: 6px; object-fit: cover; flex: none; background: var(--accent-soft); }
+.public-item small, .public-selected span { display: block; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.public-selected { justify-content: space-between; }
+.public-selected .btn-row { margin: 0; flex: none; }
+.public-selected .btn { padding: 3px 8px; font-size: 12px; }
+
 /* 状态行。v2.6.18 修横向溢出：原本只有 flex + gap，没有任何断行保护。
    文案由服务端 notices 下发（如「主版本源本次不可用…可能滞后于最新发行版」，
    45 字 ≈ 594px）。.dot 是 flex:none，后面的文本是匿名 flex item，
@@ -317,4 +335,44 @@ code {
 .nav-dot {
   display: inline-block; width: 6px; height: 6px; border-radius: 50%;
   background: var(--warn); margin-left: 4px; vertical-align: middle; flex: none;
+}
+
+/* ---- 热更新面板（2026-10-17）---- */
+/* 在线更新行：版本下拉只有版本号这么短的文本，不需要拉满整行 —— 半行足够，
+   按钮紧随其后，右侧留白，视觉上更像一条「选择 → 执行」的操作行。 */
+.hotfix-online { gap: 10px; }
+.hotfix-online .hotfix-label {
+  flex: none; color: var(--muted); font-size: 14px; white-space: nowrap;
+}
+.hotfix-online .hotfix-ver {
+  flex: 0 1 360px; width: auto; max-width: 50%; min-width: 11rem;
+  text-overflow: ellipsis;
+}
+.hotfix-online .hotfix-go { flex: none; min-width: 76px; }
+@media (max-width: 720px) {
+  .hotfix-online .hotfix-ver { flex: 1 1 auto; max-width: none; }
+}
+
+/* 手动安装折叠区：整行可点，展开后与上方内容留出呼吸感 */
+#hotfix-manual > summary { cursor: pointer; user-select: none; }
+#hotfix-manual > summary:hover { color: var(--text); }
+#hotfix-manual[open] > summary { margin-bottom: 4px; }
+#hotfix-manual .btn-row:last-child { margin-bottom: 0; }
+/* 禁用态更像「不可操作」而不是「淡一点的按钮」：主按钮退成中性灰，输入框变浅底 */
+.btn.primary:disabled {
+  background: #e8ecf1; border-color: #dde3ea; color: var(--muted); opacity: 1;
+}
+.input:disabled {
+  background: #f7f8fa; color: var(--muted); cursor: not-allowed;
+}
+
+/* VIP 徽标（2026-10-17）：网易云会员账号在「当前登录」后追加的小标识 */
+.vip-badge {
+  display: inline-flex; align-items: center; gap: 2px;
+  margin-left: 6px; padding: 1px 6px;
+  border-radius: 999px;
+  background: linear-gradient(135deg, #ff7a59, #e8362a);
+  color: #fff; font-size: 11px; font-weight: 700; line-height: 16px;
+  letter-spacing: .3px; vertical-align: 1px;
+  box-shadow: 0 1px 2px rgba(232, 54, 42, .25);
 }
