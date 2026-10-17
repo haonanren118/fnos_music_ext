@@ -1,0 +1,6 @@
+# lxserver 版本锁定与完整性校验文件
+# 由 scripts/update_lxserver.sh 维护；Dockerfile 构建时自动校验
+# 公共歌单（#55）发现层：lx-music-sync-server，仅用于歌单/榜单发现，不参与播放
+LXSERVER_TAG=v2.1.3
+LXSERVER_ZIP_NAME=lx-music-sync-server-v2.1.3-server.zip
+LXSERVER_SHA256=f6dea5d63f26e9c7c1238df8847ca5fb39380d358942b231d05991d9836307ef
