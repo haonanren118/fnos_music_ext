@@ -91,7 +91,8 @@ RUN useradd -m -u 1000 appuser \
 # --chown+chmod：镜像权限不依赖构建上下文的 umask/属主
 COPY --chown=appuser:appuser musicdl-service/app.py musicdl-service/hardening.py /srv/musicdl-service/
 COPY --chown=appuser:appuser musicbox-service/app.py musicbox-service/runner.py musicbox-service/netease_ext.py /srv/musicbox-service/
-COPY --chown=appuser:appuser lxmusic-service/app.py lxmusic-service/source_runtime.py lxmusic-service/verify_source.py /srv/lxmusic-service/
+# lxserver_client.py 是 #55 公共歌单发现层的客户端，app.py 顶层 import，必须随镜像分发
+COPY --chown=appuser:appuser lxmusic-service/app.py lxmusic-service/source_runtime.py lxmusic-service/verify_source.py lxmusic-service/lxserver_client.py /srv/lxmusic-service/
 COPY --chown=appuser:appuser lxmusic-service/js/bridge.js /srv/lxmusic-service/js/bridge.js
 COPY --chown=appuser:appuser webui-service/app.py /srv/webui-service/
 # upgrade.py 必须随镜像分发：app.py 第 36 行 `import upgrade`，
