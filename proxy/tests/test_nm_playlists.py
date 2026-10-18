@@ -217,7 +217,9 @@ def test_detail_batch_and_track_list_flow():
 def test_cover_redirect(monkeypatch):
     _wire(_musicbox_handler(rows=PLAYLIST_ROWS, tracks=TRACK_ROWS))
     # 封面直链改同源回源（200 字节），不再 302 跳外部图床
-    fake_jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF-nm-cover"
+    # 真实封面体量（> _COVER_MIN_REAL_BYTES = 12KB）：过小的字节会被判成
+    # 「平台默认图」而 404 / 回落占位图。
+    fake_jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF-nm-cover" + b"\x00" * (13 * 1024)
     monkeypatch.setattr(
         "proxy.app._COVER_CDN_TRANSPORT",
         httpx.MockTransport(lambda r: httpx.Response(200, content=fake_jpeg, headers={"content-type": "image/jpeg"})),

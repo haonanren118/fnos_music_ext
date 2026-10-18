@@ -16,3 +16,35 @@ def _no_real_ffmpeg(monkeypatch):
     monkeypatch.setattr(tc, "_SESSIONS", {})
     monkeypatch.setattr(tc, "_ACTIVE", 0)
     monkeypatch.setattr(tc, "_SLOT_COND", None)
+
+
+def wait_search_complete(client, path: str, params: dict, min_items: int = 0,
+                         headers: dict | None = None, tries: int = 40,
+                         interval: float = 0.15) -> dict:
+    """轮询搜索接口直到各源聚合完成，返回响应 JSON。
+
+    `/search/track` 的设计是「有在线条目就立刻回复」（本地在前、在线在后），
+    首个响应常常只带**最先返回的那个源** —— 各源都是 MockTransport 时谁先返回取决于
+    调度，直接断言首个响应会随机缺源（表现为「明明取到了却在合并结果里消失」的假失败）。
+
+    这里等「条数连续两次不再变化」再返回；配合用例里 `prefetch_enabled=False`
+    （预热探活会把探不通的条目标记不可播并在后续请求剔除，那会干扰排序断言）。
+    """
+    import time as _time
+
+    last_body: dict = {}
+    prev_count = -1
+    stable = 0
+    for _ in range(tries):
+        resp = client.get(path, params=params, headers=headers or {})
+        last_body = resp.json()
+        count = len(((last_body.get("data") or {}).get("list")) or [])
+        if count >= min_items and count == prev_count:
+            stable += 1
+            if stable >= 2:
+                return last_body
+        else:
+            stable = 0
+        prev_count = count
+        _time.sleep(interval)
+    return last_body

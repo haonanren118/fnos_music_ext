@@ -781,8 +781,12 @@ def test_search_track_pagination_and_cache_ttl(monkeypatch):
         list1 = data1["list"]
         assert len(list1) == 16
         assert list1[0]["guid"] == "local:101"
-        assert list1[1]["guid"] == fake_official_guid("online:netease:mb_1")
-        assert list1[15]["guid"] == fake_official_guid("online:kuwo:kw_3")
+        # 在线段内按源轮转（_spread_sources），不锁定下标顺序；只校验集合齐全
+        online_guids = {it["guid"] for it in list1[1:]}
+        expected_online = {
+            fake_official_guid("online:netease:mb_%d" % i) for i in range(1, 13)
+        } | {fake_official_guid("online:kuwo:kw_%d" % i) for i in range(1, 4)}
+        assert online_guids == expected_online
 
         # page=2 请求（在线条目已在 page=1 装满，page=2 在线切片为空）
         resp2 = client.get("/music/api/v1/search/track?q=周杰伦&page=2&size=50")

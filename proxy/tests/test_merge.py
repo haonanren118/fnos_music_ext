@@ -4,6 +4,8 @@ import pytest
 import httpx
 from fastapi.testclient import TestClient
 
+from conftest import wait_search_complete
+
 from proxy.app import (
     fake_official_guid,
     app,
@@ -1096,6 +1098,9 @@ def test_search_track_within_budget_keeps_order(monkeypatch):
     monkeypatch.setitem(CONF, "netease_wait_s", 1.0)
     monkeypatch.setitem(CONF, "lx_enabled", True)
     monkeypatch.setitem(CONF, "musicdl_enabled", True)
+    # 关掉预热：预热会对条发起真实取流探活，探不通就把它们标记为不可播并在后续
+    # 请求里剔除 —— 本用例的 mock 源本就放不出流，那会污染「排序与去重」的断言。
+    monkeypatch.setitem(CONF, "prefetch_enabled", False)
     monkeypatch.setitem(CONF, "netease_enabled", True)
 
     def upstream_handler(request: httpx.Request) -> httpx.Response:
@@ -1197,22 +1202,38 @@ def test_search_track_within_budget_keeps_order(monkeypatch):
     )
 
     with TestClient(app) as client:
-        resp = client.get("/music/api/v1/search/track?q=晴天&page=1&size=20")
-        assert resp.status_code == 200
-        items = resp.json()["data"]["list"]
-        # 1. 本地
+        # 搜索是「有在线条目就立刻回复」：首个响应可能只带最先返回的那个源。
+        # 等各源聚合完成再断言（详见 conftest.wait_search_complete）。
+        items = wait_search_complete(
+            client, "/music/api/v1/search/track",
+            {"q": "晴天", "page": 1, "size": 20}, min_items=5)["data"]["list"]
+        # 1. 本地永远第一
         assert items[0]["guid"] == "local:101"
         assert items[0]["artist"] == "周杰伦"
-        # 2. 网易云
-        assert items[1]["guid"] == fake_official_guid("online:netease:mb_unique")
-        assert items[1]["artist"] == "网易翻唱歌手"
-        # Unknown musicbox duration cannot prove this is the same recording.
-        assert items[2]["guid"] == fake_official_guid("online:kuwo:mdl_same")
-        assert items[3]["guid"] == fake_official_guid("online:kuwo:mdl_unique")
-        assert items[3]["artist"] == "Musicdl翻唱歌手"
-        assert items[4]["guid"] == fake_official_guid("online:lx:kg:lx_unique")
-        assert items[4]["artist"] == "洛雪翻唱歌手"
+        # 2. 三源的在线条目都在（同歌不同源保留为可切源候选，不去重掉）
+        online = items[1:]
+        got = {str(it.get("guid")) for it in online}
+        want = {
+            fake_official_guid("online:netease:mb_unique"),
+            fake_official_guid("online:kuwo:mdl_same"),
+            fake_official_guid("online:kuwo:mdl_unique"),
+            fake_official_guid("online:lx:kg:lx_unique"),
+        }
+        assert got == want, f"在线条目集合不符：缺 {want - got}，多 {got - want}"
         assert len(items) == 5
+        # 3. 与本地同名的网易云条目（mb_same，晴天/周杰伦）被本地去重掉
+        assert fake_official_guid("online:netease:mb_same") not in got
+        # 4. 同 rank 内按源轮转（2026-10-11 起 _spread_sources，避免单源霸榜），
+        #    因此不锁定具体交错顺序，只断言相邻不同源。
+        def _src(guid_hex: str) -> str:
+            for real in ("online:netease:mb_unique", "online:kuwo:mdl_same",
+                         "online:kuwo:mdl_unique", "online:lx:kg:lx_unique"):
+                if fake_official_guid(real) == guid_hex:
+                    return real.split(":")[1]
+            return "?"
+        seq = [_src(str(it.get("guid"))) for it in online]
+        for a, b in zip(seq, seq[1:]):
+            assert a != b, f"相邻条目同源（未轮转）：{seq}"
 
 
 
@@ -1971,7 +1992,10 @@ def test_static_cover_online_coverid_proxied(monkeypatch):
     """coverId 为在线 guid 且 /info 给出封面直链 → 服务端同源回源图床字节（200），
     不再 302 跳外部图床（远程 HTTPS 下混合内容/防盗链会拦掉直链）。"""
     cover_target = "http://img.music.migu.cn/cover123.jpg"
-    fake_jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF-fake-migu-cover"
+    # 真实封面体量（> _COVER_MIN_REAL_BYTES = 12KB）：小于阈值的字节会被判成
+    # 「平台默认图」而换成占位图 —— 这正是 2026-10-10 之后的行为，夹具需与之一致。
+    fake_jpeg = (b"\xff\xd8\xff\xe0\x00\x10JFIF-fake-migu-cover"
+                 + b"\x00" * (13 * 1024))
 
     def upstream_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(400, text="Should not reach upstream")
