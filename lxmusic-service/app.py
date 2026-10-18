@@ -2232,6 +2232,23 @@ async def public_playlist_tracks(
         return await _public_playlist_tracks(playlist_id, source, kind)
 
 
+def _chart_songinfo(row: dict, src: str) -> dict:
+    """榜单行补齐取流所需的 songInfo 字段（★ 2026-10-18）。
+
+    榜单行来自 lxserver 排行榜，字段比搜索结果少：酷我（kw）缺 `rid` 时，
+    `/api/v1/track/url` 恒返回 `no playable url` —— 而同样的歌一旦经搜索进过缓存
+    （带 rid）就能取到直链。酷我的 rid 就是数字 music id，即行里的 `songmid`（或 id 末段）。
+    """
+    item = dict(row)
+    if src == "kw" and not str(item.get("rid") or "").strip():
+        rid = str(item.get("songmid") or "").strip()
+        if not rid:
+            rid = str(item.get("id") or "").rsplit(":", 1)[-1]
+        if rid:
+            item["rid"] = rid
+    return item
+
+
 async def _public_playlist_tracks(playlist_id: str, source: str, kind: str):
     src = _public_source(source)
     raw_id = urllib.parse.unquote(playlist_id)
@@ -2247,7 +2264,7 @@ async def _public_playlist_tracks(playlist_id: str, source: str, kind: str):
                 identifier = str(row.get("id") or "")
                 if identifier and identifier not in seen_ids:
                     seen_ids.add(identifier)
-                    fresh.append(row)
+                    fresh.append(_chart_songinfo(row, src))
             for row in fresh:
                 items.append(row)
             # 部分平台忽略 page 并重复返回整榜，此时重复页就是结束条件。
@@ -2404,6 +2421,16 @@ async def track_lyric(id: str = Query("", alias="id"), guid: str = Query("", ali
             text = await kw_resolve_lyric(client, cached or {})
     except Exception as e:  # noqa: BLE001
         logger.warning("lx lyric %s failed: %s", track_id, e)
+    if not text:
+        # ★ 2026-10-18：公共歌单/榜单注入的曲目没进过搜索 → 本地 songInfo 缓存为空，
+        # 上面各平台解析器全部落空。lxserver 直接回源取歌词（免登录），
+        # 否则这类曲目的歌词恒为空（实测 kw 榜单 300 首 lyric 全 0）。
+        text = await LXSERVER.fetch_lyric(src, identifier)
+        if text:
+            try:
+                _cache_put({"id": f"lx:{src}:{identifier}", **(cached or {}), "lyric": text})
+            except Exception as e:  # noqa: BLE001
+                logger.warning("lx lyric cache write failed for %s: %s", track_id, e)
     return {"ok": True, "data": {"id": track_id, "lyric": text or ""}}
 
 

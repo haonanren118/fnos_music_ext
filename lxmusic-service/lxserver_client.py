@@ -578,6 +578,40 @@ class LxServerClient:
             raise RuntimeError("lxserver song list search returned invalid payload")
         return data
 
+    async def fetch_lyric(self, source: str, song_id: str) -> str:
+        """按平台+曲目 id 取歌词（lxserver `/api/music/lyric`，免登录可用）。
+
+        为什么需要它：lxmusic 自己的 `*_resolve_lyric` 依赖本地 songInfo 缓存，
+        而该缓存**只由搜索填充**。公共歌单/榜单注入的曲目从未经过搜索，
+        于是各平台解析器全部拿不到歌词（实测 kw 榜单曲目 lyric 恒为空）。
+        lxserver 直接回源，不依赖缓存，是这条路上唯一可靠的数据来源。
+        """
+        src = normalize_source(source)
+        raw_id = str(song_id or "").strip()
+        if not src or not raw_id:
+            return ""
+        # lxserver 会去掉 `<source>_` 前缀，这里直接传裸 id 更稳
+        if raw_id.startswith(f"{src}_"):
+            raw_id = raw_id[len(src) + 1:]
+        try:
+            client = await self.get_client()
+            resp = await client.get(
+                "/api/music/lyric",
+                params={"source": src, "id": raw_id},
+                timeout=self.timeout,
+            )
+        except Exception:
+            return ""
+        if resp.status_code != 200:
+            return ""
+        try:
+            data = resp.json()
+        except Exception:
+            return ""
+        if not isinstance(data, dict):
+            return ""
+        return str(data.get("lyric") or "").strip()
+
     async def get_leaderboard_meta(self, source: str, board_id: str) -> dict:
         """单条榜单的 {total, cover_url}（只取第 1 页）。
 

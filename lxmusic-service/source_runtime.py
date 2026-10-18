@@ -270,6 +270,12 @@ def build_music_info(item: dict, platform: str) -> dict:
         info[platform_key[0]] = str(platform_key[1])
     if platform == "kg" and item.get("hash"):
         info["songmid"] = str(item["hash"])  # 部分脚本读 songmid
+    # ★ 2026-10-18：咪咕的 songmid 是**数字 songmid**（如 1142695325），copyrightId 是另一个
+    # 值（如 6005754MDZN）。洛雪约定与主流脚本（含杰翔源：songId = hash ?? songmid ?? id）
+    # 都读 songmid —— 之前我们把 copyrightId 填进 songmid，导致所有后端都「无法解析到
+    # 有效歌曲」而全线失败。实测：同一首歌传 1142695325 立刻出直链，传 6005754MDZN 必失败。
+    if platform == "mg" and item.get("songmid"):
+        info["songmid"] = str(item["songmid"])
     # 社区源（六音酷狗、全豆要 QQ）按官方 musicInfo 读这些别名。
     # QQ 的 songmid 与 file.media_mid 经常不是同一个值，不能互相顶替。
     info["id"] = info.get("songmid") or identifier

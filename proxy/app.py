@@ -6308,8 +6308,8 @@ async def _online_info(request: Request, guid: str, include_lyric: bool = True, 
         if not str((retained or {}).get("title") or "").strip():
             hist = _history_meta(guid)
             if hist:
-                return hist
-        return retained
+                return _merge_public_track_meta(guid, hist)
+        return _merge_public_track_meta(guid, retained)
     try:
         data = await asyncio.wait_for(_fetch_online_info(request, guid, include_lyric=include_lyric), timeout=timeout_s)
         if data:
@@ -6320,11 +6320,11 @@ async def _online_info(request: Request, guid: str, include_lyric: bool = True, 
                 hist = _history_meta(guid)
                 if hist:
                     data = {**data, **{k: v for k, v in hist.items() if v}}
-            return data
+            return _merge_public_track_meta(guid, data)
         if await _recover_source(request, guid, entry):
             data = await asyncio.wait_for(_fetch_online_info(request, guid, include_lyric=include_lyric), timeout=max(3.0, timeout_s * 0.75))
             if data:
-                return data
+                return _merge_public_track_meta(guid, data)
     except Exception:
         pass
     # ★ 2026-10-09：搜索会话（_SEARCH_CACHE）没有、上游也拿不到时，回落到
@@ -6332,8 +6332,25 @@ async def _online_info(request: Request, guid: str, include_lyric: bool = True, 
     if not str((retained or {}).get("title") or "").strip():
         hist = _history_meta(guid)
         if hist:
-            return hist
-    return retained
+            return _merge_public_track_meta(guid, hist)
+    return _merge_public_track_meta(guid, retained)
+
+
+def _merge_public_track_meta(guid: str, data: "dict | None") -> "dict | None":
+    """用公共歌单注入时登记的元数据补齐空字段（★ 2026-10-18）。
+
+    洛雪榜单/歌单曲目不进音源服务的 songInfo 缓存，`_online_info` 拿不到歌名与时长，
+    客户端 audio-info 因此为空（判为不可播），歌词也随之缺失。注入时这些字段本来就是
+    全的（平台榜单接口直接给了歌名/歌手/专辑/封面/时长），这里只补空、不覆盖已有值。
+    """
+    meta = pubpl.track_meta(guid)
+    if not meta:
+        return data
+    merged = dict(data or {})
+    for field, value in meta.items():
+        if merged.get(field) in (None, "", 0):
+            merged[field] = value
+    return merged or data
 
 
 async def _fetch_online_info(request: Request, guid: str, include_lyric: bool = True) -> dict | None:
@@ -9421,6 +9438,65 @@ async def playlist_batch_detail(request: Request):
     return JSONResponse(content={"code": 0, "msg": "ok", "data": {"list": recs + official_list}})
 
 
+# ==== 洛雪公共歌单「可播预筛」（2026-10-18）====
+# 背景：洛雪榜单里混着大量音源脚本解析不出直链的曲目（实测酷我的 VIP 曲、咪咕的
+# 部分曲目 → music_url 抛错或返回空）。这些条目一旦摆进歌单，用户点开全是不能播的。
+# 已有 `_mark_unplayable`（点播失败即剔除），但要用户先点一次才知道。
+# 这里在曲目载入后**后台**探一次（不阻塞首屏），结果按歌单缓存 10 分钟：
+#   - 有结果 → 组装列表时只给可播条目，total 也随之收敛；
+#   - 没结果（首开、进行中）→ 原样返回，用户无感等待一轮。
+_LX_SCREEN_CACHE: dict[str, tuple[set, float]] = {}
+_LX_SCREEN_TTL_S = 600.0
+_LX_SCREEN_MAX = 200
+_LX_SCREEN_CONCURRENCY = 10
+_LX_SCREEN_RUNNING: set = set()
+_LX_SCREEN_PENDING: set = set()
+
+
+def _lx_screen_filter(playlist_guid: str, tracks: list) -> "tuple[list, int | None]":
+    """按最近一次预筛结果过滤曲目；没有结果则原样返回。"""
+    hit = _LX_SCREEN_CACHE.get(playlist_guid)
+    if not hit or time.monotonic() >= hit[1]:
+        return tracks, None
+    keep = hit[0]
+    return [t for t in tracks if str(t.get("guid") or "") in keep], len(keep)
+
+
+async def _lx_screen_run(request: Request, playlist_guid: str, tracks: list) -> None:
+    """后台预筛：并发问音源脚本「这首批曲子能不能拿到直链」，只记结果。"""
+    if playlist_guid in _LX_SCREEN_RUNNING:
+        return
+    candidates = [t for t in tracks[:_LX_SCREEN_MAX]
+                  if is_online_guid(str(t.get("guid") or "")) and source_from_online_guid(t["guid"]) == "lx"]
+    if not candidates:
+        return
+    _LX_SCREEN_RUNNING.add(playlist_guid)
+    sem = asyncio.Semaphore(_LX_SCREEN_CONCURRENCY)
+    client = get_lx_client(request.app)
+
+    async def one(track: dict) -> bool:
+        async with sem:
+            try:
+                resolved = await resolve_lx_url(client, song_id_from_online_guid(track["guid"]))
+            except Exception:
+                return False
+        return bool(resolved and resolved.get("url"))
+
+    try:
+        results = await asyncio.gather(*[one(t) for t in candidates], return_exceptions=True)
+        playable = set()
+        for track, ok in zip(candidates, results):
+            if ok is True:
+                playable.add(str(track.get("guid") or ""))
+            elif ok is False:
+                _mark_unplayable(str(track.get("guid") or ""), "preflight unplayable")
+        if playable:
+            _LX_SCREEN_CACHE[playlist_guid] = (playable, time.monotonic() + _LX_SCREEN_TTL_S)
+        logger.info("lx preflight %s: %d/%d playable", playlist_guid, len(playable), len(candidates))
+    finally:
+        _LX_SCREEN_RUNNING.discard(playlist_guid)
+
+
 @app.get("/music/api/v1/track/playlist-detail/list")
 async def playlist_track_list(request: Request):
     guid = str(
@@ -9443,6 +9519,23 @@ async def playlist_track_list(request: Request):
         except Exception as e:
             logger.warning("public playlist track list failed (%s): %s", guid, e)
             return JSONResponse(content={"code": -1, "msg": "public playlist load failed", "data": None})
+        if public_entry.get("provider") != "musicbox":
+            entry_guid = pubpl.playlist_guid(public_entry)
+            tracks, _known_total = _lx_screen_filter(entry_guid, tracks)
+            # 本歌单还没有有效预筛结果（首开或已过期）：原样返回，同时后台跑一轮，
+            # 下一次打开即为可播子集。首屏不做阻塞等待。
+            hit = _LX_SCREEN_CACHE.get(entry_guid)
+            if (not hit or hit[1] <= time.monotonic()) and entry_guid not in _LX_SCREEN_RUNNING:
+                task = asyncio.create_task(_lx_screen_run(request, entry_guid, tracks))
+                task.add_done_callback(lambda t: t.exception())
+                _LX_SCREEN_PENDING.add(task)
+            # 已被点播/预筛判定「播不了」的条目不再摆给用户（TTL 到期自动放回）。
+            # 覆盖预筛全灭的平台（如咪咕：歌词与直链上游都取不到）——那种情况
+            # 没有可缓存的可播子集，靠这张黑名单把整份歌单收敛掉。
+            _prune_unplayable()
+            if _PREFETCH_BAD:
+                tracks = [t for t in tracks
+                          if str(t.get("guid") or "") not in _PREFETCH_BAD]
         try:
             page = max(int(request.query_params.get("page") or 1), 1)
         except (TypeError, ValueError):

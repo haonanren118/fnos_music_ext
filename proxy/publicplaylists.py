@@ -40,6 +40,41 @@ _tracks_tasks: dict[str, asyncio.Task] = {}
 _cover_urls: dict[str, str] = {}
 _prefetch_tasks: set[asyncio.Task] = set()
 
+# 曲目元数据索引（guid -> title/artist/album/cover/duration/…）。
+# 注入公共歌单时这些字段本来就是全的（来自平台榜单/歌单接口），但 _online_info 只查
+# 音源服务自己的 songInfo 缓存：洛雪榜单曲目从未进过那个缓存（只有搜索会填），
+# 于是 audio-info 返回空歌名/时长/专辑 → 客户端判为不可播，歌词也一并为空。
+# 这里把注入时已知的元数据留一份，供 _online_info 兜底回填。
+_TRACK_META_INDEX: dict[str, dict] = {}
+_TRACK_META_INDEX_MAX = 8000
+_TRACK_META_FIELDS = ("title", "artist", "album", "cover_url", "duration_s", "ext", "file_size")
+
+
+def _index_track_meta(tracks: "list[dict]") -> None:
+    """把一批曲目的展示元数据登记进索引（满额时丢最旧的）。"""
+    for track in tracks or []:
+        if not isinstance(track, dict):
+            continue
+        guid = str(track.get("guid") or "")
+        if not guid:
+            continue
+        meta = {}
+        for field in _TRACK_META_FIELDS:
+            value = track.get(field)
+            if value not in (None, "", 0):
+                meta[field] = value
+        if not meta.get("title"):
+            continue
+        _TRACK_META_INDEX[guid] = meta
+        if len(_TRACK_META_INDEX) > _TRACK_META_INDEX_MAX:
+            for old in list(_TRACK_META_INDEX)[:len(_TRACK_META_INDEX) - _TRACK_META_INDEX_MAX]:
+                _TRACK_META_INDEX.pop(old, None)
+
+
+def track_meta(guid: str) -> "dict | None":
+    """按曲目 guid 取公共歌单注入时登记的元数据（供代理 _online_info 兜底）。"""
+    return _TRACK_META_INDEX.get(str(guid or ""))
+
 # 卡片封面字段由 app.py 注入（避免本模块反向依赖 app）：
 # 客户端「歌单」列表里 每日推荐/热门推荐 能显示封面，而公共歌单卡片一直是默认音符图标，
 # 差别就在这两个字段 —— 推荐卡片 coverId 是**纯 32-hex** 且**同时下发 coverUrl**
@@ -393,7 +428,11 @@ def _load_disk_tracks(guid: str) -> "list | None":
     card = data.get("card") if isinstance(data, dict) else None
     if isinstance(card, dict) and card.get("cover_url"):
         _cover_urls.setdefault(guid, str(card["cover_url"]))
-    return [dict(track) for track in tracks] if isinstance(tracks, list) else None
+    if not isinstance(tracks, list):
+        return None
+    # 重启后磁盘缓存里的曲目也要能兜底元数据（见 _TRACK_META_INDEX 注释）
+    _index_track_meta(tracks)
+    return [dict(track) for track in tracks]
 
 
 async def _fetch_tracks(app_state, entry: dict, build_track) -> list:
@@ -418,6 +457,7 @@ async def _fetch_tracks(app_state, entry: dict, build_track) -> list:
         if isinstance(track, dict) and track.get("guid"):
             tracks.append(track)
     _tracks_cache[guid] = (tracks, time.monotonic() + _TRACKS_TTL_S)
+    _index_track_meta(tracks)
     if guid in _tracks_order:
         _tracks_order.remove(guid)
     _tracks_order.append(guid)
