@@ -4,7 +4,7 @@ import pytest
 import httpx
 from fastapi.testclient import TestClient
 
-from conftest import wait_search_complete
+from search_wait import wait_search_complete
 
 from proxy.app import (
     fake_official_guid,
