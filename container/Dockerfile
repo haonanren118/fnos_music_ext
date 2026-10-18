@@ -58,7 +58,8 @@ RUN set -eu; \
         echo "ERROR: 可在 Docker daemon.json 配置 \"dns\": [\"223.5.5.5\"] 并重启 Docker 后重试。" >&2; \
         exit 1; \
     fi; \
-    apt-get install -y --no-install-recommends nodejs ffmpeg supervisor ca-certificates; \
+    # unzip/curl：#55 的 lxserver 段要解包预编译包，并在 vendor 缺失时回退镜像链下载
+apt-get install -y --no-install-recommends nodejs ffmpeg supervisor ca-certificates unzip curl; \
     if [ -n "${APT_MIRROR}" ]; then swap_apt_host "${APT_MIRROR}" 'http://deb.debian.org'; fi; \
     rm -rf /var/lib/apt/lists/*
 
