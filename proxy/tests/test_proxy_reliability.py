@@ -445,8 +445,12 @@ async def test_startup_stall_is_bounded_and_closes_transport(monkeypatch):
     before = time.monotonic()
     response = await p.stream_track(request("guid=online:kuwo:1"))
     assert response.status_code == 404
-    # 单次解析预算 6 秒（与进程内取链+网络抖动余量对齐），stall 必须被掐断
-    assert 5.8 < time.monotonic() - before < 6.6
+    # stall 必须在「启动预算」内被掐断。预算 2026-10-10 从固定 6s 改为可配置
+    # （默认 22s：洛雪 /track/url 是逐档解析+Range 探活的串行流程，6s 会在它试完
+    # 候选音源前掐断 → 症状是「搜索能看到歌、点播 6 秒后跳下一首」），故跟随配置断言。
+    budget = float(p.CONF.get("stream_startup_timeout") or 22.0)
+    elapsed = time.monotonic() - before
+    assert budget - 0.5 < elapsed < budget + 1.0, f"stall 未在启动预算内掐断：{elapsed:.1f}s / 预算 {budget}s"
     assert audio.closed
 
 
