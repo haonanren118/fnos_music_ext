@@ -788,8 +788,14 @@ async function syncNeteaseAccount(retries = 0) {
         // VIP 标识：vip_type>0 即付费会员（10=音乐包，11/110=黑胶VIP）
         const vipLabel = String(d.vip_label || "");
         const isVip = Number(d.vip_type || 0) > 0 || !!vipLabel;
-        $("#qr-check").innerHTML = `当前登录：${escapeHtml(String(who))}`
-          + (isVip ? ` <span class="vip-badge" title="${escapeHtml(vipLabel || "VIP")}">VIP</span>` : "");
+        const label = `当前登录：${who}`;
+        const box = $("#qr-check");
+        // 非 VIP 走 textContent（不引入 innerHTML）；VIP 才拼徽标并转义昵称
+        if (isVip) {
+          box.innerHTML = `${escapeHtml(label)} <span class="vip-badge" title="${escapeHtml(vipLabel || "VIP")}">VIP</span>`;
+        } else {
+          box.textContent = label;
+        }
         break;
       }
     } catch (_) { /* status 不可达视为未登录 */ }

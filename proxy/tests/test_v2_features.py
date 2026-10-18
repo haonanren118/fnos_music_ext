@@ -394,7 +394,7 @@ def test_cover_kw_text_url_resolved_via_rid(monkeypatch):
     """lx 酷我条目返回 artistpicserver 文本封面 → 解析 rid 拿真图直链 → 服务端回源图片字节（200）。"""
     monkeypatch.setitem(CONF, "lx_enabled", True)
     text_cover = "https://artistpicserver.kuwo.cn/pic?corp=kuwo&type=rid_pic&pictype=500&size=500&rid=123"
-    fake_jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF-kw-real"
+    fake_jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF-kw-real" + b"\x00" * (13 * 1024)  # 真实封面体量：<12KB 会被判成平台默认图
 
     def lx_handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/v1/track/info"
@@ -428,7 +428,7 @@ def test_cover_kw_text_url_resolved_via_rid(monkeypatch):
 def test_cover_qq_albummid_gtimg_proxied(monkeypatch):
     monkeypatch.setitem(CONF, "musicdl_enabled", True)
     monkeypatch.setitem(CONF, "online_sources", "QqMusicClient,KuwoMusicClient,MiguMusicClient")
-    fake_jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF-qq-gtimg"
+    fake_jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF-qq-gtimg" + b"\x00" * (13 * 1024)  # 真实封面体量：<12KB 会被判成平台默认图
 
     def musicdl_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={
@@ -476,7 +476,7 @@ def test_cover_enrich_via_netease_search(monkeypatch):
         return httpx.Response(404)
 
     _setup_clients(musicdl=musicdl_handler, musicbox=musicbox_handler)
-    fake_jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF-netease-album"
+    fake_jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF-netease-album" + b"\x00" * (13 * 1024)  # 真实封面体量：<12KB 会被判成平台默认图
 
     def cdn_handler(request: httpx.Request) -> httpx.Response:
         assert str(request.url) == "https://p1.music.126.net/cover.jpg"
@@ -665,7 +665,7 @@ def test_static_cover_playlist_skips_coverless_tracks(tmp_path, monkeypatch):
 
     rec_dir = _cover_env(tmp_path, monkeypatch, musicdl_handler=musicdl_handler)
     # 网易兜底返回空（不打真实外网）；migu 图床回源给确定性字节
-    fake_jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF-migu2"
+    fake_jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF-migu2" + b"\x00" * (13 * 1024)  # 真实封面体量：<12KB 会被判成平台默认图
 
     def cdn_handler(request: httpx.Request) -> httpx.Response:
         if "music.163.com" in str(request.url):
@@ -718,7 +718,7 @@ def test_static_cover_disguised_playlist_cover_survives_restart(tmp_path, monkey
 
     rec_dir = _cover_env(tmp_path, monkeypatch, musicdl_handler=musicdl_handler)
     # 网易兜底返回空（不打真实外网）；migu 图床回源给确定性字节
-    fake_jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF-migu2"
+    fake_jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF-migu2" + b"\x00" * (13 * 1024)  # 真实封面体量：<12KB 会被判成平台默认图
 
     def cdn_handler(request: httpx.Request) -> httpx.Response:
         if "music.163.com" in str(request.url):
