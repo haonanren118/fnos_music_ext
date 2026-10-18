@@ -222,7 +222,11 @@ def test_playlist_list_detail_tracks_and_readonly():
         assert [row["guid"] for row in rows] == [pubpl.playlist_guid(SELECTION[0]), "official"]
         assert rows[0]["name"] == "[网易] 热歌榜"
         assert rows[0]["trackCount"] == 2
-        assert rows[0]["coverId"].startswith("track_")
+        # 卡片封面字段（2026-10-18）：客户端侧边栏按 coverUrl 取图，且 coverId 必须是
+        # 纯 32-hex（track_ 前缀是行内曲目惯例，卡片不认）—— 与每日推荐同形态。
+        cid = rows[0]["coverId"]
+        assert len(cid) == 32 and all(ch in "0123456789abcdef" for ch in cid)
+        assert rows[0]["coverUrl"].endswith("coverId=" + cid)
 
         resp = client.get("/music/api/v1/playlist/detail", params={"guid": pubpl.playlist_guid(SELECTION[0])})
         assert resp.status_code == 200

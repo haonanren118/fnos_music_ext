@@ -209,7 +209,9 @@ def test_playlist_text_floor_count_and_tail():
 
 def test_declared_count_edges():
     assert tc._declared_count(0, 10) == 1
-    assert tc._declared_count(269.9, 10) == 26
+    # ceil：269.9/10 = 26.99 → 27（floor 会让清单短一片，App 提前切下一首，
+    # 2026-10-07 实测：185s 音频切出 19 片，floor 只声明 18 片）
+    assert tc._declared_count(269.9, 10) == 27
     assert tc._declared_count(10, 10) == 1
     assert tc._declared_count(240, 10) == 24
 
