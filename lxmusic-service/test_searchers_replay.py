@@ -27,7 +27,11 @@ FIXTURES = Path(__file__).resolve().parent / "tests" / "fixtures"
 PLATFORMS = ("kg", "wy", "mg", "tx", "kw")
 
 # 探活成功的最小 FLAC 前缀（probe_url 只做前缀魔数校验）
-_FLAC = b"fLaC" + b"\x00" * 8192
+# 探活成功的最小 FLAC 前缀（probe_url 只做前缀魔数校验）。
+# ⚠ 体量必须够真实：`_is_ad_clip` 用「声明时长 vs 实际字节」算平均码率，
+# 低于 32kbps 判为广告/试听片段直接拒收（实测 8KB/200s → 5.3kbps 被拒）。
+# 1.2MB 覆盖到 300s 仍有 ~32kbps 以上。
+_FLAC = b"fLaC" + b"\x00" * (1200 * 1024)
 
 
 def media_handler(body_for_search: dict | str) -> httpx.MockTransport:
