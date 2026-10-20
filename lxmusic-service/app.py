@@ -790,17 +790,90 @@ async def probe_url(
 
 
 # 链路熔断器：连续失败达阈值后暂停该链路一段时间，避免每次搜索白等超时
-_CHAIN_FAIL_THRESHOLD = 3
-_CHAIN_OPEN_SECONDS = 600
+#
+# ★ 2026-10-20 阈值与冷却调整：脚本报「某后端无数据」是**音源侧没匹配到歌**，
+# 不是基础设施故障 —— 之前这类失败也计入熔断，导致上游稍有波动（咪咕星海
+# 后端并发限流 503）就整平台熔断 600 秒（实测 mg 从 25/25 掉到 0/25）。
+# 现在只有**传输层故障**（超时/连接失败/熔断器自身）计入，
+# 脚本级「无数据」不计入；阈值同时放宽到 6 次、冷却缩短到 120s。
+_CHAIN_FAIL_THRESHOLD = 6
+_CHAIN_OPEN_SECONDS = 120
 # 熔断打开期间每 30s 放行一次 half-open 试探：第三方源 API 偶发抽风（连接重置等）
 # 会让搜索探活连续失败触发熔断，若只能干等 10 分钟冷却，用户看到的就是"搜索全空"。
 # 真实事故：换到健康源后熔断仍卡在 open，所有平台被 source_circuit_open 拦截。
 _CHAIN_RETRY_SECONDS = 30
 _CHAIN_HEALTH: dict[str, dict] = {}
+# ★ 2026-10-20：熔断改为**按平台分桶**（key = "user_source:<platform>"）。
+# 事故：咪咕唯一可用后端（星海主后端）并发限流返回 503，连续 3 次失败后
+# 触发了**全局**熔断，把 kw/kg/tx/wy 全部一起熔掉 600 秒 —— 实测 mg 掉到
+# 1/25、其余平台同时返回 "user source circuit open"。上游限流是**单平台**
+# 现象，不该牵连其他平台。此前的全局单桶让一个平台的抖动拖垮整条链路。
+_CHAIN_BUCKETED = True
+
+# ★ 2026-10-20：限流退避重试。上游按出口 IP 限流时返回 503
+# 「当前请求量过大，未授权调用暂时受限」，等待片刻即可恢复。
+_THROTTLE_RETRY_ATTEMPTS = 3
+_THROTTLE_RETRY_DELAY_S = 1.2
+_THROTTLE_MARKERS = (
+    "未授权调用暂时受限", "请求量过大", "当前请求量过大", "too many requests",
+    "rate limit", "429", "请求过于频繁",
+)
 
 
-def _chain_available(name: str) -> bool:
-    h = _CHAIN_HEALTH.get(name)
+def _is_throttled(exc: Exception) -> bool:
+    """这次失败是否是上游限流（瞬时，值得退避重试）。"""
+    text = str(exc)
+    return any(m in text for m in _THROTTLE_MARKERS)
+
+
+def _chain_key(name: str, platform: str = "") -> str:
+    """熔断桶键：按平台分桶（user_source:mg / user_source:kw ...）。"""
+    if not _CHAIN_BUCKETED or not platform:
+        return name
+    return f"{name}:{platform}"
+
+
+# 脚本级「这首拿不到」的措辞 —— 这些是**音源侧没匹配到歌**或某个后端此刻不可用，
+# 不是整条链路的故障，不该计入熔断（见 _is_infrastructure_failure）。
+_SCRIPT_MISS_MARKERS = (
+    "无数据", "未找到", "无法解析到有效歌曲", "此接口已废弃", "缺少歌曲名",
+    "缺少歌曲ID", "找不到歌曲ID", "不支持的音质", "无法获取歌曲ID",
+    "未授权调用暂时受限", "请求量过大", "返回非直链", "不支持",
+    "invalid track id", "no playable url",
+)
+
+
+def _is_infrastructure_failure(exc: Exception) -> bool:
+    """这次失败是否属于「音源链路基础设施故障」（应计入熔断）。
+
+    传输层故障（超时/连接断开/探活失败）= 链路真的出问题了 → 计入熔断。
+    脚本级失败（某后端「无数据」「未授权受限」「此接口已废弃」）= 这首歌
+    暂时拿不到 → 不计入，避免上游波动把整个平台熔断掉。
+    """
+    if isinstance(exc, ChainTransportError):
+        return True
+    if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError,
+                        httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError,
+                        ConnectionError, TimeoutError, OSError)):
+        return True
+    # SourceError.resolve：脚本侧明确说了「拿不到」→ 不计入
+    from source_runtime import SourceError as _SrcErr
+    if isinstance(exc, _SrcErr):
+        if exc.category == "resolve":
+            text = str(exc)
+            if any(m in text for m in _SCRIPT_MISS_MARKERS):
+                return False
+            # 脚本解析超时/进程异常 → 算基础设施故障
+            return True
+        return True
+    text = str(exc)
+    if any(m in text for m in _SCRIPT_MISS_MARKERS):
+        return False
+    return True
+
+
+def _chain_available(name: str, platform: str = "") -> bool:
+    h = _CHAIN_HEALTH.get(_chain_key(name, platform))
     if not h:
         return True
     if h.get("half_open"):
@@ -813,17 +886,18 @@ def _chain_available(name: str) -> bool:
     return time.time() >= open_until - (_CHAIN_OPEN_SECONDS - _CHAIN_RETRY_SECONDS)
 
 
-def _chain_acquire(name: str) -> bool:
-    if not _chain_available(name):
+def _chain_acquire(name: str, platform: str = "") -> bool:
+    if not _chain_available(name, platform):
         return False
-    h = _CHAIN_HEALTH.get(name)
+    h = _CHAIN_HEALTH.get(_chain_key(name, platform))
     if h and h.get("open_until"):
         h["half_open"] = True  # synchronous claim: only one recovery request
     return True
 
 
-def _chain_report(name: str, ok: bool) -> None:
-    h = _CHAIN_HEALTH.setdefault(name, {"fails": 0, "open_until": 0.0, "breaks": 0})
+def _chain_report(name: str, ok: bool, platform: str = "") -> None:
+    key = _chain_key(name, platform)
+    h = _CHAIN_HEALTH.setdefault(key, {"fails": 0, "open_until": 0.0, "breaks": 0})
     was_half_open = h.pop("half_open", False)
     if ok:
         h["fails"] = 0
@@ -837,13 +911,26 @@ def _chain_report(name: str, ok: bool) -> None:
 
 
 def chain_health_snapshot() -> dict:
+    """熔断快照：按平台分桶列出，另给一个全局汇总（任一桶打开即视为部分降级）。"""
     now = time.time()
-    h = _CHAIN_HEALTH.get("user_source", {})
-    state = ("half_open" if h.get("half_open") else
-             "open" if h.get("open_until", 0) > now else
-             "recovery_ready" if h.get("open_until") else "closed")
-    return {"user_source": {"fails": h.get("fails", 0), "open": state == "open",
-                            "breaks": h.get("breaks", 0), "state": state}}
+    per_platform = {}
+    any_open = False
+    total_breaks = 0
+    for key, h in _CHAIN_HEALTH.items():
+        if not key.startswith("user_source"):
+            continue
+        platform = key.split(":", 1)[1] if ":" in key else ""
+        state = ("half_open" if h.get("half_open") else
+                 "open" if h.get("open_until", 0) > now else
+                 "recovery_ready" if h.get("open_until") else "closed")
+        per_platform[platform] = {"fails": h.get("fails", 0), "open": state == "open",
+                                  "breaks": h.get("breaks", 0), "state": state}
+        any_open = any_open or state == "open"
+        total_breaks += int(h.get("breaks") or 0)
+    return {"user_source": {"fails": 0, "open": any_open,
+                            "breaks": total_breaks,
+                            "state": "open" if any_open else "closed",
+                            "platforms": per_platform}}
 
 
 def source_capabilities() -> dict:
@@ -853,7 +940,7 @@ def source_capabilities() -> dict:
     result = {}
     for src in _SEARCHERS:
         supported = ready and src in runtime.platforms
-        available = supported and _chain_available("user_source")
+        available = supported and _chain_available("user_source", src)
         if available:
             reason = ""
         elif not ready:
@@ -1147,30 +1234,56 @@ async def _resolve_and_probe(client: httpx.AsyncClient, src: str, item: dict,
         if quality is None:
             attempted.append(t)
             continue
-        if not _chain_acquire("user_source"):
+        if not _chain_acquire("user_source", src):
             _record_failure(ChainTransportError("user source circuit open"))
             break
-        recovering = bool(_CHAIN_HEALTH.get("user_source", {}).get("half_open"))
+        recovering = bool(_CHAIN_HEALTH.get(_chain_key("user_source", src), {}).get("half_open"))
         result = None
         try:
-            url = await runtime.music_url(
-                music_info, quality, platform=src, timeout=CONF["resolver_timeout"]
-            )
+            # ★ 2026-10-20：脚本解析带**限流退避重试**。
+            # 上游（尤其咪咕的星海主后端）按出口 IP 限流，批量请求时整批返回
+            # 503「当前请求量过大，未授权调用暂时受限」—— 这是**瞬时**状态，
+            # 等 1~2 秒再试就能出直链（实测同一首串行再请求即成功）。
+            # 不重试的话，榜单预筛（并发 10）会把整批曲目判成不可播。
+            url = None
+            last_exc: Exception | None = None
+            for attempt in range(_THROTTLE_RETRY_ATTEMPTS):
+                try:
+                    url = await runtime.music_url(
+                        music_info, quality, platform=src, timeout=CONF["resolver_timeout"]
+                    )
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+                    if attempt + 1 >= _THROTTLE_RETRY_ATTEMPTS or not _is_throttled(exc):
+                        raise
+                    await asyncio.sleep(_THROTTLE_RETRY_DELAY_S * (attempt + 1))
+            if url is None and last_exc is not None:
+                raise last_exc
             # item 传进去用于广告/试听片段识别（声明时长 vs 实际字节数）
             result = await _verify_result(client, {"url": url}, item=item,
                                           report_transport=True)
         except asyncio.CancelledError:
             # Deadline/client cancellation says nothing about source health.
-            _CHAIN_HEALTH.get("user_source", {}).pop("half_open", None)
+            _CHAIN_HEALTH.get(_chain_key("user_source", src), {}).pop("half_open", None)
             raise
         except Exception as exc:  # transport, timeout, or script rejection
             _record_failure(exc)
-            _chain_report("user_source", False)
+            # ★ 2026-10-20：**只有传输层故障才计入熔断**。
+            # 脚本报「某后端无数据 / 该接口已废弃 / 未授权受限」是**音源侧没匹配到
+            # 这首歌**（或该后端此刻不可用），属于正常的「这首歌拿不到」，
+            # 不是整条音源链路故障 —— 之前它也计入熔断，导致上游稍有波动
+            # （咪咕星海后端并发限流 503）就整平台熔断 600 秒，
+            # 实测 mg 从 25/25 掉到 0/25。
+            if _is_infrastructure_failure(exc):
+                _chain_report("user_source", False, src)
         else:
             # A clean resolve without usable media is not a source outage.
             # A late pre-open request must not close a circuit opened by siblings.
-            if recovering or not _CHAIN_HEALTH.get("user_source", {}).get("open_until"):
-                _chain_report("user_source", True)
+            if recovering or not _CHAIN_HEALTH.get(_chain_key("user_source", src), {}).get("open_until"):
+                _chain_report("user_source", True, src)
         if result:
             result["resolver"] = "user_source"
             if not best or _TIER_RANK.get(result["actual_tier"], -1) > _TIER_RANK.get(best["actual_tier"], -1):
@@ -2519,7 +2632,8 @@ async def source_set(body: SourceBody):
             content={"ok": False, "error": str(exc), "category": exc.category}, status_code=400
         )
     # 旧源攒下的熔断状态（连续解析失败/open）不应连带拦截新源：换源即清零健康度
-    _CHAIN_HEALTH.pop("user_source", None)
+    for key in [k for k in _CHAIN_HEALTH if k.startswith("user_source")]:
+        _CHAIN_HEALTH.pop(key, None)
     return {"ok": True, "data": SOURCE_MANAGER.describe()}
 
 

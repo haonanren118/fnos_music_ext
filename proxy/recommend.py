@@ -17,6 +17,7 @@ coverId 的本地曲目（跳过酷我文本页假链接）。
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -76,7 +77,13 @@ VERIFY_TIMEOUT_S = _env_float("FNMUSIC_RECOMMEND_VERIFY_TIMEOUT_S", 8.0, 2.0, 20
 # 音源原生推荐抓取量（过滤已收藏/最近播放与不可播曲目后仍有余量）
 NETEASE_DAILY_LIMIT = 40
 NETEASE_TOPLIST_INDEX = 3  # 网易热歌榜
-CHART_FETCH_COUNT = 40
+# 2026-10-20：热门推荐接入轮换后，候选池必须够大 —— 40 首里若前几天推过
+# 十几首，剩下不足 20 首会导致歌单变短。取 120 首给排除集足够冗余。
+CHART_FETCH_COUNT = 120
+# ★ 2026-10-20：热门推荐轮换逻辑的版本号。轮换规则（按天换榜单窗口 + 排除旧歌）
+# 变更时递增 —— 已生成的当日缓存因版本号不匹配而自动失效重建，
+# 避免「当天首次生成过就永不重建」把新逻辑挡在门外。
+_HOT_ROTATION_VERSION = "v2-20261020"
 RECOMMEND_SEARCH_CONCURRENCY = _env_int("FNMUSIC_REC_SEARCH_CONCURRENCY", 2, 1, 6)
 RECOMMEND_SEARCH_INTERVAL = _env_float("FNMUSIC_REC_SEARCH_INTERVAL", 0.15, 0.0, 5.0)
 
@@ -972,10 +979,18 @@ def resolve_source_candidates(
     limit: int = PLAYLIST_SIZE,
     exclude_guids: set[str] | None = None,
     exclude_ta: set[tuple[str, str]] | None = None,
+    blocked_song_keys: set[str] | None = None,
 ) -> list[dict]:
-    """音源原生推荐条目（已含平台 ID，无需搜索匹配）直转 Track，跳过排除项凑满 limit 首。"""
+    """音源原生推荐条目（已含平台 ID，无需搜索匹配）直转 Track，跳过排除项凑满 limit 首。
+
+    blocked_song_keys：已归一化的**歌名级**黑名单（_song_key）。
+    榜单层用它挡掉前几天推过的歌 —— 榜单每天内容高度稳定，若只按
+    (歌名,歌手) 二元组排除，同一首歌换个演唱者就会漏进来，用户看到的
+    仍是「又是前几天的歌」。
+    """
     skip_ids = set(exclude_guids or ())
     skip_ta = set(exclude_ta or ())
+    skip_keys = set(blocked_song_keys or ())
     out: list[dict] = []
     for pick in items:
         if len(out) >= limit:
@@ -991,6 +1006,10 @@ def resolve_source_candidates(
         key = identity_key(ptitle, partist)
         if key != ("", "") and key in skip_ta:
             continue
+        if skip_keys:
+            psk = _song_key(ptitle)
+            if psk and psk in skip_keys:
+                continue
         track = build_track(pick)
         tg = str(track.get("guid") or guid)
         tt, ta = str(track.get("title") or ptitle), str(track.get("artist") or partist)
@@ -999,6 +1018,10 @@ def resolve_source_candidates(
         tkey = identity_key(tt, ta)
         if tkey != ("", "") and tkey in skip_ta:
             continue
+        if skip_keys:
+            tsk = _song_key(tt)
+            if tsk and tsk in skip_keys:
+                continue
         track["recommendDimension"] = str(pick.get("dimension") or "")
         track["recommendReason"] = str(pick.get("reason") or "")
         out.append(track)
@@ -1141,6 +1164,9 @@ def _song_key(title: str) -> str:
     `+` 连接的串烧段（`晴天 + 稻香 (...)`）、再压空白与小写。
     """
     t = (title or "").strip().lower()
+    # 去掉 [VIP] 前缀（build_online_track 加的纯展示标记）：
+    # 「[VIP]甲乙丙丁」与「甲乙丙丁」是同一首歌，不剥离就会绕过跨天排除。
+    t = re.sub(r"^\[vip\]\s*", "", t)
     # 去掉括号及其内容
     t = re.sub(r"[（(\[【][^）)\]】]*[）)\]】]", "", t)
     # 去掉下划线及其之后的内容（歌手后缀）
@@ -1756,6 +1782,10 @@ def remember_rotation_items(user_guid: str, day: str,
         artist = str(t.get("artist") or "").strip()
         if not title and not artist:
             continue
+        # 归一化后入库：读取端（recent_rotation_song_keys）也按归一化比对，
+        # 两边必须一致，否则「[VIP]甲乙丙丁」这类写法会绕过跨天排除。
+        title = _song_key(title) or title
+        artist = _song_key(artist) or artist
         key = (title, artist)
         if key in seen:
             continue
@@ -2045,6 +2075,12 @@ async def get_or_build_daily(
     if kind == "daily":
         purge_stale_source_slots(day)
     cached = load_daily_cache(user_guid, day, kind)
+    # ★ 2026-10-20：热门推荐缓存带**轮换版本号**。轮换逻辑（按天换榜单窗口）
+    # 升级后，当天已存在的旧缓存必须失效重建 —— 否则「当天首次生成过就永不
+    # 重建」的短路会让新逻辑永远不生效（实测 ARM 上修复部署后当日缓存仍是
+    # 修复前生成的旧内容）。版本号一变即视为缓存过期。
+    if kind == "hot" and cached and str(cached.get("rotationVersion") or "") != _HOT_ROTATION_VERSION:
+        cached = None
     existing = list(cached.get("tracks") or []) if cached else []
     if len(existing) >= PLAYLIST_SIZE:
         _remember_daily_result(user_guid, cached)
@@ -2112,6 +2148,56 @@ async def get_or_build_daily(
             return []
         return resolve_source_candidates(items, build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
 
+    # ★ 2026-10-20：热门推荐也要**轮换**。此前 hot 链只走榜单层，既不读
+    # 前几天推过的歌、也不记录本次推了什么 —— 而榜单（酷我飙升榜/酷狗TOP500/
+    # 网易新歌速递）内容一天内高度稳定，且推荐**永远取榜单前 20 首**，
+    # 于是热门推荐**天天是同一批歌**（实测 20261020 与前一日首三首完全相同）。
+    #
+    # 只加"排除前几天推过的"并不够：黑名单里的歌来自每日推荐的 LLM 层，
+    # 与榜单池几乎不重叠（实测 120 首候选里仅 3 首命中），挡不住什么。
+    # 真正要变的是**取哪一段榜单** —— 按天做确定性轮换窗口，
+    # 每天换一个起点，歌单内容自然不同，且全部取自榜单（仍是热门歌）。
+    hot_blocked: set[str] = set()
+    if kind == "hot":
+        hot_blocked = recent_rotation_song_keys(
+            user_guid, day, days_back=ROTATION_HISTORY_DAYS - 1)
+
+    def _rotate_chart_window(items: list[dict]) -> list[dict]:
+        """按天轮换榜单窗口：同一天同一用户结果稳定，跨天必然不同。
+
+        做法：把候选按「歌名哈希 + 天序号」排序（确定性，不用随机数），
+        再按天序号取不同起点。窗口内若命中黑名单（旧歌）则顺延跳过。
+        """
+        if not items:
+            return []
+        try:
+            day_no = int(str(day))
+        except (TypeError, ValueError):
+            day_no = 0
+        seed = f"{user_guid}:{day}"
+        ranked = sorted(
+            items,
+            key=lambda it: hashlib.md5(
+                f"{seed}:{it.get('id') or it.get('title') or ''}".encode("utf-8")
+            ).hexdigest(),
+        )
+        span = max(len(ranked) - PLAYLIST_SIZE, 1)
+        start = day_no % span
+        window = ranked[start:] + ranked[:start]      # 环形窗口
+        picked: list[dict] = []
+        for it in window:
+            if len(picked) >= PLAYLIST_SIZE:
+                break
+            if hot_blocked:
+                k = _song_key(str(it.get("title") or ""))
+                if k and k in hot_blocked:
+                    continue
+            picked.append(it)
+        # 窗口内全被黑名单挡掉时兜底：退回未过滤的窗口，保证歌单不为空
+        if not picked:
+            picked = window[:PLAYLIST_SIZE]
+        return picked
+
     async def from_netease_charts(on_track=None, should_stop=None) -> list[dict]:
         if not (recommend_hot and netease_enabled and musicbox_client):
             return []
@@ -2121,7 +2207,9 @@ async def get_or_build_daily(
         )
         if not items:
             return []
-        return resolve_source_candidates(items, build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
+        items = _rotate_chart_window(items)
+        return resolve_source_candidates(items, build_track, PLAYLIST_SIZE, exclude_guids,
+                                        exclude_ta, blocked_song_keys=hot_blocked)
 
     async def from_lx_charts(on_track=None, should_stop=None) -> list[dict]:
         if not (recommend_hot and lx_enabled and lx_client):
@@ -2129,7 +2217,9 @@ async def get_or_build_daily(
         items = await fetch_lx_charts(lx_client, CHART_FETCH_COUNT, sources=lx_sources)
         if not items:
             return []
-        return resolve_source_candidates(items, build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
+        items = _rotate_chart_window(items)
+        return resolve_source_candidates(items, build_track, PLAYLIST_SIZE, exclude_guids,
+                                        exclude_ta, blocked_song_keys=hot_blocked)
 
     async def from_llm(on_track=None, should_stop=None) -> list[dict]:
         # 配置了 FNMUSIC_LLM_* 即作为每日推荐来源：音源名额已被占用（或音源
@@ -2358,11 +2448,20 @@ async def get_or_build_daily(
         "favoriteCount": len(fav_seeds),
         "builtAt": int(time.time()),
     }
+    if kind == "hot":
+        payload["rotationVersion"] = _HOT_ROTATION_VERSION
     if tracks:
         save_daily_cache(user_guid, day, payload, kind)
         logger.info(
             "%s recommend %s tracks=%s status=%s tiers=%s",
             kind, guid, len(tracks), payload["status"], ",".join(contributing) or "-",
         )
+        # ★ 2026-10-20：热门推荐也要记轮换历史，否则 hot 链读不到「前几天推过什么」，
+        # 排除集恒为空 → 榜单内容稳定 → 天天同一批歌（实测 20261020 与前日首三首相同）。
+        if kind == "hot":
+            try:
+                remember_rotation_items(user_guid, day, tracks)
+            except Exception as e:  # noqa: BLE001 —— 记历史失败不能影响推荐
+                logger.warning("failed to remember hot rotation items: %s", e)
     _remember_daily_result(user_guid, payload)
     return payload

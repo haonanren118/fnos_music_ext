@@ -6787,6 +6787,35 @@ def _cover_bytes_response(data: bytes) -> Response:
     )
 
 
+# ==== 音源平台图标（2026-10-20）====
+#
+# 歌单卡片用平台图标表明来源（酷我/酷狗/QQ/网易/咪咕），替代名称里的
+# 「[酷我]」文本前缀。图标是随包发布的本地 PNG（proxy/static/platforms/），
+# 尺寸与既有占位图一致（300x300），客户端按 coverUrl 取图即可。
+
+_PLATFORM_ICON_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "platforms")
+_PLATFORM_ICON_CACHE: dict[str, bytes] = {}
+
+
+def _platform_icon_bytes(source: str) -> bytes:
+    """读取平台图标 PNG；不存在返回空字节。"""
+    src = str(source or "").strip().lower()
+    if src not in ("kw", "kg", "tx", "wy", "mg", "netease"):
+        return b""
+    if src in _PLATFORM_ICON_CACHE:
+        return _PLATFORM_ICON_CACHE[src]
+    path = os.path.join(_PLATFORM_ICON_DIR, f"{src}.png")
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return b""
+    if not data:
+        return b""
+    _PLATFORM_ICON_CACHE[src] = data
+    return data
+
+
 def _tx_songmid_from_guid(guid: str) -> str:
     """从 lx 腾讯源 guid（online:lx:tx:<songmid>）取 songmid；非 tx 源返回空。"""
     parts = str(guid or "").split(":")
@@ -8066,6 +8095,15 @@ async def static_cover(request: Request, subpath: str = ""):
     _ua = request.headers.get("user-agent", "")[:150]
     _q = {k: (str(v)[:70]) for k, v in request.query_params.items()}
     _cover_log("REQ", f"subpath={subpath!r} ua={_ua!r} q={_q}")
+    # 2026-10-20：音源平台图标（coverId=platform:<source>）—— 歌单卡片用它表明来源，
+    # 替代原先名称里的「[酷我]」文本前缀。图标随包发布，命中即返回，不查上游。
+    _icon_id = str(request.query_params.get("coverId") or "").strip()
+    if _icon_id.startswith("platform:"):
+        _icon = _platform_icon_bytes(_icon_id.split(":", 1)[1])
+        if _icon:
+            _cover_log("PLATFORM_ICON", f"id={_icon_id}")
+            return _cover_bytes_response(_icon)
+        return Response(status_code=404)
     guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
     if not guid and subpath.startswith("online:"):
         guid = subpath

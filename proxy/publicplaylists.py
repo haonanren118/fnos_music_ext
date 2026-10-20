@@ -249,6 +249,30 @@ def _source_label(source: str) -> str:
     }.get(source, source.upper())
 
 
+# 音源平台图标（2026-10-20）：原生客户端歌单卡片只渲染 coverId/coverUrl 图标，
+# 此前靠 name 文本前缀「[酷我]」区分来源 —— 文字标签既占位又不好看。
+# 改为直接用平台图标当卡片封面，名称回归纯榜单名。
+# 图标是随包发布的本地 PNG（proxy/static/platforms/<source>.png），
+# 客户端只按 coverUrl 取图，代理用 /static/cover?coverId=platform:<source> 分发。
+_PLATFORM_ICON_SOURCES = ("kw", "kg", "tx", "wy", "mg", "netease")
+
+
+def platform_icon_cover_id(source: str) -> str:
+    """平台图标 coverId（纯 32-hex 之外的专用形态，由封面端点识别）。"""
+    src = str(source or "").strip().lower()
+    if src not in _PLATFORM_ICON_SOURCES:
+        return ""
+    return f"platform:{src}"
+
+
+def platform_icon_url(source: str) -> str:
+    """平台图标的相对 URL（客户端按 coverUrl 取图）。"""
+    icon_id = platform_icon_cover_id(source)
+    if not icon_id:
+        return ""
+    return f"/music/api/v1/static/cover?coverId={quote(icon_id, safe='')}"
+
+
 def _card_from_summary(entry: dict, summary: dict) -> dict:
     guid = playlist_guid(entry)
     cover_url = str(summary.get("cover_url") or "")
@@ -266,9 +290,18 @@ def _card_from_summary(entry: dict, summary: dict) -> dict:
     # 并同时下发 coverUrl —— 侧边栏歌单列表按 coverUrl 取图，缺它就是默认音符图标。
     cover_id = _COVER_ID_HOOK(guid) if _COVER_ID_HOOK else "track_" + fake_guid(guid)
     cover_ep = _COVER_URL_HOOK(cover_id) if (_COVER_URL_HOOK and cover_id) else ""
+    # 2026-10-20：来源标识改用**平台图标**（客户端按 coverUrl 取图），
+    # 名称里的「[酷我]」文本前缀去掉 —— 卡片图标已经表明来源，文字前缀是冗余的。
+    source = str(entry.get("source") or "")
+    icon_url = platform_icon_url(source)
+    if icon_url:
+        cover_ep = icon_url
+        name = str(summary.get("name") or entry["id"])
+    else:
+        name = f"[{_source_label(source)}] {str(summary.get('name') or entry['id'])}"
     return {
         "guid": guid,
-        "name": f"[{_source_label(entry['source'])}] {str(summary.get('name') or entry['id'])}",
+        "name": name,
         "coverId": cover_id,
         "coverUrl": cover_ep,
         "createdAt": updated or int(time.time()),
