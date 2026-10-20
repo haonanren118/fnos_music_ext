@@ -839,10 +839,12 @@ async def test_hot_playlist_uses_netease_charts(tmp_path, monkeypatch):
     assert payload["playlist"]["name"] == "热门推荐"
     assert len(payload["tracks"]) == dailyrec.PLAYLIST_SIZE
     assert all(str(t["guid"]).startswith("online:netease:") for t in payload["tracks"])
-    # 封面 = 第一个有 cover_url 的歌（第一首在列）；coverId 为其独立盐伪装 id，可反解
+    # 封面 = 第一个有 cover_url 的歌（第一首在列）；coverId 为其独立盐伪装 id，可反解。
     assert payload["playlist"]["coverId"] == payload["tracks"][0]["coverId"]
     assert resolve_real_guid(payload["playlist"]["coverId"]) == payload["tracks"][0]["guid"]
-    assert str(payload["tracks"][0].get("cover_url") or "").startswith("http://img/70000")
+    # 只断言「是网易图床 URL」—— 断言具体图床 ID 会随窗口轮换换人而失效
+    # （2026-10-20 热门推荐接入按天窗口轮换，首曲不再固定是同一个）。
+    assert str(payload["tracks"][0].get("cover_url") or "").startswith("http://img/")
 
 
 @pytest.mark.anyio

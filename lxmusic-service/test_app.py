@@ -434,8 +434,11 @@ def test_circuit_opens_after_consecutive_failures(isolated):
 
     async def run():
         http = mock_client(lambda r: httpx.Response(404))
+        # 阈值与冷却时长是运维参数（2026-10-20 从 3/600s 放宽到 6/120s），
+        # 断言跟随常量而非硬编码，这样调参不必改测试。
+        n = lxapp._CHAIN_FAIL_THRESHOLD + 2
         try:
-            for _ in range(5):
+            for _ in range(n):
                 try:
                     await lxapp.resolve_and_probe(
                         http, "kw", {"id": "lx:kw:1", "title": "t", "duration_s": 200}
@@ -444,11 +447,14 @@ def test_circuit_opens_after_consecutive_failures(isolated):
                     pass
         finally:
             await http.aclose()
+        return n
 
     import asyncio
 
-    asyncio.run(run())
-    assert len(rt.calls) == 3  # 第 4、5 次被熔断跳过
+    n = asyncio.run(run())
+    # 达阈值后打开熔断，其后 2 次被熔断跳过（不打上游）
+    assert len(rt.calls) == lxapp._CHAIN_FAIL_THRESHOLD
+    assert n == lxapp._CHAIN_FAIL_THRESHOLD + 2
     snap = lxapp.chain_health_snapshot()
     assert snap["user_source"]["open"] is True
     assert snap["user_source"]["breaks"] == 1

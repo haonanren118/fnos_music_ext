@@ -833,6 +833,20 @@ def _chain_key(name: str, platform: str = "") -> str:
     return f"{name}:{platform}"
 
 
+def _chain_bucket(name: str, platform: str = "") -> "dict | None":
+    """取该平台的熔断状态；平台桶不存在时回退到**全局桶**。
+
+    回退的意义：全局桶是「整条音源链路都挂了」的兜底状态（换源前遗留、
+    手动置入）。没有它，平台桶分桶后那些置入全局桶的状态会被忽略 ——
+    既有的换源清理、测试与运维手工置入都依赖全局桶语义。
+    """
+    if platform and _CHAIN_BUCKETED:
+        hit = _CHAIN_HEALTH.get(_chain_key(name, platform))
+        if hit is not None:
+            return hit
+    return _CHAIN_HEALTH.get(name)
+
+
 # 脚本级「这首拿不到」的措辞 —— 这些是**音源侧没匹配到歌**或某个后端此刻不可用，
 # 不是整条链路的故障，不该计入熔断（见 _is_infrastructure_failure）。
 _SCRIPT_MISS_MARKERS = (
@@ -873,7 +887,8 @@ def _is_infrastructure_failure(exc: Exception) -> bool:
 
 
 def _chain_available(name: str, platform: str = "") -> bool:
-    h = _CHAIN_HEALTH.get(_chain_key(name, platform))
+    # 平台桶优先，回退全局桶（见 _chain_bucket 的说明）
+    h = _chain_bucket(name, platform)
     if not h:
         return True
     if h.get("half_open"):
@@ -889,14 +904,22 @@ def _chain_available(name: str, platform: str = "") -> bool:
 def _chain_acquire(name: str, platform: str = "") -> bool:
     if not _chain_available(name, platform):
         return False
-    h = _CHAIN_HEALTH.get(_chain_key(name, platform))
+    h = _chain_bucket(name, platform)
     if h and h.get("open_until"):
         h["half_open"] = True  # synchronous claim: only one recovery request
     return True
 
 
 def _chain_report(name: str, ok: bool, platform: str = "") -> None:
-    key = _chain_key(name, platform)
+    # ★ 2026-10-21：写回**同一个桶**。_chain_acquire 的 half_open 标记可能打在
+    # 全局桶（平台桶不存在时的回退命中），若这里凭空新建平台桶，half_open 桶与
+    # 报告桶就分裂成两条记录 —— 全局桶的 open_until 仍是过去时间，快照会报
+    # "closed"，半开失败也拉不回 open。真实事故：test_half_open_failure_reopens。
+    existing = _chain_bucket(name, platform)
+    if existing is not None:
+        key = next((k for k, v in _CHAIN_HEALTH.items() if v is existing), _chain_key(name, platform))
+    else:
+        key = _chain_key(name, platform)
     h = _CHAIN_HEALTH.setdefault(key, {"fails": 0, "open_until": 0.0, "breaks": 0})
     was_half_open = h.pop("half_open", False)
     if ok:
@@ -916,6 +939,7 @@ def chain_health_snapshot() -> dict:
     per_platform = {}
     any_open = False
     total_breaks = 0
+    total_fails = 0
     for key, h in _CHAIN_HEALTH.items():
         if not key.startswith("user_source"):
             continue
@@ -927,7 +951,10 @@ def chain_health_snapshot() -> dict:
                                   "breaks": h.get("breaks", 0), "state": state}
         any_open = any_open or state == "open"
         total_breaks += int(h.get("breaks") or 0)
-    return {"user_source": {"fails": 0, "open": any_open,
+        # 全局 fails 取各桶之和（与 breaks 同口径）。分桶后若仍硬编码 0，
+        # 运维/测试看快照会以为「从没失败过」—— 连续失败计数正是排障第一现场。
+        total_fails += int(h.get("fails") or 0)
+    return {"user_source": {"fails": total_fails, "open": any_open,
                             "breaks": total_breaks,
                             "state": "open" if any_open else "closed",
                             "platforms": per_platform}}
