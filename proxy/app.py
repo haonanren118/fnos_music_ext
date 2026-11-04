@@ -35,6 +35,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 
 try:
     from . import recommend as dailyrec
+    from . import recommend_schedule as recsched
     from . import nmplaylists as nmpl
     from . import publicplaylists as pubpl
     from . import transcode as tc
@@ -43,6 +44,7 @@ try:
     from .version import get_version
 except ImportError:  # uvicorn --app-dir proxy
     import recommend as dailyrec  # type: ignore
+    import recommend_schedule as recsched  # type: ignore
     import nmplaylists as nmpl  # type: ignore
     import publicplaylists as pubpl  # type: ignore
     import transcode as tc  # type: ignore
@@ -3562,6 +3564,9 @@ async def lifespan(fastapi_app: FastAPI):
     logger.info("==================================")
 
     sweeper_task = asyncio.create_task(_lyric_orphan_sweeper()) if _background_jobs_enabled() else None
+    refresh_task = asyncio.create_task(
+        recsched.run(fastapi_app, _prebuild_recommend_one, _recommend_injectable_kinds)
+    ) if _background_jobs_enabled() else None
     env_task = asyncio.create_task(_env_watch_loop()) if (
         _background_jobs_enabled() and CONF.get("env_watch", True)
     ) else None
@@ -3613,6 +3618,9 @@ async def lifespan(fastapi_app: FastAPI):
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        if refresh_task:
+            refresh_task.cancel()
+            await asyncio.gather(refresh_task, return_exceptions=True)
         if sweeper_task:
             sweeper_task.cancel()
             await asyncio.gather(sweeper_task, return_exceptions=True)
@@ -8812,6 +8820,11 @@ def _recommend_injectable_kinds(user_guid: str) -> list[str]:
 
 
 async def _ensure_daily_task(request: Request, user_guid: str, kind: str = "daily") -> asyncio.Task:
+    return await _ensure_daily_task_for_app(request.app, user_guid, kind)
+
+
+async def _ensure_daily_task_for_app(app: FastAPI, user_guid: str, kind: str = "daily") -> asyncio.Task:
+    """与在线请求共用的构建入口（后台定时预构建直接调它，行为不分叉）。"""
     day = dailyrec.today_key()
     _prune_stale_daily_tasks(day)
     key = f"{user_guid}:{kind}:{day}"
@@ -8847,13 +8860,13 @@ async def _ensure_daily_task(request: Request, user_guid: str, kind: str = "dail
     task = asyncio.create_task(
         dailyrec.get_or_build_daily(
             user_guid=user_guid,
-            musicdl_client=get_musicdl_client(request.app) if CONF.get("musicdl_enabled") else None,
-            musicbox_client=get_musicbox_client(request.app) if CONF["netease_enabled"] else None,
-            llm_http=get_llm_client(request.app) if dailyrec.llm_enabled() else None,
+            musicdl_client=get_musicdl_client(app) if CONF.get("musicdl_enabled") else None,
+            musicbox_client=get_musicbox_client(app) if CONF["netease_enabled"] else None,
+            llm_http=get_llm_client(app) if dailyrec.llm_enabled() else None,
             build_track=build_online_track,
             netease_enabled=CONF["netease_enabled"],
             favorite_items=favs,
-            lx_client=get_lx_client(request.app) if CONF.get("lx_enabled") else None,
+            lx_client=get_lx_client(app) if CONF.get("lx_enabled") else None,
             lx_enabled=bool(CONF.get("lx_enabled")),
             lx_sources=CONF.get("lx_sources") or None,
             recommend_hot=bool(CONF.get("recommend_hot", True)),
@@ -8863,6 +8876,21 @@ async def _ensure_daily_task(request: Request, user_guid: str, kind: str = "dail
     )
     _DAILY_TASKS[key] = task
     return task
+
+
+async def _prebuild_recommend_one(app: FastAPI, user_guid: str, kind: str) -> None:
+    """静默预构建回调：等待该用户当日这份落盘，超时不取消底层构建。
+
+    顺序等待而非并发，避免半夜同时打满音源 / LLM 配额；超时只记日志，
+    get_or_build_daily 的逐首 checkpoint 仍会在后台把缓存写完。
+    """
+    task = await _ensure_daily_task_for_app(app, user_guid, kind)
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=300.0)
+    except asyncio.TimeoutError:
+        logger.warning("recommend refresh: %s/%s still building in background", user_guid, kind)
+    except Exception as e:  # noqa: BLE001 —— 静默任务不能影响服务
+        logger.warning("recommend refresh: %s/%s build failed: %s", user_guid, kind, e)
 
 
 async def _wait_progressive_bundle(

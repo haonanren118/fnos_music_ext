@@ -24,7 +24,7 @@ import os
 import re
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -177,8 +177,25 @@ def music_db_path() -> str:
     )
 
 
+# 推荐歌单的「逻辑日」边界：默认 00:00（自然日，与既有行为逐字节等价）。
+# 与定时静默预构建时刻共用同一定义：FNMUSIC_RECOMMEND_REFRESH_HOUR 可调；
+# 若改为 6 点，逻辑日随之后移 6 小时，保证「刷新前看到的仍是上一份已构建
+# 好的歌单」，不会出现日期已切换、当日缓存却还没建好的空窗。
+DEFAULT_REFRESH_HOUR = 0
+
+
+def refresh_hour() -> int:
+    """推荐日切换时刻（本地时间 0-23）；非法配置一律回落 0 点。"""
+    try:
+        hour = int(os.environ.get("FNMUSIC_RECOMMEND_REFRESH_HOUR", ""))
+    except (TypeError, ValueError):
+        return DEFAULT_REFRESH_HOUR
+    return hour if 0 <= hour <= 23 else DEFAULT_REFRESH_HOUR
+
+
 def today_key(now: datetime | None = None) -> str:
-    return (now or datetime.now()).strftime("%Y%m%d")
+    n = now or datetime.now()
+    return (n - timedelta(hours=refresh_hour())).strftime("%Y%m%d")
 
 
 def recommend_playlist_guid(kind: str, day: str | None = None, user_guid: str = "") -> str:

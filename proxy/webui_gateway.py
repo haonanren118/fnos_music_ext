@@ -96,6 +96,18 @@ HOST_HOTFIX_MAX_BODY = 8 << 20        # 8MB：hotfix 含多文件代码，比 ho
 HOTFIX_BACKUP_ROOT = HOST_REPO_ROOT / ".hotfix-backup"
 HOTFIX_VERSION_FILE = HOST_REPO_ROOT / ".hotfix-version"
 
+# ── 应用中心登记版本同步 ────────────────────────────────────────────────────
+# fnOS 的 appcenter-cli 没有 upgrade 子命令；install-fpk 对已安装应用是空操作
+# （实测：只打印 "Application [x] is installed." 并返回 0，版本/日志/安装记录
+# 全都不变）。所以热更新只改 repo 代码时，应用中心的登记版本会永远停在最后一次
+# fpk 安装时的值（本机实测 2.6.20，而 repo/VERSION 已到 2.7.7）。
+# 登记版本落在 PostgreSQL 的 appcenter.app.version；安装清单
+# /var/apps/<app>/manifest 里还有一份副本。两处都纳入对齐，任何一处被读取时
+# 都不会再显示旧号。只接受严格递增的 x.y.z，任何异常都只记日志、不影响主流程。
+APPCENTER_DB = "appcenter"
+APPCENTER_MANIFEST = Path(f"/var/apps/{APP_NAME}/manifest")
+APPCENTER_VERSION_BACKUP = HOTFIX_BACKUP_ROOT / "appcenter-version"
+
 # 白名单：只允许改这些前缀下的文件（用**容器路径**写法，与 CONTAINER_REPO_PREFIX 一致，
 # 因为调用方在容器里，它只知道 /repo/...）。换算成宿主路径后再做逃逸检查。
 HOTFIX_ALLOW_PREFIXES = (
@@ -394,7 +406,7 @@ def _is_post_to(head_raw: bytes, paths: tuple[str, ...]) -> bool:
     return parts[1] in paths
 
 
-def _installed_version() -> str:
+def _installed_version(timeout: float = 60.0) -> str:
     """读应用中心登记的版本号；读不到返回空串。
 
     只用于「装完到底换没换」的判定：install-fpk 对已安装应用是**空操作** ——
@@ -403,7 +415,7 @@ def _installed_version() -> str:
     """
     try:
         proc = subprocess.run(  # noqa: S603
-            [APPCENTER_CLI, "list"], capture_output=True, text=True, timeout=60,
+            [APPCENTER_CLI, "list"], capture_output=True, text=True, timeout=timeout,
         )
     except Exception:  # noqa: BLE001
         return ""
@@ -414,6 +426,100 @@ def _installed_version() -> str:
             if re.fullmatch(r"v?\d+\.\d+\.\d+\S*", cell):
                 return cell.lstrip("v")
     return ""
+
+
+def _appcenter_log(msg: str) -> None:
+    print(f"[appcenter-version] {msg}", file=sys.stderr, flush=True)
+
+
+def _write_appcenter_manifest(ver: str) -> bool:
+    """把安装清单里的 version 行对齐；只改这一行，其余字节原样保留。
+
+    写前把原始文件备份到 .hotfix-backup/appcenter-version/，再用同目录临时文件
+    原子替换，避免中途失败留下半截清单。checksum 是安装时 fpk 内容的校验值，
+    与版本行无关，保持原样不动。
+    """
+    try:
+        raw = APPCENTER_MANIFEST.read_bytes()
+    except OSError as exc:
+        _appcenter_log(f"manifest 不可读，跳过: {exc}")
+        return False
+    out: list[bytes] = []
+    hit = 0
+    for line in raw.splitlines(keepends=True):
+        if re.match(rb"^\s*version\s*=", line):
+            nl = b"\n" if line.endswith(b"\n") else b""
+            out.append(f"version               = {ver}".encode("utf-8") + nl)
+            hit += 1
+        else:
+            out.append(line)
+    if hit != 1:
+        _appcenter_log(f"manifest version 行不唯一({hit})，跳过")
+        return False
+    new = b"".join(out)
+    if new == raw:
+        return True
+    try:
+        APPCENTER_VERSION_BACKUP.mkdir(parents=True, exist_ok=True)
+        (APPCENTER_VERSION_BACKUP / f"manifest-{int(time.time())}.bak").write_bytes(raw)
+        mode = APPCENTER_MANIFEST.stat().st_mode & 0o777
+        tmp = APPCENTER_MANIFEST.with_name(APPCENTER_MANIFEST.name + ".tmp")
+        tmp.write_bytes(new)
+        os.chmod(tmp, mode)  # 保留原权限，别被 systemd 的 UMask=0077 改成 600
+        os.replace(tmp, APPCENTER_MANIFEST)
+    except OSError as exc:
+        _appcenter_log(f"manifest 写入失败，跳过: {exc}")
+        return False
+    return True
+
+
+def _sync_appcenter_version(ver: str, read_timeout: float = 10.0) -> bool:
+    """把应用中心登记版本同步到 ver；幂等、只升不降、失败静默。
+
+    PostgreSQL（appcenter-cli list / 应用详情页读它）与安装清单两处都对齐：
+    不同机型 / 系统版本的数据源可能不同，只留一处旧号将来仍会显示旧版本。
+    最后用 appcenter-cli list 复验。ver 已用正则限死为纯数字点，SQL 无注入面。
+    """
+    if not re.fullmatch(r"\d+\.\d+\.\d+", ver or ""):
+        return False
+    try:
+        current = _installed_version(timeout=read_timeout)
+        if current == ver:
+            return True
+        if current and _ver_tuple(ver) <= _ver_tuple(current):
+            _appcenter_log(f"登记版本 {current} 不低于 {ver}，不降级")
+            return False
+        sql = (f"UPDATE app SET version = '{ver}' "
+               f"WHERE app_name = '{APP_NAME}' AND version IS DISTINCT FROM '{ver}';")
+        proc = subprocess.run(  # noqa: S603
+            ["sudo", "-u", "postgres", "psql", "-d", APPCENTER_DB,
+             "-v", "ON_ERROR_STOP=1", "-c", sql],
+            capture_output=True, text=True, timeout=20,
+        )
+        if proc.returncode != 0:
+            _appcenter_log(f"PG 更新失败: {(proc.stderr or '').strip()[:200]}")
+            return False
+        _write_appcenter_manifest(ver)
+        ok = _installed_version(timeout=read_timeout) == ver
+        _appcenter_log(f"登记版本 {current or '(空)'} -> {ver}，复验{'通过' if ok else '未通过'}")
+        return ok
+    except Exception as exc:  # noqa: BLE001 —— 版本展示不能影响热更新 / 服务启动
+        _appcenter_log(f"同步失败（忽略）: {exc}")
+        return False
+
+
+def sync_version_on_startup() -> None:
+    """网关启动时把登记版本补齐到 repo/VERSION（存量安装一次性自愈）。
+
+    热更新写入的新网关代码要等下次启动才生效，所以自检必须放在启动路径上：
+    装完带本次修复的热更新包并重启 host 后，登记版本自动追平，无需重裝 fpk。
+    """
+    try:
+        ver = (HOST_REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    except OSError:
+        return
+    _sync_appcenter_version(ver)
+
 
 
 def handle_host_upgrade(client: socket.socket, headers: dict[str, str], head_raw: bytes) -> None:
@@ -857,12 +963,19 @@ def _run_hotfix(client: socket.socket, req: dict) -> bool:
         except OSError:
             pass  # 不影响本次生效，只影响下次递增判断 / UI 版本显示
 
+        # 同步应用中心登记版本：热更新只改 repo，不改应用中心的 fpk 版本记录，
+        # 不同步的话详情页会永远停在最后一次 fpk 安装时的旧号。
+        appcenter_version_ok = False
+        if re.fullmatch(r"\d+\.\d+\.\d+", ver):
+            appcenter_version_ok = _sync_appcenter_version(ver)
+
         need_reload = any(str(hp).endswith((".js", ".css", ".html")) for _c, hp, _r in plan)
         payload = _json_response(200, {
             "ok": True, "applied": len(plan), "version": ver,
             "backup": str(bdir), "restarted": restart_list,
             "need_reload_browser": need_reload,
             "version_file_written": version_file_ok,
+            "appcenter_version_synced": appcenter_version_ok,
         })
         # 若需要重启 host，则必须"先回包再重启" —— 见 _restart_after_response 的说明。
         # 交给后台线程，且把 client 的关闭责任一并移交，避免 finally 提前关掉它。
@@ -1225,6 +1338,9 @@ def main(argv: list[str] | None = None) -> int:
     path = socket_path_for(base)
     _stop_previous()
     _daemonize()
+    # daemon 化之后才起线程（fork 只保留当前线程，之前起会随父进程消失）。
+    # 后台执行：appcenter-cli / psql 万一卡住也不会拖慢 systemd 的启动超时。
+    threading.Thread(target=sync_version_on_startup, daemon=True).start()
     PID_FILE.parent.mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(str(os.getpid()))
     try:
