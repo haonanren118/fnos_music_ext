@@ -49,7 +49,8 @@ jobs:
             "https://static2.fnnas.com/fnpack/fnpack-${FNPACK_VERSION}-linux-amd64"
           chmod +x /tmp/fnpack
           sudo mv /tmp/fnpack /usr/local/bin/fnpack
-          fnpack --help | head -5
+          fnpack --help > /tmp/fnpack-help.txt
+          head -5 /tmp/fnpack-help.txt
 
       - name: Build amd64 service image
         # 仓库默认 apt/pip 指向国内镜像源；GitHub runner 在境外，显式切到官方源，
@@ -82,7 +83,9 @@ jobs:
           mkdir -p images
           docker save fnmusic-sources:latest -o images/fnmusic-sources.tar
           ls -lh images/fnmusic-sources.tar
-          tar -xOf images/fnmusic-sources.tar manifest.json | head -c 250; echo
+          # 完整读取（不要用 head 截断：pipefail 下 tar 会因 SIGPIPE 判失败）
+          tar -xOf images/fnmusic-sources.tar manifest.json \
+            | python3 -c "import sys,json; print('RepoTags:', [e.get('RepoTags') for e in json.load(sys.stdin)])"
 
       - name: Build offline fpk
         run: |
@@ -96,13 +99,14 @@ jobs:
           fpk="$(ls dist/fnmusic-ext-*.fpk | head -1)"
           test -s "${fpk}"
           ( cd dist && sha256sum -c "$(basename "${fpk}").sha256" )
-          # 外层结构
-          tar -tzf "${fpk}" | grep -qx 'app.tgz'
-          tar -tzf "${fpk}" | grep -qx 'cmd/main'
-          tar -tzf "${fpk}" | grep -qx 'manifest'
+          # 外层结构（grep 不用 -q：pipefail 下提前退出会让上游 tar 收到 SIGPIPE）
+          tar -tzf "${fpk}" > /tmp/fpk-outer.txt
+          for n in app.tgz cmd/main manifest ICON.PNG ICON_256.PNG wizard/install; do
+            grep -Fx "${n}" /tmp/fpk-outer.txt > /dev/null || { echo "ERROR: 缺少 ${n}" >&2; exit 1; }
+          done
           # Linux fnpack 必须保留可执行位（Windows 版会写成 0666，装不上）
-          tar -tvzf "${fpk}" | grep -E 'cmd/main$' | grep -qE '^-rwx' || {
-            echo "ERROR: cmd/main 权限位异常" >&2; exit 1; }
+          tar -tvzf "${fpk}" | grep -E 'cmd/main$' > /tmp/fpk-cmdmain.txt
+          grep -qE '^-rwx' /tmp/fpk-cmdmain.txt || { echo "ERROR: cmd/main 权限位异常" >&2; exit 1; }
           # 内层必须真的含内置镜像
           tar -xzOf "${fpk}" app.tgz | tar -tzvf - | grep -E 'repo/images/fnmusic-sources\.tar$'
           echo "### 离线包校验通过" >> "$GITHUB_STEP_SUMMARY"
