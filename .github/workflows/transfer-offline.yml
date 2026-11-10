@@ -1,0 +1,52 @@
+name: Offline FPK transfer (temporary)
+
+# 临时传输通道：把已构建的离线 fpk 从 Actions artifact 转成一个临时 prerelease 资产，
+# 便于本机经国内镜像分段取回。取回后由维护者删除该 prerelease 与同名 tag。
+# tag 名不以 v 开头，不会触发 release.yml（on.push.tags = v*）。
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "已成功构建离线包的 workflow run id"
+        required: true
+      tag:
+        description: "版本标签（用于定位 artifact 名 fnmusic-offline-<tag>）"
+        required: true
+        default: "v2.7.8"
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  transfer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SRC_RUN: ${{ inputs.source_run_id }}
+      TARGET_TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Download built fpk from artifact
+        run: |
+          set -euo pipefail
+          gh run download "${SRC_RUN}" --name "fnmusic-offline-${TARGET_TAG}" --dir dist
+          ls -lh dist/
+          test -s "dist/fnmusic-ext-2.7.8.fpk"
+
+      - name: Create temporary prerelease
+        run: |
+          set -euo pipefail
+          tmp_tag="offline-transfer-${TARGET_TAG}"
+          gh release view "${tmp_tag}" >/dev/null 2>&1 && {
+            echo "临时 tag 已存在，先删除旧的同名临时 release"; gh release delete "${tmp_tag}" --yes --cleanup-tag; }
+          gh release create "${tmp_tag}" --prerelease --target "${GITHUB_REF_NAME}" \
+            --title "TEMP offline fpk transfer ${TARGET_TAG}" \
+            --notes "临时传输通道，取回本地后删除；非发行版本。"
+          gh release upload "${tmp_tag}" \
+            "dist/fnmusic-ext-2.7.8.fpk" "dist/fnmusic-ext-2.7.8.fpk.sha256" --clobber
+          gh release view "${tmp_tag}" --json assets --jq '.assets[] | "\(.name) \(.size)"'
