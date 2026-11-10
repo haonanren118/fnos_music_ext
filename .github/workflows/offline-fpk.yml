@@ -1,0 +1,121 @@
+name: Offline FPK (manual)
+
+# 手动构建「离线版」fpk：内置 fnmusic-sources:latest docker 镜像（约 1.2GB 未压缩），
+# 新用户装机时无需联网拉取基础镜像。CI 常规发版只出在线版（见 release.yml）。
+# 触发：gh workflow run offline-fpk.yml --ref main -f tag=v2.7.8
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要打包的发行标签（须与该 tag 的 VERSION 一致）"
+        required: true
+        default: "v2.7.8"
+
+permissions:
+  contents: read
+
+jobs:
+  build-offline-fpk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      TARGET_TAG: ${{ inputs.tag }}
+      FNPACK_VERSION: "1.2.3"
+
+    steps:
+      - name: Checkout target tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_TAG }}
+          fetch-depth: 1
+
+      - name: Verify tag matches VERSION
+        run: |
+          set -euo pipefail
+          want="${TARGET_TAG#v}"
+          got="$(head -n1 VERSION | tr -d '[:space:]')"
+          echo "tag version=${want}  VERSION=${got}"
+          test "${want}" = "${got}" || { echo "ERROR: tag 与 VERSION 不一致" >&2; exit 1; }
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Install fnpack (linux-amd64)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/fnpack \
+            "https://static2.fnnas.com/fnpack/fnpack-${FNPACK_VERSION}-linux-amd64"
+          chmod +x /tmp/fnpack
+          sudo mv /tmp/fnpack /usr/local/bin/fnpack
+          fnpack --help | head -5
+
+      - name: Build amd64 service image
+        # 仓库默认 apt/pip 指向国内镜像源；GitHub runner 在境外，显式切到官方源，
+        # lxserver 预编译包由 Dockerfile 直连 GitHub Release 下载并做 sha256 校验。
+        run: |
+          set -euo pipefail
+          docker build -f container/Dockerfile -t fnmusic-sources:latest \
+            --build-arg BASE_IMAGE=python:3.13-slim \
+            --build-arg PIP_INDEX_URL=https://pypi.org/simple \
+            --build-arg APT_MIRROR="" \
+            --progress=plain .
+          docker image inspect fnmusic-sources:latest \
+            --format 'IMAGE {{.Id}} arch={{.Architecture}} os={{.Os}} size={{.Size}}'
+          test "$(docker image inspect fnmusic-sources:latest --format '{{.Architecture}}')" = "amd64"
+
+      - name: Verify image components (v2.7.x)
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint sh fnmusic-sources:latest -c '
+            test -f /srv/lxserver/server/server/server.js &&
+            test -f /srv/lxmusic-service/lxserver_client.py &&
+            test -f /srv/webui-service/upgrade.py &&
+            test -x /usr/local/bin/entrypoint.sh &&
+            echo "image components OK"'
+
+      - name: Save image into packaging tree
+        # 必须在 docker build 之后生成：否则 1.2GB 的 tar 会进 build context。
+        run: |
+          set -euo pipefail
+          mkdir -p images
+          docker save fnmusic-sources:latest -o images/fnmusic-sources.tar
+          ls -lh images/fnmusic-sources.tar
+          tar -xOf images/fnmusic-sources.tar manifest.json | head -c 250; echo
+
+      - name: Build offline fpk
+        run: |
+          set -euo pipefail
+          ./packaging/fpk/build.sh
+          ls -lh dist/
+
+      - name: Verify offline fpk
+        run: |
+          set -euo pipefail
+          fpk="$(ls dist/fnmusic-ext-*.fpk | head -1)"
+          test -s "${fpk}"
+          ( cd dist && sha256sum -c "$(basename "${fpk}").sha256" )
+          # 外层结构
+          tar -tzf "${fpk}" | grep -qx 'app.tgz'
+          tar -tzf "${fpk}" | grep -qx 'cmd/main'
+          tar -tzf "${fpk}" | grep -qx 'manifest'
+          # Linux fnpack 必须保留可执行位（Windows 版会写成 0666，装不上）
+          tar -tvzf "${fpk}" | grep -E 'cmd/main$' | grep -qE '^-rwx' || {
+            echo "ERROR: cmd/main 权限位异常" >&2; exit 1; }
+          # 内层必须真的含内置镜像
+          tar -xzOf "${fpk}" app.tgz | tar -tzvf - | grep -E 'repo/images/fnmusic-sources\.tar$'
+          echo "### 离线包校验通过" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$(basename "${fpk}")\` $(stat -c%s "${fpk}") bytes" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`$(cat "${fpk}.sha256")\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact (local delivery)
+        uses: actions/upload-artifact@v4
+        with:
+          name: fnmusic-offline-${{ inputs.tag }}
+          path: |
+            dist/*.fpk
+            dist/*.fpk.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
